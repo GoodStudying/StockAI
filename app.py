@@ -19,7 +19,9 @@ import db
 import lcsc
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-app.secret_key = os.urandom(24)
+# 固定密钥：gunicorn 多 worker 各自 os.urandom(24) 会导致 session 跨进程验签失败（登录后立刻被踢回登录页）
+# 可通过环境变量 SECRET_KEY 覆盖
+app.secret_key = os.environ.get("SECRET_KEY") or "personal-erp-fixed-secret-9f4c2a8e7b1d"
 
 db.init_schema()
 db.ensure_default_admin()
