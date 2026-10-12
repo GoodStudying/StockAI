@@ -154,7 +154,14 @@ def _remote_version():
     url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_BRANCH}")
     r = requests.get(url, timeout=15, headers=_gh_headers())
     if not r.ok:
-        raise RuntimeError(f"GitHub 接口返回 HTTP {r.status_code}")
+        # 403 常见原因：Token 未勾 Contents:Read-only / 限流；404：仓库不存在或无权限
+        try:
+            detail = r.json().get("message", "")
+        except Exception:
+            detail = ""
+        hint = {403: "（Token 缺少 Contents:Read-only 权限或触发限流）",
+                404: "（仓库不存在，或 Token 无权访问）"}.get(r.status_code, "")
+        raise RuntimeError(f"GitHub 接口返回 HTTP {r.status_code}{hint} {detail}")
     return r.json().get("sha", "")
 
 
