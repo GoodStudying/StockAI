@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>仓库管理 - 个人ERP</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<nav>
+  <span class="brand">个人ERP</span>
+  <a href="/">物料 / 出入库</a>
+  <a href="/warehouses.html" class="active">仓库管理</a>
+  <a href="/system.html">系统管理</a>
+  <span class="spacer"></span>
+  <span id="nav-user"></span>
+</nav>
+
+<div class="content" style="display:flex;gap:14px">
+  <div class="panel" style="width:420px">
+    <h3>仓库结构（最多4级）</h3>
+    <div class="toolbar">
+      <button onclick="addWarehouse(null)">+ 新建一级库</button>
+    </div>
+    <div id="tree"></div>
+  </div>
+
+  <div class="panel" style="flex:1">
+    <h3 id="detail-title">库内物料</h3>
+    <p style="font-size:12px;color:#909399;margin-bottom:10px">点击左侧仓库查看该库物料</p>
+    <table>
+      <thead><tr><th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>库存</th></tr></thead>
+      <tbody id="wh-mat-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+let warehouses = [];
+let currentWid = null;
+
+async function init() {
+  const user = await checkLogin();
+  if (!user) return;
+  await loadWarehouses();
+}
+async function loadWarehouses() {
+  warehouses = await api('/api/warehouses');
+  renderTree();
+}
+function renderTree() {
+  const el = document.getElementById('tree');
+  el.innerHTML = '';
+  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid);
+  function render(list) {
+    list.forEach(w => {
+      const div = document.createElement('div');
+      div.className = `tree-node indent-${w.level}`;
+      div.innerHTML = `<span class="badge">L${w.level}</span><span>${esc(w.name)}</span>
+        <span class="ops">
+          ${w.level < 4 ? `<button class="small" onclick="event.stopPropagation();addWarehouse(${w.id})">+子库</button>` : ''}
+          <button class="small" onclick="event.stopPropagation();renameWarehouse(${w.id},'${esc(w.name)}')">改名</button>
+          <button class="small danger" onclick="event.stopPropagation();delWarehouse(${w.id})">删除</button>
+        </span>`;
+      div.onclick = () => { currentWid = w.id; showWarehouseMaterials(w); };
+      el.appendChild(div);
+      render(childrenOf(w.id));
+    });
+  }
+  render(childrenOf(null));
+}
+
+async function addWarehouse(parentId) {
+  const name = prompt(parentId ? '输入子库名称：' : '输入一级库名称：');
+  if (!name) return;
+  await api('/api/warehouses', { method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ name, parent_id: parentId }) });
+  loadWarehouses();
+}
+async function renameWarehouse(id, oldName) {
+  const name = prompt('修改库名：', oldName);
+  if (!name || name === oldName) return;
+  await api(`/api/warehouses/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ name }) });
+  loadWarehouses();
+}
+async function delWarehouse(id) {
+  if (!confirm('删除该库及其所有子库？')) return;
+  await api(`/api/warehouses/${id}`, { method: 'DELETE' });
+  currentWid = null;
+  document.getElementById('wh-mat-body').innerHTML = '';
+  document.getElementById('detail-title').textContent = '库内物料';
+  loadWarehouses();
+}
+async function showWarehouseMaterials(w) {
+  document.getElementById('detail-title').textContent = `「${w.name}」库内物料`;
+  const list = await api(`/api/materials?warehouse_id=${w.id}`);
+  document.getElementById('wh-mat-body').innerHTML = list.length
+    ? list.map(m => `<tr><td>${m.id}</td><td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
+        <td>${esc(m.model||'')}</td><td>${m.quantity} ${esc(m.unit||'')}</td></tr>`).join('')
+    : '<tr><td colspan="5" style="color:#909399;text-align:center">该库暂无物料</td></tr>';
+}
+
+init();
+</script>
+</body>
+</html>

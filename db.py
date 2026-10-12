@@ -125,11 +125,38 @@ CREATE TABLE IF NOT EXISTS material_documents (
     uploaded_at TEXT DEFAULT (datetime('now','localtime'))
 );
 
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',   -- admin / user
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS stock_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+    type TEXT NOT NULL CHECK(type IN ('in','out')),   -- in=入库 out=出库
+    quantity INTEGER NOT NULL CHECK(quantity > 0),
+    operator TEXT,               -- 操作人
+    remark TEXT,                 -- 备注
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_materials_name ON materials(name);
 CREATE INDEX IF NOT EXISTS idx_materials_code ON materials(code);
 CREATE INDEX IF NOT EXISTS idx_materials_wh ON materials(warehouse_id);
 CREATE INDEX IF NOT EXISTS idx_wh_parent ON warehouses(parent_id);
+CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
 """
+
+
+def ensure_default_admin():
+    """首次启动时创建默认管理员 admin / admin123"""
+    import hashlib
+    if not query("SELECT id FROM users WHERE username='admin'"):
+        pw = hashlib.sha256("admin123".encode()).hexdigest()
+        execute_write("INSERT INTO users(username, password_hash, role) VALUES ('admin', ?, 'admin')", (pw,))
 
 SCHEMA_POSTGRES = """
 CREATE TABLE IF NOT EXISTS warehouses (

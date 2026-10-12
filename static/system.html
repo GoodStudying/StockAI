@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>系统管理 - 个人ERP</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<nav>
+  <span class="brand">个人ERP</span>
+  <a href="/">物料 / 出入库</a>
+  <a href="/warehouses.html">仓库管理</a>
+  <a href="/system.html" class="active">系统管理</a>
+  <span class="spacer"></span>
+  <span id="nav-user"></span>
+</nav>
+
+<div class="content">
+  <!-- 数据库管理 -->
+  <div class="panel">
+    <h3>数据库管理</h3>
+    <div id="db-info" style="font-size:13px;line-height:2">加载中...</div>
+    <div class="toolbar" style="margin-top:10px">
+      <button onclick="location.href='/api/db/backup'">备份数据库（下载）</button>
+      <button class="gray" onclick="loadDbInfo()">刷新</button>
+    </div>
+    <p style="font-size:12px;color:#909399">
+      切换到 PostgreSQL：编辑项目根目录 .env，将 DB_TYPE 改为 postgres 并填写 POSTGRES_DSN，重启服务即可。</p>
+  </div>
+
+  <!-- 账户管理 -->
+  <div class="panel">
+    <h3>账户管理</h3>
+    <div class="toolbar">
+      <button onclick="openUserModal()">+ 新建账户</button>
+    </div>
+    <table>
+      <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
+      <tbody id="user-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 新建账户弹窗 -->
+<div class="modal-mask" id="user-modal">
+  <div class="modal" style="width:400px">
+    <h3>新建账户</h3>
+    <div class="form-row"><label>用户名 *</label><input id="u-name"></div>
+    <div class="form-row"><label>密码 *</label><input id="u-pass" type="password"></div>
+    <div class="form-row"><label>角色</label>
+      <select id="u-role"><option value="user">普通用户</option><option value="admin">管理员</option></select>
+    </div>
+    <div class="modal-footer">
+      <button class="gray" onclick="closeModal('user-modal')">取消</button>
+      <button onclick="saveUser()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+async function init() {
+  const user = await checkLogin();
+  if (!user) return;
+  loadDbInfo();
+  loadUsers();
+}
+async function loadDbInfo() {
+  try {
+    const d = await api('/api/db/info');
+    document.getElementById('db-info').innerHTML = `
+      数据库类型：<b>${d.type}</b><br>
+      ${d.type === 'sqlite' ? `数据库文件：${esc(d.path)}（${d.size_kb} KB）<br>` : ''}
+      仓库数：${d.warehouses}　物料数：${d.materials}　手册数：${d.material_documents}　
+      流水数：${d.stock_records}　账户数：${d.users}`;
+  } catch (e) {
+    document.getElementById('db-info').textContent = e.message;
+  }
+}
+async function loadUsers() {
+  const list = await api('/api/users');
+  document.getElementById('user-body').innerHTML = list.map(u => `<tr>
+    <td>${u.id}</td><td>${esc(u.username)}</td>
+    <td><span class="badge">${u.role === 'admin' ? '管理员' : '普通用户'}</span></td>
+    <td>${u.created_at}</td>
+    <td>
+      <button class="small" onclick="resetPass(${u.id})">重置密码</button>
+      <button class="small gray" onclick="toggleRole(${u.id},'${u.role}')">切换角色</button>
+      <button class="small danger" onclick="delUser(${u.id})">删除</button>
+    </td></tr>`).join('');
+}
+function openUserModal() {
+  document.getElementById('u-name').value = '';
+  document.getElementById('u-pass').value = '';
+  openModal('user-modal');
+}
+async function saveUser() {
+  const body = { username: document.getElementById('u-name').value.trim(),
+                 password: document.getElementById('u-pass').value,
+                 role: document.getElementById('u-role').value };
+  await api('/api/users', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  closeModal('user-modal');
+  loadUsers();
+}
+async function resetPass(uid) {
+  const password = prompt('输入新密码：');
+  if (!password) return;
+  await api(`/api/users/${uid}`, { method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ password }) });
+  alert('密码已重置');
+}
+async function toggleRole(uid, role) {
+  const newRole = role === 'admin' ? 'user' : 'admin';
+  await api(`/api/users/${uid}`, { method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ role: newRole }) });
+  loadUsers();
+}
+async function delUser(uid) {
+  if (!confirm('确认删除该账户？')) return;
+  await api(`/api/users/${uid}`, { method: 'DELETE' });
+  loadUsers();
+}
+
+init();
+</script>
+</body>
+</html>

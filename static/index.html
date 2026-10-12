@@ -2,75 +2,46 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>个人ERP管理</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: "Microsoft YaHei", sans-serif; background: #f0f2f5; }
-  header { background: #1f2d3d; color: #fff; padding: 12px 20px; font-size: 18px; }
-  .layout { display: flex; gap: 12px; padding: 12px; }
-  .panel { background: #fff; border-radius: 8px; padding: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
-  #tree-panel { width: 300px; min-height: 80vh; }
-  #main-panel { flex: 1; }
-  h3 { margin-bottom: 10px; font-size: 15px; color: #333; border-bottom: 2px solid #409eff; padding-bottom: 6px; }
-  button { background: #409eff; color: #fff; border: none; border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
-  button:hover { background: #66b1ff; }
-  button.danger { background: #f56c6c; }
-  button.gray { background: #909399; }
-  input, select, textarea { padding: 5px 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 13px; }
-  .tree-node { padding: 3px 0 3px 4px; cursor: pointer; border-radius: 4px; display: flex; align-items: center; gap: 4px; font-size: 14px; }
-  .tree-node:hover { background: #ecf5ff; }
-  .tree-node.selected { background: #d9ecff; }
-  .tree-node .ops { display: none; margin-left: auto; }
-  .tree-node:hover .ops { display: inline; }
-  .tree-node .ops button { padding: 1px 6px; font-size: 12px; }
-  .indent-1 { margin-left: 0; } .indent-2 { margin-left: 18px; }
-  .indent-3 { margin-left: 36px; } .indent-4 { margin-left: 54px; }
-  table { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
-  th, td { border: 1px solid #ebeef5; padding: 6px 8px; text-align: left; }
-  th { background: #f5f7fa; }
-  .toolbar { display: flex; gap: 8px; margin-bottom: 10px; align-items: center; flex-wrap: wrap; }
-  .modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; justify-content: center; align-items: center; z-index: 99; }
-  .modal { background: #fff; border-radius: 8px; padding: 20px; width: 520px; max-height: 85vh; overflow-y: auto; }
-  .modal h3 { margin-bottom: 14px; }
-  .form-row { display: flex; align-items: center; margin-bottom: 10px; gap: 8px; }
-  .form-row label { width: 90px; font-size: 13px; color: #606266; flex-shrink: 0; }
-  .form-row input, .form-row select, .form-row textarea { flex: 1; }
-  .modal-footer { text-align: right; margin-top: 12px; }
-  .modal-footer button { margin-left: 8px; }
-  .lcsc-result { border: 1px solid #ebeef5; border-radius: 4px; padding: 8px; margin: 6px 0; font-size: 12px; cursor: pointer; }
-  .lcsc-result:hover { background: #ecf5ff; }
-  .doc-item { font-size: 12px; color: #409eff; margin-right: 8px; }
-  .badge { display: inline-block; background: #ecf5ff; color: #409eff; border-radius: 3px; padding: 0 5px; font-size: 11px; }
-</style>
+<title>物料管理 - 个人ERP</title>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header>个人ERP管理系统</header>
-<div class="layout">
-  <!-- 左侧：仓库树 -->
-  <div class="panel" id="tree-panel">
-    <h3>仓库结构（最多4级）</h3>
-    <div class="toolbar">
-      <button onclick="addWarehouse(null)">+ 新建一级库</button>
-    </div>
-    <div id="tree"></div>
-  </div>
+<nav>
+  <span class="brand">个人ERP</span>
+  <a href="/" class="active">物料 / 出入库</a>
+  <a href="/warehouses.html">仓库管理</a>
+  <a href="/system.html">系统管理</a>
+  <span class="spacer"></span>
+  <span id="nav-user"></span>
+</nav>
 
-  <!-- 右侧：物料 -->
-  <div class="panel" id="main-panel">
-    <h3 id="mat-title">物料列表</h3>
+<div class="content">
+  <div class="panel">
+    <h3>物料查询</h3>
     <div class="toolbar">
-      <input id="search-input" placeholder="按名称 / 编码 / 型号搜索" style="width:220px"
+      <input id="search-input" placeholder="按名称 / 编码 / 型号搜索" style="width:240px"
              onkeydown="if(event.key==='Enter')loadMaterials()">
+      <select id="filter-warehouse" onchange="loadMaterials()"><option value="">全部仓库</option></select>
       <button onclick="loadMaterials()">查询</button>
       <button onclick="openMaterialModal()">+ 新建物料</button>
       <button class="gray" onclick="openLcscModal()">从立创商城新建</button>
     </div>
     <table>
       <thead><tr>
-        <th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th>
-        <th>品牌</th><th>数量</th><th>所在库</th><th>手册</th><th>操作</th>
+        <th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th>
+        <th>库存</th><th>所在库</th><th>手册</th><th style="width:210px">操作</th>
       </tr></thead>
       <tbody id="mat-body"></tbody>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h3>出入库流水</h3>
+    <table>
+      <thead><tr>
+        <th>时间</th><th>物料</th><th>编码</th><th>类型</th><th>数量</th><th>操作人</th><th>备注</th>
+      </tr></thead>
+      <tbody id="record-body"></tbody>
     </table>
   </div>
 </div>
@@ -134,95 +105,61 @@
   </div>
 </div>
 
+<!-- 入库/出库弹窗 -->
+<div class="modal-mask" id="stock-modal">
+  <div class="modal" style="width:400px">
+    <h3 id="stock-title">入库</h3>
+    <input type="hidden" id="s-mid"><input type="hidden" id="s-op">
+    <div class="form-row"><label>物料</label><input id="s-name" disabled></div>
+    <div class="form-row"><label>当前库存</label><input id="s-cur" disabled></div>
+    <div class="form-row"><label>数量 *</label><input id="s-qty" type="number" min="1" value="1"></div>
+    <div class="form-row"><label>备注</label><input id="s-remark"></div>
+    <div class="modal-footer">
+      <button class="gray" onclick="closeModal('stock-modal')">取消</button>
+      <button onclick="submitStock()">确认</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
 <script>
 let warehouses = [];
-let currentWid = null;
 
-// ---------- 通用 ----------
-async function api(url, opts = {}) {
-  const r = await fetch(url, opts);
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok) { alert(data.error || '操作失败'); throw new Error(data.error); }
-  return data;
-}
-function closeModal(id) { document.getElementById(id).style.display = 'none'; }
-function openModal(id) { document.getElementById(id).style.display = 'flex'; }
-
-// ---------- 仓库树 ----------
-async function loadWarehouses() {
+async function init() {
+  const user = await checkLogin();
+  if (!user) return;
   warehouses = await api('/api/warehouses');
-  renderTree();
-  fillWarehouseSelect();
+  fillWarehouseSelects();
+  loadMaterials();
+  loadRecords();
 }
-function renderTree() {
-  const el = document.getElementById('tree');
-  el.innerHTML = '';
-  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid);
-  function render(list) {
-    list.forEach(w => {
-      const div = document.createElement('div');
-      div.className = `tree-node indent-${w.level}` + (w.id === currentWid ? ' selected' : '');
-      div.innerHTML = `<span class="badge">L${w.level}</span><span>${esc(w.name)}</span>
-        <span class="ops">
-          ${w.level < 4 ? `<button onclick="event.stopPropagation();addWarehouse(${w.id})">+</button>` : ''}
-          <button onclick="event.stopPropagation();renameWarehouse(${w.id},'${esc(w.name)}')">改名</button>
-          <button class="danger" onclick="event.stopPropagation();delWarehouse(${w.id})">删</button>
-        </span>`;
-      div.onclick = () => { currentWid = (currentWid === w.id ? null : w.id); renderTree(); loadMaterials(); };
-      el.appendChild(div);
-      render(childrenOf(w.id));
-    });
-  }
-  render(childrenOf(null));
-}
-function esc(s) { return String(s).replace(/[<>&'"]/g, c => ({'<':'&lt;','>':'&gt;','&':'&amp;',"'":'&#39;','"':'&quot;'}[c])); }
-
-async function addWarehouse(parentId) {
-  const name = prompt(parentId ? '输入子库名称：' : '输入一级库名称：');
-  if (!name) return;
-  await api('/api/warehouses', { method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ name, parent_id: parentId }) });
-  loadWarehouses();
-}
-async function renameWarehouse(id, oldName) {
-  const name = prompt('修改库名：', oldName);
-  if (!name || name === oldName) return;
-  await api(`/api/warehouses/${id}`, { method: 'PUT', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ name }) });
-  loadWarehouses();
-}
-async function delWarehouse(id) {
-  if (!confirm('删除该库及其所有子库？（库内物料的库归属将被置空）')) return;
-  await api(`/api/warehouses/${id}`, { method: 'DELETE' });
-  currentWid = null;
-  loadWarehouses(); loadMaterials();
-}
-function fillWarehouseSelect() {
-  const sel = document.getElementById('m-warehouse');
-  sel.innerHTML = '<option value="">（未指定）</option>' +
-    warehouses.map(w => `<option value="${w.id}">${'　'.repeat(w.level-1)}${esc(w.name)}</option>`).join('');
+function fillWarehouseSelects() {
+  const opts = warehouses.map(w =>
+    `<option value="${w.id}">${'　'.repeat(w.level-1)}${esc(w.name)}</option>`).join('');
+  document.getElementById('filter-warehouse').innerHTML = '<option value="">全部仓库</option>' + opts;
+  document.getElementById('m-warehouse').innerHTML = '<option value="">（未指定）</option>' + opts;
 }
 
 // ---------- 物料 ----------
 async function loadMaterials() {
   const q = document.getElementById('search-input').value.trim();
+  const wid = document.getElementById('filter-warehouse').value;
   let url = '/api/materials?';
   if (q) url += `q=${encodeURIComponent(q)}&`;
-  if (currentWid) url += `warehouse_id=${currentWid}`;
+  if (wid) url += `warehouse_id=${wid}`;
   const list = await api(url);
-  document.getElementById('mat-title').textContent =
-    currentWid ? `物料列表（${(warehouses.find(w=>w.id===currentWid)||{}).name || ''}）` : '物料列表';
-  const tb = document.getElementById('mat-body');
-  tb.innerHTML = list.map(m => `<tr>
+  document.getElementById('mat-body').innerHTML = list.map(m => `<tr>
     <td>${m.id}</td><td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
     <td>${esc(m.model||'')}</td><td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
     <td>${(m.documents||[]).map(d =>
-      `<a class="doc-item" href="/api/documents/${d.id}">${esc(d.file_name)}</a>`).join('')}
-      <button style="padding:1px 6px;font-size:12px" onclick="openDocModal(${m.id})">传</button></td>
+      `<a href="/api/documents/${d.id}">${esc(d.file_name)}</a>`).join(' ')}
+      <button class="small" onclick="openDocModal(${m.id})">传</button></td>
     <td>
-      <button style="padding:2px 8px;font-size:12px" onclick='editMaterial(${JSON.stringify(m)})'>编</button>
-      <button class="danger" style="padding:2px 8px;font-size:12px" onclick="delMaterial(${m.id})">删</button>
+      <button class="small" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'in')">入库</button>
+      <button class="small gray" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'out')">出库</button>
+      <button class="small" onclick='editMaterial(${JSON.stringify(m)})'>编</button>
+      <button class="small danger" onclick="delMaterial(${m.id})">删</button>
     </td></tr>`).join('');
 }
 function openMaterialModal() {
@@ -231,7 +168,6 @@ function openMaterialModal() {
     .forEach(id => document.getElementById(id).value = '');
   document.getElementById('m-quantity').value = 0;
   document.getElementById('m-unit').value = '个';
-  document.getElementById('m-warehouse').value = currentWid || '';
   openModal('mat-modal');
 }
 function editMaterial(m) {
@@ -280,6 +216,34 @@ async function delMaterial(id) {
   loadMaterials();
 }
 
+// ---------- 出入库 ----------
+function openStock(mid, name, curQty, op) {
+  document.getElementById('s-mid').value = mid;
+  document.getElementById('s-op').value = op;
+  document.getElementById('s-name').value = name;
+  document.getElementById('s-cur').value = curQty;
+  document.getElementById('s-qty').value = 1;
+  document.getElementById('s-remark').value = '';
+  document.getElementById('stock-title').textContent = op === 'in' ? '入库' : '出库';
+  openModal('stock-modal');
+}
+async function submitStock() {
+  const mid = document.getElementById('s-mid').value;
+  const op = document.getElementById('s-op').value;
+  const body = { material_id: +mid, quantity: +document.getElementById('s-qty').value,
+                 remark: document.getElementById('s-remark').value.trim() };
+  await api(`/api/stock/${op}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  closeModal('stock-modal');
+  loadMaterials(); loadRecords();
+}
+async function loadRecords() {
+  const list = await api('/api/stock/records');
+  document.getElementById('record-body').innerHTML = list.map(r => `<tr>
+    <td>${r.created_at}</td><td>${esc(r.material_name)}</td><td>${esc(r.material_code||'')}</td>
+    <td><span class="badge ${r.type}">${r.type === 'in' ? '入库' : '出库'}</span></td>
+    <td>${r.quantity}</td><td>${esc(r.operator||'')}</td><td>${esc(r.remark||'')}</td></tr>`).join('');
+}
+
 // ---------- 立创商城 ----------
 function openLcscModal() {
   document.getElementById('lcsc-results').innerHTML = '';
@@ -296,7 +260,7 @@ async function lcscSearch() {
     box.innerHTML = '';
     list.forEach(it => {
       const div = document.createElement('div');
-      div.className = 'lcsc-result';
+      div.style.cssText = 'border:1px solid #ebeef5;border-radius:4px;padding:8px;margin:6px 0;font-size:12px;cursor:pointer';
       div.innerHTML = `<b>${esc(it.code)}</b> ${esc(it.model)} [${esc(it.brand)}] ${esc(it.package)}<br>
         <span style="color:#909399">${esc(it.category||'')}</span>`;
       div.onclick = () => fillFromLcsc(it);
@@ -337,8 +301,7 @@ async function uploadDoc() {
   loadMaterials();
 }
 
-// ---------- 启动 ----------
-loadWarehouses().then(loadMaterials);
+init();
 </script>
 </body>
 </html>
