@@ -551,4 +551,5 @@ def db_backup():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    # 0.0.0.0：Docker 容器内必须监听全部网卡，宿主机端口映射才能进得来
+    app.run(host="0.0.0.0", port=5000, debug=False)
