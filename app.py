@@ -11,6 +11,9 @@ import re
 import io
 import hashlib
 import shutil
+import tarfile
+import tempfile
+import threading
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, send_file, session
@@ -106,6 +109,114 @@ def default_admin_exists():
     pw = hashlib.sha256("admin123".encode()).hexdigest()
     rows = db.query("SELECT id FROM users WHERE username='admin' AND password_hash=?", (pw,))
     return jsonify({"default_exists": bool(rows)})
+
+
+# ---------------- 版本与在线更新（GitHub） ----------------
+# GITHUB_REPO：GitHub 仓库（格式 用户名/仓库名）；GITHUB_PROXY：可选加速前缀（如 https://gh-proxy.com）
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip("/")
+GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "master")
+GITHUB_PROXY = os.environ.get("GITHUB_PROXY", "").rstrip("/")
+VERSION_FILE = os.path.join(BASE_DIR, ".version")
+# 更新时绝不覆盖的本地目录/文件（数据与环境配置）
+_UPD_KEEP = {".env", "data", "uploads", "__pycache__", ".git", ".version"}
+
+
+def _gh(path):
+    """拼接 GitHub 地址（可选走加速代理）"""
+    return GITHUB_PROXY + path if GITHUB_PROXY else path
+
+
+def _local_version():
+    try:
+        with open(VERSION_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip() or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _remote_version():
+    """查询 GitHub 远程分支最新 commit sha"""
+    import requests
+    url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_BRANCH}")
+    r = requests.get(url, timeout=15, headers={"User-Agent": "erp-updater"})
+    if not r.ok:
+        raise RuntimeError(f"GitHub 接口返回 HTTP {r.status_code}")
+    return r.json().get("sha", "")
+
+
+@app.route("/api/update/status")
+@admin_required
+def update_status():
+    """检查 GitHub 是否有新版本"""
+    if not GITHUB_REPO:
+        return jsonify({"error": "未配置 GITHUB_REPO 环境变量（格式：用户名/仓库名）"}), 400
+    try:
+        remote = _remote_version()
+    except Exception as e:
+        return jsonify({"error": f"无法访问 GitHub：{e}。NAS 若无法直连，可配置 GITHUB_PROXY 加速前缀"}), 502
+    local = _local_version()
+    return jsonify({"repo": GITHUB_REPO, "branch": GITHUB_BRANCH, "local": local,
+                    "remote": remote[:7], "update_available": local != remote})
+
+
+@app.route("/api/update/apply", methods=["POST"])
+@admin_required
+def update_apply():
+    """从 GitHub 下载最新代码覆盖到 /app 并平滑重启（数据库不受影响）"""
+    import requests
+    if not GITHUB_REPO:
+        return jsonify({"error": "未配置 GITHUB_REPO 环境变量（格式：用户名/仓库名）"}), 400
+    # 1. 仓库 tarball（stream 下载，避免占用内存）
+    url = _gh(f"https://codeload.github.com/{GITHUB_REPO}/tar.gz/refs/heads/{GITHUB_BRANCH}")
+    try:
+        r = requests.get(url, timeout=120, stream=True)
+        if not r.ok:
+            return jsonify({"error": f"下载失败 HTTP {r.status_code}"}), 502
+        tmp = os.path.join(tempfile.gettempdir(), "erp_update.tgz")
+        with open(tmp, "wb") as f:
+            shutil.copyfileobj(r.raw, f)
+    except Exception as e:
+        return jsonify({"error": f"下载失败：{e}。NAS 若无法直连 GitHub，请配置 GITHUB_PROXY 加速前缀"}), 502
+    # 2. 解包覆盖（跳过数据/环境文件，防目录穿越）
+    try:
+        with tarfile.open(tmp) as tar:
+            names = tar.getnames()
+            root = names[0].split("/")[0] if names else ""
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                rel = m.name[len(root) + 1:] if m.name.startswith(root + "/") else m.name
+                if not rel or ".." in rel.split("/"):
+                    continue
+                if rel.split("/")[0] in _UPD_KEEP:
+                    continue
+                dest = os.path.join(BASE_DIR, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with tar.extractfile(m) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+    except Exception as e:
+        return jsonify({"error": f"解包失败：{e}"}), 500
+    # 3. 记录新版本号
+    try:
+        sha = _remote_version()
+    except Exception:
+        sha = ""
+    with open(VERSION_FILE, "w", encoding="utf-8") as f:
+        f.write(sha)
+    # 4. 延迟 2 秒平滑重启：容器内向 gunicorn 主进程(PID1)发 SIGHUP；本地开发则直接退出进程
+    def _reload():
+        import signal, time
+        time.sleep(2)
+        try:
+            if os.getppid() == 1:
+                os.kill(1, signal.SIGHUP)   # gunicorn 平滑重启 worker，加载新代码
+            else:
+                os._exit(0)                 # 本地 python app.py 场景，退出后手动重启
+        except Exception:
+            os._exit(0)
+    threading.Thread(target=_reload, daemon=True).start()
+    return jsonify({"ok": True, "version": sha[:7],
+                    "msg": "更新完成，服务正在平滑重启，约 5 秒后请刷新页面"})
 
 
 # ---------------- 页面路由 ----------------
