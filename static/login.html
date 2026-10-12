@@ -20,7 +20,7 @@
     <input id="password" type="password" placeholder="密码" autocomplete="current-password"
            onkeydown="if(event.key==='Enter')doLogin()">
     <button onclick="doLogin()">登 录</button>
-    <p class="login-hint">默认账户 admin / admin123（首次登录后请修改）</p>
+    <p class="login-hint" id="default-hint" style="display:none">默认账户 admin / admin123（首次登录后请修改）</p>
     <div class="theme-switch" style="padding-top:14px">
       <span class="theme-dot" data-theme="classic" title="经典主题" onclick="switchTheme('classic')">◐</span>
       <span class="theme-dot" data-theme="light" title="洁净主题" onclick="switchTheme('light')">○</span>
@@ -30,6 +30,10 @@
 </div>
 <script src="/common.js"></script>
 <script>
+/* 默认密码提示：仅当 admin 仍是默认密码时显示，改密后自动消失 */
+fetch('/api/default_admin_exists').then(r => r.json()).then(d => {
+  if (d.default_exists) document.getElementById('default-hint').style.display = '';
+}).catch(() => {});
 async function doLogin() {
   const username = document.getElementById('username').value.trim();
   const password = document.getElementById('password').value;

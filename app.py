@@ -99,6 +99,15 @@ def me():
     return jsonify({"user": u})
 
 
+@app.route("/api/default_admin_exists")
+def default_admin_exists():
+    """登录页探测：admin 是否仍为默认密码（是则前端显示修改提醒，改密后自动消失）"""
+    import hashlib
+    pw = hashlib.sha256("admin123".encode()).hexdigest()
+    rows = db.query("SELECT id FROM users WHERE username='admin' AND password_hash=?", (pw,))
+    return jsonify({"default_exists": bool(rows)})
+
+
 # ---------------- 页面路由 ----------------
 @app.route("/")
 def index():
