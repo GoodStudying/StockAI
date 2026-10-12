@@ -5,5 +5,4 @@ data/
 uploads/
 .env
 pgdata/
-personal-erp-nas/
 *.zip

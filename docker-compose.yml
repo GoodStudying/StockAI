@@ -1,57 +1,26 @@
-# 个人ERP · 飞牛 fnOS / Docker 部署配置
-# 用法：docker compose up -d --build
+# 个人ERP · Docker 部署配置（飞牛 fnOS / 群晖通用）
+# 数据库使用宿主机已有的 postgres 容器（ERP_DB 库，宿主机端口 54321）
+# 本文件只启动 ERP 应用
+# 用法：docker compose up -d --build（或 fnOS Docker 图形界面创建项目）
 services:
-  # ---------- PostgreSQL 数据库（内容全部存这里，含手册/图片BLOB） ----------
-  db:
-    image: postgres:16-alpine
-    container_name: erp-db
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: erp
-      POSTGRES_USER: erp
-      POSTGRES_PASSWORD: erp_2024_change_me   # 部署时务必改密码
-      TZ: Asia/Shanghai
-    volumes:
-      - ./pgdata:/var/lib/postgresql/data      # 数据库持久化（备份=pgdata 文件夹）
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U erp"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-  # ---------- ERP 应用 ----------
   erp:
     build: .
     container_name: personal-erp
     restart: unless-stopped      # NAS 重启后自动拉起
     ports:
-      - "5800:5000"              # NAS局域网访问端口，冲突可改 5801:5000
-    volumes:
-      - ./data:/app/data         # 兼容 sqlite 模式的挂载（postgres 模式不用）
+      - "54322:5000"             # NAS局域网访问端口
     environment:
       - TZ=Asia/Shanghai
       - DB_TYPE=postgres
-      # 密码与上面 db 服务保持一致；容器间用服务名 db 互连
-      - POSTGRES_DSN=host=db port=5432 dbname=erp user=erp password=erp_2024_change_me
+      # 走宿主机映射地址连接 postgres：host.docker.internal = NAS 宿主机，端口用映射的 54321
+      # 若 NAS 防火墙拦截，可把 host 换成 NAS 局域网 IP（如 192.168.1.10）
+      - POSTGRES_DSN=host=host.docker.internal port=54321 dbname=ERP_DB user=postgres password=改成你的密码
       # ---------- 网页一键更新（GitHub）----------
-      # 格式：用户名/仓库名；私有仓库需再配 GITHUB_TOKEN（fine-grained PAT，Contents 只读）
       - GITHUB_REPO=Liaojianwei8/AP_ERP
-      # - GITHUB_TOKEN=github_pat_xxx
-      # NAS 访问 GitHub 不稳时启用加速前缀
+      # 私有仓库必填：GitHub Settings → Developer settings → Fine-grained tokens
+      # 只勾选 AP_ERP 仓库 + Contents:Read-only，泄露风险极小
+      - GITHUB_TOKEN=填你的Token
+      # NAS 访问 GitHub 不稳时取消注释走加速前缀
       # - GITHUB_PROXY=https://gh-proxy.com
-    depends_on:
-      db:
-        condition: service_healthy
-
-  # ---------- 外网访问（可选）：Cloudflare Tunnel ----------
-  # 前置条件：一个托管在 Cloudflare 的域名，并已在 Cloudflare Zero Trust
-  # 面板创建隧道拿到 TOKEN（cloudflared tunnel login 后按提示操作）
-  # 取消下面注释并填入 TOKEN 即可外网访问 https://erp.你的域名.com
-  # cloudflared:
-  #   image: cloudflare/cloudflared:latest
-  #   container_name: erp-tunnel
-  #   restart: unless-stopped
-  #   command: tunnel --no-autoupdate run --token 你的隧道TOKEN
-  #   depends_on:
-  #     - erp
-  #   # 隧道指向在 Cloudflare 面板配置：Service 类型 HTTP，URL 填 erp:5000
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux 内核 NAS 必需，让该域名指向宿主机

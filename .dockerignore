@@ -9,3 +9,4 @@ _test_*.py
 *.bak
 Dockerfile
 docker-compose.yml
+docs
