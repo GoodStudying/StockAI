@@ -7,21 +7,17 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<nav>
-  <span class="brand">个人ERP</span>
-  <a href="/">物料管理</a>
-  <a href="/stock.html" class="active">出入库</a>
-  <a href="/warehouses.html">仓库管理</a>
-  <a href="/system.html">系统管理</a>
-  <span class="spacer"></span>
-  <span id="nav-user"></span>
-</nav>
-
-<div class="content">
+<div class="layout">
+<div id="nav-mount"></div>
+<main>
+  <div class="page-head">
+    <h1>出入库</h1>
+    <span class="sub">物料入库 / 出库操作与流水记录</span>
+  </div>
   <div class="panel">
-    <h3>物料出入库操作</h3>
+    <h3 class="pt">物料出入库操作</h3>
     <div class="toolbar">
-      <input id="search-input" placeholder="按名称 / 编码 / 型号搜索物料" style="width:260px"
+      <input id="search-input" placeholder="按名称 / 编码 / 型号搜索物料"
              onkeydown="if(event.key==='Enter')loadMaterials()">
       <select id="filter-warehouse" onchange="loadMaterials()"><option value="">全部仓库</option></select>
       <button onclick="loadMaterials()">查询</button>
@@ -38,7 +34,7 @@
   </div>
 
   <div class="panel">
-    <h3>出入库流水</h3>
+    <h3 class="pt">出入库流水</h3>
     <div class="table-wrap">
     <table>
       <thead><tr>
@@ -48,6 +44,7 @@
     </table>
     </div>
   </div>
+</main>
 </div>
 
 <!-- 入库/出库弹窗 -->
@@ -71,6 +68,7 @@
 let warehouses = [];
 
 async function init() {
+  document.getElementById('nav-mount').innerHTML = renderNav('/stock.html');
   const user = await checkLogin();
   if (!user) return;
   warehouses = await api('/api/warehouses');

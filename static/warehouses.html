@@ -7,19 +7,16 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<nav>
-  <span class="brand">个人ERP</span>
-  <a href="/">物料管理</a>
-  <a href="/stock.html">出入库</a>
-  <a href="/warehouses.html" class="active">仓库管理</a>
-  <a href="/system.html">系统管理</a>
-  <span class="spacer"></span>
-  <span id="nav-user"></span>
-</nav>
-
-<div class="content wh-layout" style="display:flex;gap:14px">
-  <div class="panel" style="width:420px;flex-shrink:0">
-    <h3>仓库结构（最多4级）</h3>
+<div class="layout">
+<div id="nav-mount"></div>
+<main>
+  <div class="page-head">
+    <h1>仓库管理</h1>
+    <span class="sub">多级仓库结构（最多4级）与库内物料</span>
+  </div>
+  <div class="wh-layout" style="display:flex;gap:16px">
+  <div class="panel" style="width:400px;flex-shrink:0">
+    <h3 class="pt">仓库结构</h3>
     <div class="toolbar">
       <button onclick="addWarehouse(null)">新建一级库</button>
       <button class="gray" onclick="expandAll()">全部展开</button>
@@ -29,8 +26,8 @@
   </div>
 
   <div class="panel" style="flex:1;min-width:0">
-    <h3 id="detail-title">库内物料</h3>
-    <p style="font-size:12px;color:#909399;margin-bottom:10px">点击左侧仓库查看该库物料</p>
+    <h3 class="pt" id="detail-title">库内物料</h3>
+    <p style="font-size:12px;color:var(--ink-3);margin-bottom:10px">点击左侧仓库查看该库物料（含子库）</p>
     <div class="table-wrap">
     <table>
       <thead><tr><th>序号</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th><th>所在库</th><th>库存</th></tr></thead>
@@ -38,6 +35,8 @@
     </table>
     </div>
   </div>
+  </div>
+</main>
 </div>
 
 <script src="/common.js"></script>
@@ -46,6 +45,7 @@ let warehouses = [];
 let currentWid = null;
 
 async function init() {
+  document.getElementById('nav-mount').innerHTML = renderNav('/warehouses.html');
   const user = await checkLogin();
   if (!user) return;
   await loadWarehouses();
@@ -122,7 +122,7 @@ async function showWarehouseMaterials(w) {
     ? list.map((m, i) => `<tr><td>${i + 1}</td><td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
         <td>${esc(m.model||'')}</td><td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
         <td>${esc(m.warehouse_name||'')}</td><td>${m.quantity} ${esc(m.unit||'')}</td></tr>`).join('')
-    : '<tr><td colspan="8" style="color:#909399;text-align:center">该库及子库暂无物料</td></tr>';
+    : '<tr><td colspan="8" style="color:var(--ink-3);text-align:center">该库及子库暂无物料</td></tr>';
 }
 
 init();

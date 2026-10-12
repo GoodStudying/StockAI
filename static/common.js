@@ -1,6 +1,5 @@
-/* 共享样式与公共函数 */
+/* 公共 API 与工具函数 */
 
-/* ---------- 公共 API ---------- */
 async function api(url, opts = {}) {
   const r = await fetch(url, opts);
   if (r.status === 401) { location.href = '/login.html'; throw new Error('未登录'); }
@@ -15,15 +14,34 @@ function esc(s) {
 function closeModal(id) { document.getElementById(id).style.display = 'none'; }
 function openModal(id) { document.getElementById(id).style.display = 'flex'; }
 
+/* 侧栏导航模板（各页共用） */
+function renderNav(active) {
+  const pages = [
+    ['/', '物料管理', '◈'],
+    ['/stock.html', '出入库', '⇅'],
+    ['/warehouses.html', '仓库管理', '▤'],
+    ['/system.html', '系统管理', '⚙'],
+  ];
+  return `
+  <aside class="nav">
+    <div class="brand">个人ERP<small>INVENTORY</small></div>
+    ${pages.map(([href, label, ico]) =>
+      `<a href="${href}" class="${href === active ? 'active' : ''}"><span class="ico">${ico}</span>${label}</a>`).join('')}
+    <span class="spacer"></span>
+    <div class="nav-user" id="nav-user"></div>
+  </aside>`;
+}
+
 async function checkLogin() {
   const { user } = await api('/api/me');
   if (!user) { location.href = '/login.html'; return null; }
   const el = document.getElementById('nav-user');
-  if (el) el.innerHTML = `${esc(user.username)}（${user.role === 'admin' ? '管理员' : '普通用户'}）
-    <a href="#" onclick="logout();return false;" style="color:#ffd04b;margin-left:8px">退出</a>`;
+  if (el) el.innerHTML = `${esc(user.username)}<br>
+    <span style="opacity:.7">${user.role === 'admin' ? '管理员' : '普通用户'}</span>
+    <a href="#" onclick="logout();return false;">退出</a>`;
   // 非管理员隐藏系统管理菜单
   if (user.role !== 'admin') {
-    const sys = document.querySelector('nav a[href="/system.html"]');
+    const sys = document.querySelector('aside.nav a[href="/system.html"]');
     if (sys) sys.style.display = 'none';
   }
   return user;

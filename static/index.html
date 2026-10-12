@@ -7,19 +7,15 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<nav>
-  <span class="brand">个人ERP</span>
-  <a href="/" class="active">物料管理</a>
-  <a href="/stock.html">出入库</a>
-  <a href="/warehouses.html">仓库管理</a>
-  <a href="/system.html">系统管理</a>
-  <span class="spacer"></span>
-  <span id="nav-user"></span>
-</nav>
-
-<div class="content">
+<div class="layout">
+<div id="nav-mount"></div>
+<main>
+  <div class="page-head">
+    <h1>物料管理</h1>
+    <span class="sub">新建 / 编辑 / 删除物料，管理手册与图片</span>
+  </div>
   <div class="panel">
-    <h3>物料管理</h3>
+    <h3 class="pt">物料清单</h3>
     <div class="toolbar">
       <input id="search-input" placeholder="按名称 / 编码 / 型号搜索" style="width:240px"
              onkeydown="if(event.key==='Enter')loadMaterials()">
@@ -38,6 +34,7 @@
     </table>
     </div>
   </div>
+</main>
 </div>
 
 <!-- 新建/编辑物料弹窗 -->
@@ -73,7 +70,7 @@
              onkeydown="if(event.key==='Enter')lcscSearch()">
       <button onclick="lcscSearch()">搜索</button>
     </div>
-    <p style="font-size:12px;color:#909399;margin-bottom:8px">
+    <p style="font-size:12px;color:var(--ink-3);margin-bottom:8px">
       输入立创编号可直接获取完整详情；输入型号关键字会搜索匹配的编号列表，点击「查看详情」获取完整信息。</p>
     <div id="lcsc-results"></div>
     <div class="modal-footer">
@@ -106,6 +103,7 @@
 let warehouses = [];
 
 async function init() {
+  document.getElementById('nav-mount').innerHTML = renderNav('/');
   const user = await checkLogin();
   if (!user) return;
   warehouses = await api('/api/warehouses');
@@ -222,17 +220,17 @@ async function lcscSearch() {
   const kw = document.getElementById('lcsc-kw').value.trim();
   if (!kw) return;
   const box = document.getElementById('lcsc-results');
-  box.innerHTML = '<p style="color:#909399;font-size:13px">搜索中，请稍候...</p>';
+  box.innerHTML = '<p style="color:var(--ink-3);font-size:13px">搜索中，请稍候...</p>';
   try {
     const list = await api(`/api/lcsc/search?q=${encodeURIComponent(kw)}`);
     if (!list.length) {
-      box.innerHTML = '<p style="color:#909399;font-size:13px">未找到结果，请换关键字或直接手工新建。</p>';
+      box.innerHTML = '<p style="color:var(--ink-3);font-size:13px">未找到结果，请换关键字或直接手工新建。</p>';
       return;
     }
     box.innerHTML = '';
     list.forEach(it => box.appendChild(makeLcscCard(it)));
   } catch (e) {
-    box.innerHTML = '<p style="color:#909399;font-size:13px">搜索失败，请手工新建。</p>';
+    box.innerHTML = '<p style="color:var(--ink-3);font-size:13px">搜索失败，请手工新建。</p>';
   }
 }
 function makeLcscCard(it) {
