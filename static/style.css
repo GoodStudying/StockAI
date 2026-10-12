@@ -46,6 +46,10 @@ th { background: #f5f7fa; white-space: nowrap; }
 .tree-node:hover .ops { display: inline-flex; gap: 3px; }
 .indent-1 { margin-left: 0; } .indent-2 { margin-left: 20px; }
 .indent-3 { margin-left: 40px; } .indent-4 { margin-left: 60px; }
+.toggle { display: inline-block; width: 16px; text-align: center; color: #909399;
+          flex-shrink: 0; user-select: none; font-size: 12px; }
+.toggle:hover { color: #409eff; }
+.toggle-placeholder { display: inline-block; width: 16px; flex-shrink: 0; }
 
 /* 立创搜索结果卡片 */
 .lcsc-card { border: 1px solid #ebeef5; border-radius: 6px; padding: 10px; margin: 8px 0; font-size: 13px; cursor: pointer; display: flex; gap: 10px; }

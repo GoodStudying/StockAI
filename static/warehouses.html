@@ -21,6 +21,8 @@
     <h3>仓库结构（最多4级）</h3>
     <div class="toolbar">
       <button onclick="addWarehouse(null)">新建一级库</button>
+      <button class="gray" onclick="expandAll()">全部展开</button>
+      <button class="gray" onclick="collapseAll()">全部折叠</button>
     </div>
     <div id="tree"></div>
   </div>
@@ -51,15 +53,21 @@ async function loadWarehouses() {
   warehouses = await api('/api/warehouses');
   renderTree();
 }
+let collapsed = {};  // 折叠状态：id -> true
+
 function renderTree() {
   const el = document.getElementById('tree');
   el.innerHTML = '';
   const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid);
   function render(list) {
     list.forEach(w => {
+      const kids = childrenOf(w.id);
+      const isCollapsed = !!collapsed[w.id];
       const div = document.createElement('div');
       div.className = `tree-node indent-${w.level}`;
-      div.innerHTML = `<span class="badge">L${w.level}</span><span class="name">${esc(w.name)}</span>
+      div.innerHTML = `
+        ${kids.length ? `<span class="toggle" onclick="event.stopPropagation();toggleNode(${w.id})">${isCollapsed ? '▸' : '▾'}</span>` : '<span class="toggle-placeholder"></span>'}
+        <span class="badge">L${w.level}</span><span class="name">${esc(w.name)}</span>
         <span class="badge">${w.material_count ?? 0}项</span>
         <span class="ops">
           ${w.level < 4 ? `<button class="small" onclick="event.stopPropagation();addWarehouse(${w.id})">新建子库</button>` : ''}
@@ -68,10 +76,20 @@ function renderTree() {
         </span>`;
       div.onclick = () => { currentWid = w.id; showWarehouseMaterials(w); };
       el.appendChild(div);
-      render(childrenOf(w.id));
+      if (kids.length && !isCollapsed) render(kids);
     });
   }
   render(childrenOf(null));
+}
+function toggleNode(id) {
+  collapsed[id] = !collapsed[id];
+  renderTree();
+}
+function expandAll() { collapsed = {}; renderTree(); }
+function collapseAll() {
+  // 只折叠有子库的一级库
+  warehouses.filter(w => !w.parent_id).forEach(w => collapsed[w.id] = true);
+  renderTree();
 }
 
 async function addWarehouse(parentId) {
