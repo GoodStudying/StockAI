@@ -113,7 +113,13 @@ async function init() {
   loadMaterials();
 }
 function fillWarehouseSelects() {
-  const opts = warehouses.map(w =>
+  // 深度优先排序：子库紧跟父库，符合树形层级
+  const sorted = [];
+  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid);
+  (function walk(pid) {
+    childrenOf(pid).forEach(w => { sorted.push(w); walk(w.id); });
+  })(null);
+  const opts = sorted.map(w =>
     `<option value="${w.id}">${'　'.repeat(w.level-1)}${esc(w.name)}</option>`).join('');
   document.getElementById('filter-warehouse').innerHTML = '<option value="">全部仓库</option>' + opts;
   document.getElementById('m-warehouse').innerHTML = '<option value="">（未指定）</option>' + opts;
