@@ -1,5 +1,25 @@
 /* 公共 API 与工具函数 */
 
+/* ---------- 主题切换 ---------- */
+const THEMES = [
+  { id: 'classic', name: '经典', ico: '◐' },
+  { id: 'light',   name: '洁净', ico: '○' },
+  { id: 'dark',    name: '暗夜', ico: '●' },
+];
+/* 尽早应用主题，防止刷新闪白（各页面 head 内调用） */
+function applyThemeEarly() {
+  const t = localStorage.getItem('theme') || 'classic';
+  if (t !== 'classic') document.documentElement.setAttribute('data-theme', t);
+}
+/* 切换主题并持久化 */
+function switchTheme(id) {
+  localStorage.setItem('theme', id);
+  if (id === 'classic') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', id);
+  document.querySelectorAll('.theme-dot').forEach(d =>
+    d.classList.toggle('on', d.dataset.theme === id));
+}
+
 async function api(url, opts = {}) {
   const r = await fetch(url, opts);
   if (r.status === 401) { location.href = '/login.html'; throw new Error('未登录'); }
@@ -22,12 +42,17 @@ function renderNav(active) {
     ['/warehouses.html', '仓库管理', '▤'],
     ['/system.html', '系统管理', '⚙'],
   ];
+  const cur = localStorage.getItem('theme') || 'classic';
   return `
   <aside class="nav">
     <div class="brand">个人ERP<small>INVENTORY</small></div>
     ${pages.map(([href, label, ico]) =>
       `<a href="${href}" class="${href === active ? 'active' : ''}"><span class="ico">${ico}</span>${label}</a>`).join('')}
     <span class="spacer"></span>
+    <div class="theme-switch">
+      ${THEMES.map(t => `<span class="theme-dot${t.id === cur ? ' on' : ''}" data-theme="${t.id}"
+        title="${t.name}主题" onclick="switchTheme('${t.id}')">${t.ico}</span>`).join('')}
+    </div>
     <div class="nav-user" id="nav-user"></div>
   </aside>`;
 }

@@ -2,8 +2,12 @@
    个人ERP · 视觉体系
    方向：精致工具感 —— 深石墨侧栏 / 暖白工作区 / 琥珀金点缀
    ============================================================ */
+/* ============================================================
+   主题体系：classic（现有·暖白琥珀）/ light（洁净白）/ dark（暗夜）
+   通过 <html data-theme="..."> 切换，全部走 CSS 变量
+   ============================================================ */
 :root {
-  /* 配色 */
+  /* 配色（classic · 精致工具感：深石墨侧栏 / 暖白工作区 / 琥珀金） */
   --ink: #1c2128;            /* 近黑墨色（主文字） */
   --ink-2: #4a5158;          /* 次级文字 */
   --ink-3: #8b939c;          /* 弱化文字 */
@@ -22,11 +26,91 @@
   --blue-soft: #eef2f8;
   --sidebar: #1e2227;        /* 侧栏深石墨 */
   --sidebar-hi: #2a2f36;
+  --nav-text: #c6cbd1;       /* 侧栏文字 */
+  --nav-link: #aeb4bb;       /* 侧栏链接 */
+  --nav-link-hover: #fff;
+  --nav-active-text: #fff;   /* 侧栏激活项文字 */
+  --nav-line: rgba(255,255,255,.08);  /* 侧栏分隔线 */
+  --brand-text: #fff;        /* 品牌文字 */
+  --btn-gray-bg: #fff;       /* 灰按钮底 */
+  --input-bg: #fff;          /* 输入框底 */
   --radius: 10px;
   --radius-sm: 6px;
   --shadow: 0 1px 2px rgba(28,33,40,.05), 0 4px 16px rgba(28,33,40,.06);
   --shadow-lg: 0 8px 40px rgba(28,33,40,.14);
   --font: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  color-scheme: light;
+}
+
+/* 洁净风格：冷调纯白 + 白色侧栏，干净清爽 */
+html[data-theme="light"] {
+  --ink: #1c2430;
+  --ink-2: #4b5563;
+  --ink-3: #8a93a1;
+  --paper: #f4f6f9;
+  --card: #ffffff;
+  --line: #e9edf2;
+  --line-2: #d9dfe7;
+  --accent: #3b82f6;
+  --accent-deep: #2563eb;
+  --accent-soft: #eef4fe;
+  --green: #109269;
+  --green-soft: #e8f6f1;
+  --red: #d5494f;
+  --red-soft: #fbeff0;
+  --blue: #3b6ea5;
+  --blue-soft: #edf3fa;
+  --sidebar: #ffffff;
+  --sidebar-hi: #f1f4f8;
+  --nav-text: #9aa4b1;
+  --nav-link: #5b6674;
+  --nav-link-hover: #1c2430;
+  --nav-active-text: #fff;
+  --nav-line: #e9edf2;
+  --brand-text: #1c2430;
+  --btn-gray-bg: #fff;
+  --input-bg: #fff;
+  --shadow: 0 1px 2px rgba(28,36,48,.04), 0 4px 16px rgba(28,36,48,.05);
+  color-scheme: light;
+}
+
+/* 暗夜风格：深空底 + 提亮琥珀 */
+html[data-theme="dark"] {
+  --ink: #e6e9ed;
+  --ink-2: #aab3bd;
+  --ink-3: #79828e;
+  --paper: #14171c;
+  --card: #1c2027;
+  --line: #2b313a;
+  --line-2: #3a414c;
+  --accent: #e2a24b;
+  --accent-deep: #c98a35;
+  --accent-soft: rgba(226,162,75,.14);
+  --green: #5cb885;
+  --green-soft: rgba(92,184,133,.14);
+  --red: #e06c6a;
+  --red-soft: rgba(224,108,106,.14);
+  --blue: #7d9cd1;
+  --blue-soft: rgba(125,156,209,.14);
+  --sidebar: #101318;
+  --sidebar-hi: #232830;
+  --nav-text: #aeb4bb;
+  --nav-link: #8b939c;
+  --nav-link-hover: #fff;
+  --nav-active-text: #fff;
+  --nav-line: rgba(255,255,255,.07);
+  --brand-text: #fff;
+  --btn-gray-bg: #262c34;
+  --input-bg: #14171c;
+  --shadow: 0 1px 2px rgba(0,0,0,.2), 0 4px 16px rgba(0,0,0,.25);
+  --shadow-lg: 0 8px 40px rgba(0,0,0,.5);
+  color-scheme: dark;
+}
+
+/* 主题切换时的平滑过渡 */
+body, aside.nav, .panel, .info-cell, th, .lcsc-card, .login-box,
+input, select, textarea, button.gray {
+  transition: background-color .25s ease, color .25s ease, border-color .25s ease;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -44,36 +128,53 @@ body {
 aside.nav {
   width: 200px; flex-shrink: 0;
   background: var(--sidebar);
-  color: #c6cbd1;
+  color: var(--nav-text);
   display: flex; flex-direction: column;
   padding: 22px 12px;
   position: sticky; top: 0; height: 100vh;
+  border-right: 1px solid var(--nav-line);
 }
 .brand {
-  font-size: 18px; font-weight: 700; color: #fff;
+  font-size: 18px; font-weight: 700; color: var(--brand-text);
   letter-spacing: 2px; padding: 0 12px 20px;
-  border-bottom: 1px solid rgba(255,255,255,.08); margin-bottom: 16px;
+  border-bottom: 1px solid var(--nav-line); margin-bottom: 16px;
 }
 .brand small { display: block; font-size: 10px; font-weight: 400; color: var(--ink-3); letter-spacing: 3px; margin-top: 2px; }
 aside.nav a {
   display: flex; align-items: center; gap: 10px;
-  color: #aeb4bb; text-decoration: none;
+  color: var(--nav-link); text-decoration: none;
   padding: 11px 14px; border-radius: var(--radius-sm);
   font-size: 14px; margin-bottom: 4px;
   transition: all .18s;
   white-space: nowrap;
 }
 aside.nav a .ico { font-size: 15px; width: 20px; text-align: center; opacity: .75; }
-aside.nav a:hover { color: #fff; background: var(--sidebar-hi); }
-aside.nav a.active { color: #fff; background: var(--accent); box-shadow: 0 4px 12px rgba(201,134,42,.35); }
+aside.nav a:hover { color: var(--nav-link-hover); background: var(--sidebar-hi); }
+aside.nav a.active { color: var(--nav-active-text); background: var(--accent); box-shadow: 0 4px 12px rgba(201,134,42,.35); }
 aside.nav a.active .ico { opacity: 1; }
 aside.nav .spacer { flex: 1; }
 .nav-user {
-  padding: 14px 12px 0; border-top: 1px solid rgba(255,255,255,.08);
+  padding: 14px 12px 0; border-top: 1px solid var(--nav-line);
   font-size: 12px; color: var(--ink-3); line-height: 1.9;
 }
 .nav-user a { color: var(--accent); text-decoration: none; }
 .nav-user a:hover { text-decoration: underline; }
+
+/* 主题切换按钮（侧栏底部三圆点） */
+.theme-switch {
+  display: flex; gap: 6px; justify-content: center;
+  padding: 0 12px 12px;
+}
+.theme-dot {
+  width: 26px; height: 26px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; cursor: pointer; user-select: none;
+  color: var(--nav-link); background: var(--sidebar-hi);
+  border: 1px solid var(--nav-line);
+  transition: all .15s;
+}
+.theme-dot:hover { color: var(--nav-link-hover); transform: scale(1.12); }
+.theme-dot.on { color: var(--accent); border-color: var(--accent); box-shadow: 0 0 0 2px rgba(201,134,42,.25); }
 
 main { flex: 1; min-width: 0; padding: 26px 30px 40px; }
 
@@ -106,7 +207,7 @@ button {
 button:hover { background: var(--accent-deep); transform: translateY(-1px); box-shadow: 0 4px 10px rgba(201,134,42,.3); }
 button:active { transform: translateY(0); }
 button:disabled { opacity: .55; cursor: not-allowed; transform: none; }
-button.gray { background: #fff; color: var(--ink-2); border: 1px solid var(--line-2); box-shadow: none; }
+button.gray { background: var(--btn-gray-bg); color: var(--ink-2); border: 1px solid var(--line-2); box-shadow: none; }
 button.gray:hover { background: var(--paper); border-color: var(--ink-3); color: var(--ink); }
 button.danger { background: var(--red); box-shadow: 0 2px 6px rgba(192,80,77,.25); }
 button.danger:hover { background: #a84441; }
@@ -117,7 +218,7 @@ button.small.danger { box-shadow: none; }
 input, select, textarea {
   padding: 7px 11px; border: 1px solid var(--line-2);
   border-radius: var(--radius-sm); font-size: 13px; font-family: var(--font);
-  min-width: 0; background: #fff; color: var(--ink);
+  min-width: 0; background: var(--input-bg); color: var(--ink);
   transition: border-color .15s, box-shadow .15s;
 }
 input:focus, select:focus, textarea:focus {
@@ -227,7 +328,7 @@ tbody tr:last-child td { border-bottom: none; }
 .lcsc-card {
   border: 1px solid var(--line); border-radius: var(--radius-sm);
   padding: 12px 14px; margin: 10px 0; font-size: 13px; cursor: pointer;
-  display: flex; gap: 12px; background: #fff;
+  display: flex; gap: 12px; background: var(--card);
   transition: all .15s;
 }
 .lcsc-card:hover { border-color: var(--accent); box-shadow: 0 3px 12px rgba(201,134,42,.12); transform: translateY(-1px); }

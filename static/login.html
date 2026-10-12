@@ -5,6 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>登录 - 个人ERP</title>
 <link rel="stylesheet" href="/style.css">
+<script>
+/* 尽早应用主题，防止刷新时闪回默认配色 */
+(function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
+</script>
 </head>
 <body>
 <div class="login-page">
@@ -17,6 +21,11 @@
            onkeydown="if(event.key==='Enter')doLogin()">
     <button onclick="doLogin()">登 录</button>
     <p class="login-hint">默认账户 admin / admin123（首次登录后请修改）</p>
+    <div class="theme-switch" style="padding-top:14px">
+      <span class="theme-dot" data-theme="classic" title="经典主题" onclick="switchTheme('classic')">◐</span>
+      <span class="theme-dot" data-theme="light" title="洁净主题" onclick="switchTheme('light')">○</span>
+      <span class="theme-dot" data-theme="dark" title="暗夜主题" onclick="switchTheme('dark')">●</span>
+    </div>
   </div>
 </div>
 <script src="/common.js"></script>
