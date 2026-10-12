@@ -29,7 +29,7 @@
     <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>图片</th><th>名称</th><th>编码</th><th>型号</th><th>品牌</th>
+        <th>序号</th><th>图片</th><th>名称</th><th>编码</th><th>型号</th><th>品牌</th>
         <th>库存</th><th>所在库</th><th>操作</th>
       </tr></thead>
       <tbody id="mat-body"></tbody>
@@ -93,7 +93,8 @@ async function loadMaterials() {
   if (q) url += `q=${encodeURIComponent(q)}&`;
   if (wid) url += `warehouse_id=${wid}`;
   const list = await api(url);
-  document.getElementById('mat-body').innerHTML = list.map(m => `<tr>
+  document.getElementById('mat-body').innerHTML = list.map((m, i) => `<tr>
+    <td>${i + 1}</td>
     <td>${m.image_path ? `<img src="/api/materials/${m.id}/image" style="width:40px;height:40px;object-fit:contain"
          onerror="this.replaceWith(document.createTextNode('—'))">` : '—'}</td>
     <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td><td>${esc(m.model||'')}</td>
