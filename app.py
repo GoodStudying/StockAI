@@ -76,10 +76,26 @@ def index():
 
 
 # ---------------- 仓库管理 ----------------
+def _descendant_ids(wid):
+    """递归收集仓库及全部子孙库 id 列表"""
+    ids = [wid]
+    children = db.query("SELECT id FROM warehouses WHERE parent_id=?", (wid,))
+    for c in children:
+        ids += _descendant_ids(c["id"])
+    return ids
+
+
 @app.route("/api/warehouses", methods=["GET"])
 @login_required
 def list_warehouses():
-    return jsonify(db.query("SELECT * FROM warehouses ORDER BY level, id"))
+    """返回全部仓库，附带本库及子孙库物料总数"""
+    rows = db.query("SELECT * FROM warehouses ORDER BY level, id")
+    for w in rows:
+        ids = _descendant_ids(w["id"])
+        ph = ",".join("?" * len(ids))
+        w["material_count"] = db.query(
+            f"SELECT COUNT(*) AS c FROM materials WHERE warehouse_id IN ({ph})", tuple(ids))[0]["c"]
+    return jsonify(rows)
 
 
 @app.route("/api/warehouses", methods=["POST"])
@@ -134,6 +150,7 @@ def delete_warehouse(wid):
 def list_materials():
     kw = (request.args.get("q") or "").strip()
     wid = request.args.get("warehouse_id")
+    include_children = request.args.get("include_children", "1") != "0"  # 默认含子库
     sql = """SELECT m.*, w.name AS warehouse_name FROM materials m
              LEFT JOIN warehouses w ON m.warehouse_id = w.id"""
     conds, params = [], []
@@ -142,8 +159,14 @@ def list_materials():
         like = f"%{kw}%"
         params += [like, like, like]
     if wid:
-        conds.append("m.warehouse_id = ?")
-        params.append(wid)
+        if include_children:
+            # 仓库层级包含关系：查该库及其全部子孙库的物料
+            ph = ",".join("?" * len(ids := _descendant_ids(int(wid))))
+            conds.append(f"m.warehouse_id IN ({ph})")
+            params += ids
+        else:
+            conds.append("m.warehouse_id = ?")
+            params.append(wid)
     if conds:
         sql += " WHERE " + " AND ".join(conds)
     sql += " ORDER BY m.id DESC LIMIT 500"

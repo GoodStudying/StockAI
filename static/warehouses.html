@@ -30,7 +30,7 @@
     <p style="font-size:12px;color:#909399;margin-bottom:10px">点击左侧仓库查看该库物料</p>
     <div class="table-wrap">
     <table>
-      <thead><tr><th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>库存</th></tr></thead>
+      <thead><tr><th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th><th>所在库</th><th>库存</th></tr></thead>
       <tbody id="wh-mat-body"></tbody>
     </table>
     </div>
@@ -60,6 +60,7 @@ function renderTree() {
       const div = document.createElement('div');
       div.className = `tree-node indent-${w.level}`;
       div.innerHTML = `<span class="badge">L${w.level}</span><span class="name">${esc(w.name)}</span>
+        <span class="badge">${w.material_count ?? 0}项</span>
         <span class="ops">
           ${w.level < 4 ? `<button class="small" onclick="event.stopPropagation();addWarehouse(${w.id})">新建子库</button>` : ''}
           <button class="small" onclick="event.stopPropagation();renameWarehouse(${w.id},'${esc(w.name)}')">修改名称</button>
@@ -96,12 +97,13 @@ async function delWarehouse(id) {
   loadWarehouses();
 }
 async function showWarehouseMaterials(w) {
-  document.getElementById('detail-title').textContent = `「${w.name}」库内物料`;
-  const list = await api(`/api/materials?warehouse_id=${w.id}`);
+  document.getElementById('detail-title').textContent = `「${w.name}」库内物料（含子库，共 ${w.material_count ?? 0} 项）`;
+  const list = await api(`/api/materials?warehouse_id=${w.id}`);  // 默认含子库
   document.getElementById('wh-mat-body').innerHTML = list.length
     ? list.map(m => `<tr><td>${m.id}</td><td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
-        <td>${esc(m.model||'')}</td><td>${m.quantity} ${esc(m.unit||'')}</td></tr>`).join('')
-    : '<tr><td colspan="5" style="color:#909399;text-align:center">该库暂无物料</td></tr>';
+        <td>${esc(m.model||'')}</td><td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
+        <td>${esc(m.warehouse_name||'')}</td><td>${m.quantity} ${esc(m.unit||'')}</td></tr>`).join('')
+    : '<tr><td colspan="8" style="color:#909399;text-align:center">该库及子库暂无物料</td></tr>';
 }
 
 init();
