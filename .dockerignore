@@ -1,0 +1,11 @@
+.git
+.venv
+__pycache__
+*.pyc
+data
+uploads
+.env
+_test_*.py
+*.bak
+Dockerfile
+docker-compose.yml

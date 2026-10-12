@@ -1,0 +1,26 @@
+# 个人ERP · 飞牛 fnOS / Docker 部署配置
+# 用法：docker compose up -d --build
+services:
+  erp:
+    build: .
+    container_name: personal-erp
+    restart: unless-stopped      # NAS 重启后自动拉起
+    ports:
+      - "5800:5000"              # NAS局域网访问端口，冲突可改 5801:5000
+    volumes:
+      - ./data:/app/data         # SQLite 数据库持久化（备份=data 文件夹）
+    environment:
+      - TZ=Asia/Shanghai
+
+  # ---------- 外网访问（可选）：Cloudflare Tunnel ----------
+  # 前置条件：一个托管在 Cloudflare 的域名，并已在 Cloudflare Zero Trust
+  # 面板创建隧道拿到 TOKEN（cloudflared tunnel login 后按提示操作）
+  # 取消下面注释并填入 TOKEN 即可外网访问 https://erp.你的域名.com
+  # cloudflared:
+  #   image: cloudflare/cloudflared:latest
+  #   container_name: erp-tunnel
+  #   restart: unless-stopped
+  #   command: tunnel --no-autoupdate run --token 你的隧道TOKEN
+  #   depends_on:
+  #     - erp
+  #   # 隧道指向在 Cloudflare 面板配置：Service 类型 HTTP，URL 填 erp:5000
