@@ -9,10 +9,9 @@
 import os
 import re
 import io
+import base64
 import hashlib
 import shutil
-import tarfile
-import tempfile
 import threading
 from datetime import datetime
 from functools import wraps
@@ -120,7 +119,8 @@ GITHUB_PROXY = os.environ.get("GITHUB_PROXY", "").rstrip("/")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 VERSION_FILE = os.path.join(BASE_DIR, ".version")
 # 更新时绝不覆盖的本地目录/文件（数据与环境配置）
-_UPD_KEEP = {".env", "data", "uploads", "__pycache__", ".git", ".version"}
+_UPD_KEEP = {".env", "data", "uploads", "__pycache__", ".git", ".version",
+             "docker-compose.yml", "Dockerfile", "start.sh", ".dockerignore"}
 
 
 def _gh(path):
@@ -173,40 +173,54 @@ def update_status():
 @app.route("/api/update/apply", methods=["POST"])
 @admin_required
 def update_apply():
-    """从 GitHub 下载最新代码覆盖到 /app 并平滑重启（数据库不受影响）"""
+    """从 GitHub 下载最新代码覆盖到 /app 并平滑重启（数据库与部署配置不受影响）"""
     import requests
     if not GITHUB_REPO:
         return jsonify({"error": "未配置 GITHUB_REPO 环境变量（格式：用户名/仓库名）"}), 400
-    # 1. 仓库 tarball（stream 下载，避免占用内存）
-    url = _gh(f"https://codeload.github.com/{GITHUB_REPO}/tar.gz/refs/heads/{GITHUB_BRANCH}")
-    try:
-        r = requests.get(url, timeout=120, stream=True, headers=_gh_headers())
+
+    def _fetch_tree():
+        """经 api.github.com 拉取分支完整文件树（国内 NAS 通常可直连该域名）"""
+        url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}?recursive=1")
+        r = requests.get(url, timeout=30, headers=_gh_headers())
         if not r.ok:
-            return jsonify({"error": f"下载失败 HTTP {r.status_code}"}), 502
-        tmp = os.path.join(tempfile.gettempdir(), "erp_update.tgz")
-        with open(tmp, "wb") as f:
-            shutil.copyfileobj(r.raw, f)
-    except Exception as e:
-        return jsonify({"error": f"下载失败：{e}。NAS 若无法直连 GitHub，请配置 GITHUB_PROXY 加速前缀"}), 502
-    # 2. 解包覆盖（跳过数据/环境文件，防目录穿越）
+            raise RuntimeError(f"获取文件树失败 HTTP {r.status_code}")
+        tree = r.json().get("tree", [])
+        files = [t for t in tree if t.get("type") == "blob"]
+        if not files:
+            raise RuntimeError("仓库文件树为空")
+        return files
+
+    def _write_base64(content_b64, rel):
+        """base64 内容写入目标文件（自动建目录）"""
+        dest = os.path.join(BASE_DIR, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(base64.b64decode(content_b64))
+
+    # 1. 拉文件树
     try:
-        with tarfile.open(tmp) as tar:
-            names = tar.getnames()
-            root = names[0].split("/")[0] if names else ""
-            for m in tar.getmembers():
-                if not m.isfile():
-                    continue
-                rel = m.name[len(root) + 1:] if m.name.startswith(root + "/") else m.name
-                if not rel or ".." in rel.split("/"):
-                    continue
-                if rel.split("/")[0] in _UPD_KEEP:
-                    continue
-                dest = os.path.join(BASE_DIR, rel)
-                os.makedirs(os.path.dirname(dest), exist_ok=True)
-                with tar.extractfile(m) as src, open(dest, "wb") as out:
-                    shutil.copyfileobj(src, out)
+        files = _fetch_tree()
     except Exception as e:
-        return jsonify({"error": f"解包失败：{e}"}), 500
+        return jsonify({"error": f"{e}。请检查 GITHUB_TOKEN 权限（需 Contents:Read-only）或配置 GITHUB_PROXY"}), 502
+    # 过滤：跳过数据/环境/部署配置文件
+    files = [t for t in files if t["path"].split("/")[0] not in _UPD_KEEP
+             and ".." not in t["path"].split("/")]
+    # 2. 逐文件下载（经 api.github.com 的 contents 接口，走与查版本相同的可达域名）
+    done, errs = 0, []
+    for t in files:
+        rel = t["path"]
+        url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{rel}?ref={GITHUB_BRANCH}")
+        try:
+            r = requests.get(url, timeout=30, headers=_gh_headers())
+            if not r.ok:
+                errs.append(f"{rel}: HTTP {r.status_code}")
+                continue
+            _write_base64(r.json().get("content", ""), rel)
+            done += 1
+        except Exception as e:
+            errs.append(f"{rel}: {e}")
+    if errs and done == 0:
+        return jsonify({"error": "全部文件下载失败：" + "; ".join(errs[:3])}), 502
     # 3. 记录新版本号
     try:
         sha = _remote_version()
@@ -226,8 +240,10 @@ def update_apply():
         except Exception:
             os._exit(0)
     threading.Thread(target=_reload, daemon=True).start()
-    return jsonify({"ok": True, "version": sha[:7],
-                    "msg": "更新完成，服务正在平滑重启，约 5 秒后请刷新页面"})
+    msg = f"更新完成（{done} 个文件），服务正在平滑重启，约 5 秒后请刷新页面"
+    if errs:
+        msg += f"。{len(errs)} 个文件失败：{errs[0]}"
+    return jsonify({"ok": True, "version": sha[:7], "msg": msg})
 
 
 # ---------------- 页面路由 ----------------
