@@ -253,6 +253,19 @@ def lcsc_search():
     return jsonify(lcsc.search_lcsc(kw))
 
 
+@app.route("/api/lcsc/detail", methods=["GET"])
+@login_required
+def lcsc_detail():
+    """按 C 编号抓取完整详情"""
+    code = (request.args.get("code") or "").strip()
+    if not code:
+        return jsonify({"error": "编号不能为空"}), 400
+    result = lcsc.fetch_detail(code)
+    if not result:
+        return jsonify({"error": "未获取到详情（编号可能无效或网络受限）"}), 404
+    return jsonify(result[0])
+
+
 # ---------------- 手册上传 / 下载 ----------------
 ALLOWED_DOC_TYPES = {"datasheet", "user_manual", "other"}
 

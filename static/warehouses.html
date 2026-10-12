@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>仓库管理 - 个人ERP</title>
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -15,22 +16,24 @@
   <span id="nav-user"></span>
 </nav>
 
-<div class="content" style="display:flex;gap:14px">
-  <div class="panel" style="width:420px">
+<div class="content wh-layout" style="display:flex;gap:14px">
+  <div class="panel" style="width:420px;flex-shrink:0">
     <h3>仓库结构（最多4级）</h3>
     <div class="toolbar">
-      <button onclick="addWarehouse(null)">+ 新建一级库</button>
+      <button onclick="addWarehouse(null)">新建一级库</button>
     </div>
     <div id="tree"></div>
   </div>
 
-  <div class="panel" style="flex:1">
+  <div class="panel" style="flex:1;min-width:0">
     <h3 id="detail-title">库内物料</h3>
     <p style="font-size:12px;color:#909399;margin-bottom:10px">点击左侧仓库查看该库物料</p>
+    <div class="table-wrap">
     <table>
       <thead><tr><th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>库存</th></tr></thead>
       <tbody id="wh-mat-body"></tbody>
     </table>
+    </div>
   </div>
 </div>
 
@@ -56,10 +59,10 @@ function renderTree() {
     list.forEach(w => {
       const div = document.createElement('div');
       div.className = `tree-node indent-${w.level}`;
-      div.innerHTML = `<span class="badge">L${w.level}</span><span>${esc(w.name)}</span>
+      div.innerHTML = `<span class="badge">L${w.level}</span><span class="name">${esc(w.name)}</span>
         <span class="ops">
-          ${w.level < 4 ? `<button class="small" onclick="event.stopPropagation();addWarehouse(${w.id})">+子库</button>` : ''}
-          <button class="small" onclick="event.stopPropagation();renameWarehouse(${w.id},'${esc(w.name)}')">改名</button>
+          ${w.level < 4 ? `<button class="small" onclick="event.stopPropagation();addWarehouse(${w.id})">新建子库</button>` : ''}
+          <button class="small" onclick="event.stopPropagation();renameWarehouse(${w.id},'${esc(w.name)}')">修改名称</button>
           <button class="small danger" onclick="event.stopPropagation();delWarehouse(${w.id})">删除</button>
         </span>`;
       div.onclick = () => { currentWid = w.id; showWarehouseMaterials(w); };

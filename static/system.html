@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>系统管理 - 个人ERP</title>
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -22,7 +23,7 @@
     <div id="db-info" style="font-size:13px;line-height:2">加载中...</div>
     <div class="toolbar" style="margin-top:10px">
       <button onclick="location.href='/api/db/backup'">备份数据库（下载）</button>
-      <button class="gray" onclick="loadDbInfo()">刷新</button>
+      <button class="gray" onclick="loadDbInfo()">刷新数据</button>
     </div>
     <p style="font-size:12px;color:#909399">
       切换到 PostgreSQL：编辑项目根目录 .env，将 DB_TYPE 改为 postgres 并填写 POSTGRES_DSN，重启服务即可。</p>
@@ -32,12 +33,14 @@
   <div class="panel">
     <h3>账户管理</h3>
     <div class="toolbar">
-      <button onclick="openUserModal()">+ 新建账户</button>
+      <button onclick="openUserModal()">新建账户</button>
     </div>
+    <div class="table-wrap">
     <table>
       <thead><tr><th>ID</th><th>用户名</th><th>角色</th><th>创建时间</th><th>操作</th></tr></thead>
       <tbody id="user-body"></tbody>
     </table>
+    </div>
   </div>
 </div>
 
@@ -83,7 +86,7 @@ async function loadUsers() {
     <td>${u.id}</td><td>${esc(u.username)}</td>
     <td><span class="badge">${u.role === 'admin' ? '管理员' : '普通用户'}</span></td>
     <td>${u.created_at}</td>
-    <td>
+    <td style="white-space:nowrap">
       <button class="small" onclick="resetPass(${u.id})">重置密码</button>
       <button class="small gray" onclick="toggleRole(${u.id},'${u.role}')">切换角色</button>
       <button class="small danger" onclick="delUser(${u.id})">删除</button>

@@ -1,30 +1,31 @@
 /* 共享CSS */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: "Microsoft YaHei", sans-serif; background: #f0f2f5; }
-nav { background: #1f2d3d; color: #fff; padding: 0 20px; display: flex; align-items: center; height: 50px; }
-nav .brand { font-size: 17px; font-weight: bold; margin-right: 30px; }
-nav a { color: #c0c4cc; text-decoration: none; padding: 15px 16px; font-size: 14px; }
+nav { background: #1f2d3d; color: #fff; padding: 0 12px; display: flex; align-items: center; height: 50px; flex-wrap: wrap; }
+nav .brand { font-size: 17px; font-weight: bold; margin-right: 16px; white-space: nowrap; }
+nav a { color: #c0c4cc; text-decoration: none; padding: 15px 10px; font-size: 14px; white-space: nowrap; }
 nav a:hover, nav a.active { color: #fff; background: #2c3e50; }
 nav .spacer { flex: 1; }
-nav #nav-user { font-size: 13px; color: #c0c4cc; }
+nav #nav-user { font-size: 13px; color: #c0c4cc; white-space: nowrap; }
 .content { padding: 16px; }
 .panel { background: #fff; border-radius: 8px; padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-bottom: 14px; }
 h3 { margin-bottom: 12px; font-size: 15px; color: #333; border-bottom: 2px solid #409eff; padding-bottom: 6px; }
-button { background: #409eff; color: #fff; border: none; border-radius: 4px; padding: 5px 12px; cursor: pointer; font-size: 13px; }
+button { background: #409eff; color: #fff; border: none; border-radius: 4px; padding: 6px 14px; cursor: pointer; font-size: 13px;
+         white-space: nowrap; flex-shrink: 0; }  /* 完整显示按钮文字，不换行不截断 */
 button:hover { background: #66b1ff; }
 button.danger { background: #f56c6c; }
 button.gray { background: #909399; }
-button.small { padding: 2px 8px; font-size: 12px; }
-input, select, textarea { padding: 5px 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 13px; }
+button.small { padding: 4px 10px; font-size: 12px; }
+input, select, textarea { padding: 6px 8px; border: 1px solid #dcdfe6; border-radius: 4px; font-size: 13px; min-width: 0; }
 table { width: 100%; border-collapse: collapse; font-size: 13px; }
 th, td { border: 1px solid #ebeef5; padding: 6px 8px; text-align: left; }
-th { background: #f5f7fa; }
+th { background: #f5f7fa; white-space: nowrap; }
 .toolbar { display: flex; gap: 8px; margin-bottom: 12px; align-items: center; flex-wrap: wrap; }
-.modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; justify-content: center; align-items: center; z-index: 99; }
-.modal { background: #fff; border-radius: 8px; padding: 20px; width: 520px; max-height: 85vh; overflow-y: auto; }
+.modal-mask { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; justify-content: center; align-items: center; z-index: 99; padding: 12px; }
+.modal { background: #fff; border-radius: 8px; padding: 20px; width: 520px; max-width: 100%; max-height: 88vh; overflow-y: auto; }
 .form-row { display: flex; align-items: center; margin-bottom: 10px; gap: 8px; }
 .form-row label { width: 90px; font-size: 13px; color: #606266; flex-shrink: 0; }
-.form-row input, .form-row select, .form-row textarea { flex: 1; }
+.form-row input, .form-row select, .form-row textarea { flex: 1; width: 100%; }
 .modal-footer { text-align: right; margin-top: 12px; }
 .modal-footer button { margin-left: 8px; }
 .badge { display: inline-block; background: #ecf5ff; color: #409eff; border-radius: 3px; padding: 0 5px; font-size: 11px; }
@@ -32,15 +33,53 @@ th { background: #f5f7fa; }
 .badge.out { background: #fef0f0; color: #f56c6c; }
 
 /* 登录页 */
-.login-box { width: 340px; margin: 120px auto; background: #fff; border-radius: 8px; padding: 30px; box-shadow: 0 2px 12px rgba(0,0,0,.15); }
+.login-box { width: 340px; max-width: calc(100vw - 32px); margin: 100px auto; background: #fff; border-radius: 8px; padding: 30px; box-shadow: 0 2px 12px rgba(0,0,0,.15); }
 .login-box h2 { text-align: center; margin-bottom: 20px; color: #1f2d3d; }
 .login-box input { width: 100%; padding: 9px; margin-bottom: 14px; }
 .login-box button { width: 100%; padding: 9px; font-size: 15px; }
 
 /* 仓库树 */
-.tree-node { padding: 4px 4px; cursor: pointer; border-radius: 4px; display: flex; align-items: center; gap: 5px; font-size: 14px; }
+.tree-node { padding: 4px; cursor: pointer; border-radius: 4px; display: flex; align-items: center; gap: 5px; font-size: 14px; flex-wrap: wrap; }
 .tree-node:hover { background: #ecf5ff; }
+.tree-node .name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tree-node .ops { display: none; margin-left: auto; }
-.tree-node:hover .ops { display: inline; }
+.tree-node:hover .ops { display: inline-flex; gap: 3px; }
 .indent-1 { margin-left: 0; } .indent-2 { margin-left: 20px; }
 .indent-3 { margin-left: 40px; } .indent-4 { margin-left: 60px; }
+
+/* 立创搜索结果卡片 */
+.lcsc-card { border: 1px solid #ebeef5; border-radius: 6px; padding: 10px; margin: 8px 0; font-size: 13px; cursor: pointer; display: flex; gap: 10px; }
+.lcsc-card:hover { border-color: #409eff; background: #f5faff; }
+.lcsc-card img { width: 60px; height: 60px; object-fit: contain; background: #fafafa; border-radius: 4px; flex-shrink: 0; }
+.lcsc-card .info { flex: 1; min-width: 0; }
+.lcsc-card .model { font-weight: bold; font-size: 14px; }
+.lcsc-card .meta { color: #909399; margin-top: 2px; }
+.lcsc-card .desc { color: #606266; margin-top: 4px; font-size: 12px;
+                   display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.lcsc-card .pick { flex-shrink: 0; align-self: center; }
+
+/* ============ 手机适配（≤768px） ============ */
+@media (max-width: 768px) {
+  nav { height: auto; padding: 6px 8px; }
+  nav .brand { margin-right: 8px; font-size: 16px; }
+  nav a { padding: 8px 8px; font-size: 13px; }
+  nav #nav-user { width: 100%; padding: 4px 0; }
+  .content { padding: 10px; }
+  .panel { padding: 12px; border-radius: 6px; }
+  .toolbar input { width: 100% !important; }
+  .toolbar button { flex: 1; }
+  .modal { width: 100%; padding: 14px; }
+  .form-row { flex-wrap: wrap; }
+  .form-row label { width: 100%; margin-bottom: 2px; }
+
+  /* 表格横向滚动容器 */
+  .table-wrap { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .table-wrap table { min-width: 700px; }
+
+  /* 仓库管理页左右布局改上下 */
+  .wh-layout { display: block !important; }
+  .wh-layout .panel { width: 100% !important; }
+
+  .tree-node .ops { display: inline-flex; gap: 3px; margin-left: 0; }  /* 触屏无hover，常显操作 */
+  .lcsc-card img { width: 48px; height: 48px; }
+}

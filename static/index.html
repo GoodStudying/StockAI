@@ -2,6 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>物料管理 - 个人ERP</title>
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -23,26 +24,30 @@
              onkeydown="if(event.key==='Enter')loadMaterials()">
       <select id="filter-warehouse" onchange="loadMaterials()"><option value="">全部仓库</option></select>
       <button onclick="loadMaterials()">查询</button>
-      <button onclick="openMaterialModal()">+ 新建物料</button>
+      <button onclick="openMaterialModal()">新建物料</button>
       <button class="gray" onclick="openLcscModal()">从立创商城新建</button>
     </div>
+    <div class="table-wrap">
     <table>
       <thead><tr>
         <th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th>
-        <th>库存</th><th>所在库</th><th>手册</th><th style="width:210px">操作</th>
+        <th>库存</th><th>所在库</th><th>手册</th><th>操作</th>
       </tr></thead>
       <tbody id="mat-body"></tbody>
     </table>
+    </div>
   </div>
 
   <div class="panel">
     <h3>出入库流水</h3>
+    <div class="table-wrap">
     <table>
       <thead><tr>
         <th>时间</th><th>物料</th><th>编码</th><th>类型</th><th>数量</th><th>操作人</th><th>备注</th>
       </tr></thead>
       <tbody id="record-body"></tbody>
     </table>
+    </div>
   </div>
 </div>
 
@@ -75,10 +80,12 @@
     <h3>从立创商城获取物料</h3>
     <div class="form-row">
       <label>关键字</label>
-      <input id="lcsc-kw" placeholder="立创编号(C25804) 或 型号"
+      <input id="lcsc-kw" placeholder="立创编号(C25804) 或 型号(STM32F103C8T6)"
              onkeydown="if(event.key==='Enter')lcscSearch()">
       <button onclick="lcscSearch()">搜索</button>
     </div>
+    <p style="font-size:12px;color:#909399;margin-bottom:8px">
+      输入立创编号可直接获取完整详情；输入型号关键字会搜索匹配的编号列表，点击「查看详情」获取完整信息。</p>
     <div id="lcsc-results"></div>
     <div class="modal-footer">
       <button class="gray" onclick="closeModal('lcsc-modal')">关闭</button>
@@ -116,7 +123,7 @@
     <div class="form-row"><label>备注</label><input id="s-remark"></div>
     <div class="modal-footer">
       <button class="gray" onclick="closeModal('stock-modal')">取消</button>
-      <button onclick="submitStock()">确认</button>
+      <button onclick="submitStock()">确认提交</button>
     </div>
   </div>
 </div>
@@ -154,12 +161,12 @@ async function loadMaterials() {
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
     <td>${(m.documents||[]).map(d =>
       `<a href="/api/documents/${d.id}">${esc(d.file_name)}</a>`).join(' ')}
-      <button class="small" onclick="openDocModal(${m.id})">传</button></td>
-    <td>
+      <button class="small" onclick="openDocModal(${m.id})">上传手册</button></td>
+    <td style="white-space:nowrap">
       <button class="small" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'in')">入库</button>
       <button class="small gray" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'out')">出库</button>
-      <button class="small" onclick='editMaterial(${JSON.stringify(m)})'>编</button>
-      <button class="small danger" onclick="delMaterial(${m.id})">删</button>
+      <button class="small" onclick='editMaterial(${JSON.stringify(m)})'>编辑</button>
+      <button class="small danger" onclick="delMaterial(${m.id})">删除</button>
     </td></tr>`).join('');
 }
 function openMaterialModal() {
@@ -247,31 +254,60 @@ async function loadRecords() {
 // ---------- 立创商城 ----------
 function openLcscModal() {
   document.getElementById('lcsc-results').innerHTML = '';
+  document.getElementById('lcsc-kw').value = '';
   openModal('lcsc-modal');
 }
 async function lcscSearch() {
   const kw = document.getElementById('lcsc-kw').value.trim();
   if (!kw) return;
   const box = document.getElementById('lcsc-results');
-  box.innerHTML = '搜索中...';
+  box.innerHTML = '<p style="color:#909399;font-size:13px">搜索中，请稍候...</p>';
   try {
     const list = await api(`/api/lcsc/search?q=${encodeURIComponent(kw)}`);
-    if (!list.length) { box.innerHTML = '未找到结果，请手工新建。'; return; }
+    if (!list.length) {
+      box.innerHTML = '<p style="color:#909399;font-size:13px">未找到结果，请换关键字或直接手工新建。</p>';
+      return;
+    }
     box.innerHTML = '';
-    list.forEach(it => {
-      const div = document.createElement('div');
-      div.style.cssText = 'border:1px solid #ebeef5;border-radius:4px;padding:8px;margin:6px 0;font-size:12px;cursor:pointer';
-      div.innerHTML = `<b>${esc(it.code)}</b> ${esc(it.model)} [${esc(it.brand)}] ${esc(it.package)}<br>
-        <span style="color:#909399">${esc(it.category||'')}</span>`;
-      div.onclick = () => fillFromLcsc(it);
-      box.appendChild(div);
-    });
-  } catch (e) { box.innerHTML = '搜索失败，请手工新建。'; }
+    list.forEach(it => box.appendChild(makeLcscCard(it)));
+  } catch (e) {
+    box.innerHTML = '<p style="color:#909399;font-size:13px">搜索失败，请手工新建。</p>';
+  }
+}
+function makeLcscCard(it) {
+  const div = document.createElement('div');
+  div.className = 'lcsc-card';
+  const hasDetail = !!(it.model || it.name);
+  div.innerHTML = `
+    ${it.image ? `<img src="${esc(it.image)}" onerror="this.style.display='none'">` : ''}
+    <div class="info">
+      <div class="model">${esc(it.model || it.code)}</div>
+      <div class="meta">${esc(it.code)}${it.brand ? ' · ' + esc(it.brand) : ''}${it.package ? ' · ' + esc(it.package) : ''}${it.stock ? ' · 库存' + esc(it.stock) : ''}${it.price ? ' · $' + esc(it.price) : ''}</div>
+      ${it.description ? `<div class="desc">${esc(it.description)}</div>` : ''}
+    </div>
+    <div class="pick">
+      ${hasDetail ? '' : `<button class="small" onclick="loadLcscDetail('${it.code}', this)">查看详情</button>`}
+      <button class="small" onclick='fillFromLcsc(${JSON.stringify(it)})'>选中新建</button>
+    </div>`;
+  return div;
+}
+async function loadLcscDetail(code, btn) {
+  const card = btn.closest('.lcsc-card');
+  btn.disabled = true;
+  btn.textContent = '获取中...';
+  try {
+    const it = await api(`/api/lcsc/detail?code=${encodeURIComponent(code)}`);
+    const div = makeLcscCard(it);
+    card.replaceWith(div);
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '查看详情';
+  }
 }
 function fillFromLcsc(it) {
   closeModal('lcsc-modal');
   openMaterialModal();
-  document.getElementById('m-name').value = it.name || it.model;
+  document.getElementById('m-name').value = it.name || it.model || it.code;
   document.getElementById('m-code').value = it.code;
   document.getElementById('m-model').value = it.model;
   document.getElementById('m-category').value = it.category || '';
@@ -279,6 +315,9 @@ function fillFromLcsc(it) {
   document.getElementById('m-brand').value = it.brand || '';
   document.getElementById('m-lcsc').value = it.url || '';
   document.getElementById('m-desc').value = it.description || '';
+  if (it.datasheet_url) {
+    document.getElementById('m-desc').value += (it.description ? '\n' : '') + '手册: ' + it.datasheet_url;
+  }
 }
 
 // ---------- 手册上传 ----------
