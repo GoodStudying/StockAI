@@ -195,26 +195,35 @@ def search_by_keyword_via_bing(keyword: str, limit=6):
 
 def download_datasheet(datasheet_url: str, save_dir: str):
     """
-    下载立创手册 PDF 到本地（失败自动重试一次）。
+    下载立创手册 PDF 到本地磁盘（旧接口，保留兼容）。
     返回 (保存路径, 文件名) 或 (None, None)。
+    """
+    data, fname = fetch_datasheet_bytes(datasheet_url)
+    if not data:
+        return None, None
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, fname)
+    with open(path, "wb") as f:
+        f.write(data)
+    return path, fname
+
+
+def fetch_datasheet_bytes(datasheet_url: str):
+    """
+    下载立创手册 PDF 到内存（存数据库 BLOB 用，失败自动重试一次）。
+    返回 (bytes, 文件名) 或 (None, None)。
     """
     if not datasheet_url:
         return None, None
 
     def _try_download():
-        r = requests.get(datasheet_url, headers=HEADERS, timeout=60, stream=True)
-        if r.status_code != 200:
+        r = requests.get(datasheet_url, headers=HEADERS, timeout=60)
+        if r.status_code != 200 or not r.content:
             return None
-        os.makedirs(save_dir, exist_ok=True)
         # 文件名：优先 URL 里的哈希，否则用默认名
         m = re.search(r'/([0-9a-fA-F]{16,})\.pdf', datasheet_url)
         stem = m.group(1) if m else "datasheet"
-        fname = f"{stem}.pdf"
-        path = os.path.join(save_dir, fname)
-        with open(path, "wb") as f:
-            for chunk in r.iter_content(8192):
-                f.write(chunk)
-        return path, fname
+        return r.content, f"{stem}.pdf"
 
     for _ in range(2):  # 重试一次
         try:
@@ -228,8 +237,25 @@ def download_datasheet(datasheet_url: str, save_dir: str):
 
 def download_image(image_url: str, code: str, save_dir: str):
     """
-    下载立创物料图片到本地。
+    下载立创物料图片到本地磁盘（旧接口，保留兼容）。
     返回 保存路径 或 None。
+    """
+    data = fetch_image_bytes(image_url)
+    if not data:
+        return None
+    # 根据内容判断扩展名
+    ext = ".png" if data[:8] == b"\x89PNG\r\n\x1a\n" else ".jpg"
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, f"{code}{ext}")
+    with open(path, "wb") as f:
+        f.write(data)
+    return path
+
+
+def fetch_image_bytes(image_url: str):
+    """
+    下载立创物料图片到内存（存数据库 BLOB 用）。
+    返回 bytes 或 None。
     """
     if not image_url:
         return None
@@ -239,14 +265,11 @@ def download_image(image_url: str, code: str, save_dir: str):
         r = requests.get(image_url, headers=HEADERS, timeout=20)
         if r.status_code != 200 or not r.content:
             return None
-        # 根据Content-Type或URL后缀定扩展名
-        ct = r.headers.get("Content-Type", "")
-        ext = ".png" if "png" in ct or ".png" in image_url.lower() else ".jpg"
-        os.makedirs(save_dir, exist_ok=True)
-        path = os.path.join(save_dir, f"{code}{ext}")
-        with open(path, "wb") as f:
-            f.write(r.content)
-        return path
+        # 仅接受图片内容（按魔数粗验）
+        if r.content[:3] == b"\xff\xd8\xff" or r.content[:8] == b"\x89PNG\r\n\x1a\n" \
+           or r.content[:6] in (b"GIF89a", b"GIF87a") or r.content[:4] == b"RIFF":
+            return r.content
+        return None
     except Exception:
         return None
 

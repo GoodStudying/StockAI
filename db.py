@@ -112,7 +112,8 @@ CREATE TABLE IF NOT EXISTS materials (
     unit TEXT DEFAULT '个',
     warehouse_id INTEGER REFERENCES warehouses(id),
     lcsc_url TEXT,            -- 立创商城链接
-    image_path TEXT,          -- 立创图片本地路径
+    image_path TEXT,          -- 立创图片本地路径（旧字段，保留兼容）
+    image_blob BLOB,          -- 图片内容（存数据库，优先于 image_path）
     created_at TEXT DEFAULT (datetime('now','localtime')),
     updated_at TEXT DEFAULT (datetime('now','localtime'))
 );
@@ -123,6 +124,7 @@ CREATE TABLE IF NOT EXISTS material_documents (
     doc_type TEXT NOT NULL,   -- datasheet / user_manual / other
     file_path TEXT NOT NULL,
     file_name TEXT NOT NULL,
+    file_blob BLOB,           -- 文件内容（存数据库，与 file_path 二选一，优先 BLOB）
     uploaded_at TEXT DEFAULT (datetime('now','localtime'))
 );
 
@@ -165,6 +167,41 @@ def run_migrations():
     cols = {r["name"] for r in query("PRAGMA table_info(materials)")}
     if "image_path" not in cols:
         execute_write("ALTER TABLE materials ADD COLUMN image_path TEXT")
+    if "image_blob" not in cols:
+        execute_write("ALTER TABLE materials ADD COLUMN image_blob BLOB")
+
+    doc_cols = {r["name"] for r in query("PRAGMA table_info(material_documents)")}
+    if "file_blob" not in doc_cols:
+        execute_write("ALTER TABLE material_documents ADD COLUMN file_blob BLOB")
+
+    _migrate_files_to_blob()
+
+
+def _migrate_files_to_blob():
+    """
+    存量文件入库迁移：把 uploads/ 下已存在的图片和手册读入数据库 BLOB。
+    仅迁移一次（有 BLOB 的记录跳过），文件保留在磁盘作备份，新数据一律走 BLOB。
+    """
+    import config
+    # 图片：materials.image_path -> image_blob
+    for r in query("SELECT id, image_path FROM materials WHERE image_blob IS NULL AND image_path IS NOT NULL"):
+        p = r["image_path"]
+        if p and os.path.exists(p):
+            try:
+                with open(p, "rb") as f:
+                    execute_write("UPDATE materials SET image_blob=? WHERE id=?", (f.read(), r["id"]))
+            except OSError:
+                pass
+
+    # 手册：material_documents.file_path -> file_blob
+    for r in query("SELECT id, file_path FROM material_documents WHERE file_blob IS NULL"):
+        p = r["file_path"]
+        if p and os.path.exists(p):
+            try:
+                with open(p, "rb") as f:
+                    execute_write("UPDATE material_documents SET file_blob=? WHERE id=?", (f.read(), r["id"]))
+            except OSError:
+                pass
 
 
 

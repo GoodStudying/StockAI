@@ -137,7 +137,7 @@ async function loadMaterials() {
   const list = await api(url);
   document.getElementById('mat-body').innerHTML = list.map((m, i) => `<tr>
     <td>${i + 1}</td>
-    <td>${m.image_path ? `<img src="/api/materials/${m.id}/image" style="width:44px;height:44px;object-fit:contain;cursor:zoom-in"
+    <td>${(m.image_path || m.has_image) ? `<img src="/api/materials/${m.id}/image" style="width:44px;height:44px;object-fit:contain;cursor:zoom-in"
          title="点击查看大图" onclick="window.open('/api/materials/${m.id}/image')"
          onerror="this.replaceWith(document.createTextNode('—'))">` : '—'}</td>
     <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
@@ -153,7 +153,7 @@ async function loadMaterials() {
       <button class="small" onclick="openDocModal(${m.id})">上传手册</button>
       ${m.code ? `<button class="small" onclick="autoFetchDoc(${m.id}, this)">获取手册</button>` : ''}</td>
     <td style="white-space:nowrap">
-      ${m.code && !m.image_path ? `<button class="small" onclick="fetchImg(${m.id}, this)">获取图片</button>` : ''}
+      ${m.code && !m.image_path && !m.has_image ? `<button class="small" onclick="fetchImg(${m.id}, this)">获取图片</button>` : ''}
       <button class="small" onclick='editMaterial(${JSON.stringify(m)})'>编辑</button>
       <button class="small danger" onclick="delMaterial(${m.id})">删除</button>
     </td></tr>`).join('');

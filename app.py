@@ -8,6 +8,7 @@
 """
 import os
 import re
+import io
 import hashlib
 import shutil
 from functools import wraps
@@ -22,6 +23,31 @@ app.secret_key = os.urandom(24)
 db.init_schema()
 db.ensure_default_admin()
 db.run_migrations()
+
+
+# ---------------- 文件存储辅助（BLOB 优先，兼容旧磁盘文件） ----------------
+def _read_material_file(path_col, blob_col, rid):
+    """按 id 读取文件内容：优先数据库 BLOB，其次旧磁盘路径。返回 bytes 或 None"""
+    rows = db.query(f"SELECT {path_col} AS p, {blob_col} AS b FROM "
+                    f"{'materials' if path_col == 'image_path' else 'material_documents'} WHERE id=?", (rid,))
+    if not rows:
+        return None
+    r = rows[0]
+    if r["b"] is not None:
+        return bytes(r["b"])
+    if r["p"] and os.path.exists(r["p"]):
+        with open(r["p"], "rb") as f:
+            return f.read()
+    return None
+
+
+def _serve_bytes(data: bytes, download_name: str, inline: bool):
+    """从内存返回文件（预览 inline / 下载 attachment）"""
+    ext = os.path.splitext(download_name)[1].lower()
+    mime = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}.get(ext, "application/octet-stream")
+    return send_file(io.BytesIO(data), as_attachment=not inline,
+                     download_name=download_name, mimetype=mime)
 
 
 # ---------------- 认证 ----------------
@@ -152,7 +178,11 @@ def list_materials():
     kw = (request.args.get("q") or "").strip()
     wid = request.args.get("warehouse_id")
     include_children = request.args.get("include_children", "1") != "0"  # 默认含子库
-    sql = """SELECT m.*, w.name AS warehouse_name FROM materials m
+    sql = """SELECT m.id, m.name, m.code, m.model, m.category, m.package, m.brand,
+                    m.description, m.quantity, m.unit, m.warehouse_id, m.lcsc_url,
+                    m.image_path, (m.image_blob IS NOT NULL) AS has_image,
+                    m.created_at, m.updated_at, w.name AS warehouse_name
+             FROM materials m
              LEFT JOIN warehouses w ON m.warehouse_id = w.id"""
     conds, params = [], []
     if kw:
@@ -198,13 +228,13 @@ def create_material():
          int(d.get("quantity") or 0), d.get("unit", "个"),
          d.get("warehouse_id") or None, d.get("lcsc_url", "")))
 
-    # 立创建库时自动下载物料图片（失败不影响建物料）
+    # 立创建库时自动下载物料图片（失败不影响建物料）；图片内容直接存数据库
     image_url = (d.get("image_url") or "").strip()
     if image_url and (d.get("code") or "").strip():
         code = d["code"].strip()
-        path = lcsc.download_image(image_url, code, os.path.join(UPLOAD_DIR, str(last_id)))
-        if path:
-            db.execute_write("UPDATE materials SET image_path=? WHERE id=?", (path, last_id))
+        img_bytes = lcsc.fetch_image_bytes(image_url)
+        if img_bytes:
+            db.execute_write("UPDATE materials SET image_blob=? WHERE id=?", (img_bytes, last_id))
     return jsonify({"id": last_id}), 201
 
 
@@ -324,9 +354,8 @@ def fetch_datasheet(mid):
     if not datasheet_url:
         return jsonify({"error": "立创未提供该物料的手册PDF"}), 404
 
-    mat_dir = os.path.join(UPLOAD_DIR, str(mid))
-    path, fname = lcsc.download_datasheet(datasheet_url, mat_dir)
-    if not path:
+    pdf_bytes, fname = lcsc.fetch_datasheet_bytes(datasheet_url)
+    if not pdf_bytes:
         return jsonify({"error": "手册PDF下载失败（网络受限或超时），请稍后重试"}), 502
 
     # 避免重复登记同一手册
@@ -336,32 +365,37 @@ def fetch_datasheet(mid):
         return jsonify({"ok": True, "file_name": fname, "note": "手册已存在"})
 
     db.execute_write(
-        "INSERT INTO material_documents(material_id, doc_type, file_path, file_name) VALUES (?,?,?,?)",
-        (mid, "datasheet", path, fname))
+        "INSERT INTO material_documents(material_id, doc_type, file_path, file_name, file_blob) VALUES (?,?,?,?,?)",
+        (mid, "datasheet", "", fname, pdf_bytes))
     return jsonify({"ok": True, "file_name": fname})
 
 
 @app.route("/api/materials/<int:mid>/image", methods=["GET"])
 @login_required
 def material_image(mid):
-    """物料图片（本地文件）"""
-    rows = db.query("SELECT image_path FROM materials WHERE id=?", (mid,))
-    if not rows or not rows[0]["image_path"] or not os.path.exists(rows[0]["image_path"]):
+    """物料图片（优先数据库 BLOB，其次旧磁盘文件）"""
+    rows = db.query("SELECT image_path, image_blob FROM materials WHERE id=?", (mid,))
+    if not rows:
+        return jsonify({"error": "物料不存在"}), 404
+    data = _read_material_file("image_path", "image_blob", mid)
+    if data is None:
         return jsonify({"error": "无图片"}), 404
-    return send_file(rows[0]["image_path"])
+    # 按内容判断图片类型
+    mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+    return send_file(io.BytesIO(data), mimetype=mime)
 
 
 @app.route("/api/materials/<int:mid>/fetch_image", methods=["POST"])
 @login_required
 def fetch_image(mid):
-    """按编号从立创补取物料图片"""
-    rows = db.query("SELECT code, image_path FROM materials WHERE id=?", (mid,))
+    """按编号从立创补取物料图片（存入数据库）"""
+    rows = db.query("SELECT code, image_path, image_blob FROM materials WHERE id=?", (mid,))
     if not rows:
         return jsonify({"error": "物料不存在"}), 404
     code = (rows[0]["code"] or "").strip()
     if not code:
         return jsonify({"error": "该物料没有立创C编号，无法获取图片"}), 400
-    if rows[0]["image_path"] and os.path.exists(rows[0]["image_path"]):
+    if rows[0]["image_blob"] is not None or (rows[0]["image_path"] and os.path.exists(rows[0]["image_path"])):
         return jsonify({"ok": True, "note": "图片已存在"})
     try:
         detail = lcsc.fetch_detail(code)
@@ -369,10 +403,10 @@ def fetch_image(mid):
         detail = []
     if not detail or not detail[0].get("image"):
         return jsonify({"error": "立创未提供图片或获取失败"}), 404
-    path = lcsc.download_image(detail[0]["image"], code, os.path.join(UPLOAD_DIR, str(mid)))
-    if not path:
+    img_bytes = lcsc.fetch_image_bytes(detail[0]["image"])
+    if not img_bytes:
         return jsonify({"error": "图片下载失败"}), 502
-    db.execute_write("UPDATE materials SET image_path=? WHERE id=?", (path, mid))
+    db.execute_write("UPDATE materials SET image_blob=? WHERE id=?", (img_bytes, mid))
     return jsonify({"ok": True})
 
 
@@ -383,6 +417,7 @@ ALLOWED_DOC_TYPES = {"datasheet", "user_manual", "other"}
 @app.route("/api/materials/<int:mid>/documents", methods=["POST"])
 @login_required
 def upload_document(mid):
+    """上传手册：文件内容直接存入数据库 BLOB"""
     if not db.query("SELECT id FROM materials WHERE id=?", (mid,)):
         return jsonify({"error": "物料不存在"}), 404
     f = request.files.get("file")
@@ -392,13 +427,10 @@ def upload_document(mid):
     if doc_type not in ALLOWED_DOC_TYPES:
         return jsonify({"error": "doc_type 不合法"}), 400
     safe_name = re.sub(r"[^\w.\-\u4e00-\u9fff]", "_", f.filename)
-    mat_dir = os.path.join(UPLOAD_DIR, str(mid))
-    os.makedirs(mat_dir, exist_ok=True)
-    save_path = os.path.join(mat_dir, safe_name)
-    f.save(save_path)
+    blob = f.read()  # 读入内存，存数据库
     last_id, _ = db.execute_write(
-        "INSERT INTO material_documents(material_id, doc_type, file_path, file_name) VALUES (?,?,?,?)",
-        (mid, doc_type, save_path, safe_name))
+        "INSERT INTO material_documents(material_id, doc_type, file_path, file_name, file_blob) VALUES (?,?,?,?,?)",
+        (mid, doc_type, "", safe_name, blob))
     return jsonify({"id": last_id, "file_name": safe_name}), 201
 
 
@@ -406,21 +438,23 @@ def upload_document(mid):
 @login_required
 def download_document(did):
     """手册操作：?mode=preview 浏览器直接打开；默认下载（自动重命名为 物料名称_型号）"""
-    rows = db.query("""SELECT d.file_path, m.name AS mat_name, m.model AS mat_model, m.code AS mat_code
+    rows = db.query("""SELECT d.file_path, d.file_name, m.name AS mat_name, m.model AS mat_model, m.code AS mat_code
                        FROM material_documents d JOIN materials m ON d.material_id = m.id
                        WHERE d.id=?""", (did,))
-    if not rows or not os.path.exists(rows[0]["file_path"]):
+    if not rows:
+        return jsonify({"error": "记录不存在"}), 404
+    data = _read_material_file("file_path", "file_blob", did)
+    if data is None:
         return jsonify({"error": "文件不存在"}), 404
-    path = rows[0]["file_path"]
 
     # 下载文件名：物料名称_型号_数据手册.pdf（非法字符替换）
     base = "_".join(x for x in (rows[0]["mat_name"], rows[0]["mat_model"]) if x) or rows[0]["mat_code"] or "手册"
     safe_base = re.sub(r'[\\/:*?"<>|]', "_", base).strip() or "手册"
-    ext = os.path.splitext(path)[1] or ".pdf"
+    ext = os.path.splitext(rows[0]["file_name"])[1] or ".pdf"
 
     if request.args.get("mode") == "preview":
-        return send_file(path, as_attachment=False)  # 浏览器内直接打开
-    return send_file(path, as_attachment=True, download_name=f"{safe_base}{ext}")
+        return _serve_bytes(data, f"{safe_base}{ext}", inline=True)   # 浏览器内直接打开
+    return _serve_bytes(data, f"{safe_base}{ext}", inline=False)      # 下载，友好文件名
 
 
 @app.route("/api/documents/<int:did>", methods=["DELETE"])
@@ -430,7 +464,8 @@ def delete_document(did):
     if not rows:
         return jsonify({"error": "记录不存在"}), 404
     db.execute_write("DELETE FROM material_documents WHERE id=?", (did,))
-    if os.path.exists(rows[0]["file_path"]):
+    # 旧磁盘文件一并清理（新数据 BLOB 随记录删除）
+    if rows[0]["file_path"] and os.path.exists(rows[0]["file_path"]):
         os.remove(rows[0]["file_path"])
     return jsonify({"ok": True})
 
