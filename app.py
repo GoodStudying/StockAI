@@ -155,6 +155,9 @@ def list_materials():
     return jsonify(rows)
 
 
+DOC_TYPE_LABELS = {"datasheet": "数据手册", "user_manual": "用户手册", "other": "其他文档"}
+
+
 @app.route("/api/materials", methods=["POST"])
 @login_required
 def create_material():
@@ -335,11 +338,22 @@ def upload_document(mid):
 @app.route("/api/documents/<int:did>", methods=["GET"])
 @login_required
 def download_document(did):
-    rows = db.query("SELECT file_path, file_name FROM material_documents WHERE id=?", (did,))
+    """手册操作：?mode=preview 浏览器直接打开；默认下载（自动重命名为 物料名称_型号）"""
+    rows = db.query("""SELECT d.file_path, m.name AS mat_name, m.model AS mat_model, m.code AS mat_code
+                       FROM material_documents d JOIN materials m ON d.material_id = m.id
+                       WHERE d.id=?""", (did,))
     if not rows or not os.path.exists(rows[0]["file_path"]):
         return jsonify({"error": "文件不存在"}), 404
-    return send_file(rows[0]["file_path"], as_attachment=True,
-                     download_name=rows[0]["file_name"])
+    path = rows[0]["file_path"]
+
+    # 下载文件名：物料名称_型号_数据手册.pdf（非法字符替换）
+    base = "_".join(x for x in (rows[0]["mat_name"], rows[0]["mat_model"]) if x) or rows[0]["mat_code"] or "手册"
+    safe_base = re.sub(r'[\\/:*?"<>|]', "_", base).strip() or "手册"
+    ext = os.path.splitext(path)[1] or ".pdf"
+
+    if request.args.get("mode") == "preview":
+        return send_file(path, as_attachment=False)  # 浏览器内直接打开
+    return send_file(path, as_attachment=True, download_name=f"{safe_base}{ext}")
 
 
 @app.route("/api/documents/<int:did>", methods=["DELETE"])

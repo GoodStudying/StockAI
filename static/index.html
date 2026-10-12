@@ -159,8 +159,12 @@ async function loadMaterials() {
     <td>${m.id}</td><td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
     <td>${esc(m.model||'')}</td><td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
-    <td>${(m.documents||[]).map(d =>
-      `<a href="/api/documents/${d.id}">${esc(d.file_name)}</a>`).join(' ')}
+    <td>${m.documents && m.documents.length ? m.documents.map(d =>
+      `<span class="badge">${d.doc_type === 'datasheet' ? '数据手册' : d.doc_type === 'user_manual' ? '用户手册' : '其他文档'}</span>
+       <button class="small" onclick="window.open('/api/documents/${d.id}?mode=preview')">预览</button>
+       <button class="small gray" onclick="location.href='/api/documents/${d.id}'">下载</button>
+       <button class="small danger" onclick="delDoc(${d.id})">删除</button>`).join('<br>')
+      : ''}
       <button class="small" onclick="openDocModal(${m.id})">上传手册</button>
       ${m.code ? `<button class="small" onclick="autoFetchDoc(${m.id}, this)">获取手册</button>` : ''}</td>
     <td style="white-space:nowrap">
@@ -349,6 +353,11 @@ async function autoFetchDoc(mid, btn) {
     btn.textContent = old;
     btn.disabled = false;
   }
+}
+async function delDoc(did) {
+  if (!confirm('确认删除该手册文件？')) return;
+  await api(`/api/documents/${did}`, { method: 'DELETE' });
+  loadMaterials();
 }
 
 init();
