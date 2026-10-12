@@ -276,10 +276,15 @@ def fetch_datasheet(mid):
     code = (rows[0]["code"] or "").strip()
     if not code:
         return jsonify({"error": "该物料没有立创编码（C编号），无法自动下载"}), 400
+    if not re.fullmatch(r"C\d+", code, re.I):
+        return jsonify({"error": f"编码「{code}」不是立创C编号（形如 C621395），无法自动下载"}), 400
 
-    detail = lcsc.fetch_detail(code)
+    try:
+        detail = lcsc.fetch_detail(code)
+    except Exception as e:
+        return jsonify({"error": f"访问立创失败：{type(e).__name__}，请稍后重试"}), 502
     if not detail:
-        return jsonify({"error": "未获取到立创详情，请检查编号"}), 404
+        return jsonify({"error": "未获取到立创详情（编号可能无效或网络受限），请稍后重试"}), 404
     datasheet_url = detail[0].get("datasheet_url")
     if not datasheet_url:
         return jsonify({"error": "立创未提供该物料的手册PDF"}), 404
@@ -287,7 +292,7 @@ def fetch_datasheet(mid):
     mat_dir = os.path.join(UPLOAD_DIR, str(mid))
     path, fname = lcsc.download_datasheet(datasheet_url, mat_dir)
     if not path:
-        return jsonify({"error": "手册下载失败（网络受限）"}), 502
+        return jsonify({"error": "手册PDF下载失败（网络受限或超时），请稍后重试"}), 502
 
     # 避免重复登记同一手册
     exists = db.query("SELECT id FROM material_documents WHERE material_id=? AND file_name=?",

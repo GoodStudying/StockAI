@@ -342,9 +342,7 @@ async function autoFetchDoc(mid, btn) {
   btn.disabled = true;
   btn.textContent = '下载中...';
   try {
-    const r = await fetch(`/api/materials/${mid}/fetch_datasheet`, { method: 'POST' });
-    const data = await r.json();
-    if (!r.ok) { alert(data.error || '获取失败'); btn.textContent = old; btn.disabled = false; return; }
+    const data = await api(`/api/materials/${mid}/fetch_datasheet`, { method: 'POST' });
     alert(data.note ? `手册已存在：${data.file_name}` : `手册已下载：${data.file_name}`);
     loadMaterials();
   } catch (e) {

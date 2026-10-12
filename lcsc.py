@@ -195,17 +195,18 @@ def search_by_keyword_via_bing(keyword: str, limit=6):
 
 def download_datasheet(datasheet_url: str, save_dir: str):
     """
-    下载立创手册 PDF 到本地。
+    下载立创手册 PDF 到本地（失败自动重试一次）。
     返回 (保存路径, 文件名) 或 (None, None)。
     """
     if not datasheet_url:
         return None, None
-    try:
-        r = requests.get(datasheet_url, headers=HEADERS, timeout=30, stream=True)
+
+    def _try_download():
+        r = requests.get(datasheet_url, headers=HEADERS, timeout=60, stream=True)
         if r.status_code != 200:
-            return None, None
+            return None
         os.makedirs(save_dir, exist_ok=True)
-        # 文件名：优先 URL 里的哈希，否则用 C编号
+        # 文件名：优先 URL 里的哈希，否则用默认名
         m = re.search(r'/([0-9a-fA-F]{16,})\.pdf', datasheet_url)
         stem = m.group(1) if m else "datasheet"
         fname = f"{stem}.pdf"
@@ -214,8 +215,15 @@ def download_datasheet(datasheet_url: str, save_dir: str):
             for chunk in r.iter_content(8192):
                 f.write(chunk)
         return path, fname
-    except Exception:
-        return None, None
+
+    for _ in range(2):  # 重试一次
+        try:
+            result = _try_download()
+            if result:
+                return result
+        except Exception:
+            continue
+    return None, None
 
 
 def search_lcsc(keyword: str):
