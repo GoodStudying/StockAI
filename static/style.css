@@ -113,6 +113,27 @@ input, select, textarea, button.gray {
   transition: background-color .25s ease, color .25s ease, border-color .25s ease;
 }
 
+/* ============ 页面切换丝滑过渡（跨文档视图过渡） ============
+   Chrome/Edge 126+ 支持：旧页快照保留，交叉淡入，无白屏瞬间。
+   侧栏声明为固定元素，切换时侧栏完全不动，仅内容区过渡。 */
+@view-transition {
+  navigation: auto;
+}
+/* 视图过渡期间：侧栏不参与动画（视觉固定） */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: .18s;
+  animation-timing-function: ease;
+}
+/* 旧浏览器兜底：内容区轻微淡入，减轻跳变生硬感 */
+@supports not (view-transition-name: none) {
+  main { animation: fade-in .18s ease; }
+}
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html { -webkit-text-size-adjust: 100%; }
 body {

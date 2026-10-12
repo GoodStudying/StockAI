@@ -4,15 +4,16 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>出入库 - 个人ERP</title>
-<link rel="stylesheet" href="/style.css">
+<script src="/common.js"></script>
 <script>
 /* 尽早应用主题，防止刷新时闪回默认配色 */
 (function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
 </script>
+<link rel="stylesheet" href="/style.css">
 </head>
 <body>
 <div class="layout">
-<div id="nav-mount"></div>
+<div id="nav-mount"><script>/* 解析到即注入，侧栏随首帧出现 */document.currentScript.parentElement.innerHTML = renderNav('/stock.html');</script></div>
 <main>
   <div class="page-head">
     <h1>出入库</h1>
@@ -72,7 +73,6 @@
 let warehouses = [];
 
 async function init() {
-  document.getElementById('nav-mount').innerHTML = renderNav('/stock.html');
   const user = await checkLogin();
   if (!user) return;
   warehouses = await api('/api/warehouses');
