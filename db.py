@@ -27,7 +27,7 @@ class SQLiteBackend:
 
 
 class PostgresBackend:
-    """PostgreSQL 后端（预留接口）。安装 psycopg2-binary 后可用。"""
+    """PostgreSQL 后端（NAS Docker 部署使用）"""
     def conn(self):
         import psycopg2
         import psycopg2.extras
@@ -40,6 +40,17 @@ class PostgresBackend:
         return conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
 
+# 统一取 cursor：sqlite 用默认（Row 工厂），postgres 用 RealDictCursor
+def _cursor(conn):
+    cur = conn.cursor()
+    if DB_TYPE == "postgres":
+        # psycopg2 默认工厂即 tuple，改用 dict 工厂便于统一 dict(r)
+        import psycopg2.extras
+        cur.close()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    return cur
+
+
 _backend = PostgresBackend() if DB_TYPE == "postgres" else SQLiteBackend()
 
 
@@ -50,7 +61,7 @@ def get_conn():
 def execute(sql, params=()):
     conn = get_conn()
     try:
-        cur = conn.cursor()
+        cur = _cursor(conn)
         cur.execute(_convert(sql), params)
         conn.commit()
         return cur
@@ -66,7 +77,7 @@ def query(sql, params=()):
     """查询并返回 list[dict]"""
     conn = get_conn()
     try:
-        cur = conn.cursor()
+        cur = _cursor(conn)
         cur.execute(_convert(sql), params)
         rows = cur.fetchall()
         return [dict(r) for r in rows]
@@ -78,10 +89,21 @@ def execute_write(sql, params=()):
     """写操作，返回 lastrowid / affected"""
     conn = get_conn()
     try:
-        cur = conn.cursor()
-        cur.execute(_convert(sql), params)
+        cur = _cursor(conn)
+        # postgres：INSERT 自动追加 RETURNING id（无 RETURNING 语法时退化为 lastrowid=None）
+        if DB_TYPE == "postgres":
+            if sql.lstrip().upper().startswith("INSERT"):
+                sql = sql.rstrip().rstrip(";") + " RETURNING id"
+            cur.execute(_convert(sql), params)
+            if cur.description:
+                row = cur.fetchone()
+                last_id = list(dict(row).values())[0] if row else None
+            else:
+                last_id = None
+        else:
+            cur.execute(_convert(sql), params)
+            last_id = cur.lastrowid
         conn.commit()
-        last_id = cur.lastrowid if DB_TYPE == "sqlite" else None
         return last_id, cur.rowcount
     except Exception:
         conn.rollback()
@@ -164,6 +186,11 @@ def ensure_default_admin():
 
 def run_migrations():
     """轻量迁移：补充新增列（已有表不重建）"""
+    if DB_TYPE == "postgres":
+        # postgres 的 BLOB 列迁移已在 init_schema 内完成；磁盘文件迁移同样执行
+        _migrate_files_to_blob()
+        return
+
     cols = {r["name"] for r in query("PRAGMA table_info(materials)")}
     if "image_path" not in cols:
         execute_write("ALTER TABLE materials ADD COLUMN image_path TEXT")
@@ -213,8 +240,66 @@ CREATE TABLE IF NOT EXISTS warehouses (
     level INTEGER NOT NULL CHECK(level BETWEEN 1 AND 4),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
--- ... 其余表结构同 sqlite（类型作对应调整） ...
+
+CREATE TABLE IF NOT EXISTS materials (
+    id SERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    code TEXT,
+    model TEXT,
+    category TEXT,
+    package TEXT,
+    brand TEXT,
+    description TEXT,
+    quantity INTEGER DEFAULT 0,
+    unit TEXT DEFAULT '个',
+    warehouse_id INTEGER REFERENCES warehouses(id),
+    lcsc_url TEXT,
+    image_path TEXT,
+    image_blob BYTEA,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS material_documents (
+    id SERIAL PRIMARY KEY,
+    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+    doc_type TEXT NOT NULL,
+    file_path TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    file_blob BYTEA,
+    uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username TEXT NOT NULL UNIQUE,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL DEFAULT 'user',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS stock_records (
+    id SERIAL PRIMARY KEY,
+    material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE,
+    type TEXT NOT NULL CHECK(type IN ('in','out')),
+    quantity INTEGER NOT NULL CHECK(quantity > 0),
+    operator TEXT,
+    remark TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_materials_name ON materials(name);
+CREATE INDEX IF NOT EXISTS idx_materials_code ON materials(code);
+CREATE INDEX IF NOT EXISTS idx_materials_wh ON materials(warehouse_id);
+CREATE INDEX IF NOT EXISTS idx_wh_parent ON warehouses(parent_id);
+CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
 """
+
+
+def _pg_columns(table):
+    """postgres：返回表的列名集合（表不存在返回空集）"""
+    return {r["column_name"] for r in query(
+        "SELECT column_name FROM information_schema.columns WHERE table_name=?", (table,))}
 
 
 def init_schema():
@@ -224,9 +309,22 @@ def init_schema():
             conn.executescript(SCHEMA_SQLITE)
             conn.commit()
         else:
+            # postgres 逐条执行（psycopg2 无 executescript）
+            import re as _re
             cur = conn.cursor()
-            # 实际切换时按 SCHEMA_POSTGRES 逐条执行
-            cur.execute(_convert(SCHEMA_POSTGRES))
+            for stmt in _re.split(r";\s*\n", SCHEMA_POSTGRES):
+                sql_one = stmt.strip()
+                if sql_one and not sql_one.startswith("--"):
+                    cur.execute(sql_one)
             conn.commit()
+            # postgres 迁移：补 BLOB 列（老库升级）
+            mats = _pg_columns("materials")
+            if "image_blob" not in mats:
+                cur.execute("ALTER TABLE materials ADD COLUMN image_blob BYTEA")
+                conn.commit()
+            docs = _pg_columns("material_documents")
+            if "file_blob" not in docs:
+                cur.execute("ALTER TABLE material_documents ADD COLUMN file_blob BYTEA")
+                conn.commit()
     finally:
         conn.close()

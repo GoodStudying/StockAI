@@ -11,6 +11,7 @@ import re
 import io
 import hashlib
 import shutil
+from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify, send_from_directory, send_file, session
 from config import UPLOAD_DIR, MAX_WAREHOUSE_LEVEL, BASE_DIR, SQLITE_PATH, DB_TYPE
@@ -245,11 +246,12 @@ def update_material(mid):
     _, n = db.execute_write(
         """UPDATE materials SET name=?, code=?, model=?, category=?, package=?,
            brand=?, description=?, quantity=?, unit=?, warehouse_id=?, lcsc_url=?,
-           updated_at=datetime('now','localtime') WHERE id=?""",
+           updated_at=? WHERE id=?""",
         (d.get("name", ""), d.get("code", ""), d.get("model", ""), d.get("category", ""),
          d.get("package", ""), d.get("brand", ""), d.get("description", ""),
          int(d.get("quantity") or 0), d.get("unit", "个"),
-         d.get("warehouse_id") or None, d.get("lcsc_url", ""), mid))
+         d.get("warehouse_id") or None, d.get("lcsc_url", ""),
+         datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mid))
     if n == 0:
         return jsonify({"error": "物料不存在"}), 404
     return jsonify({"ok": True})
@@ -285,8 +287,8 @@ def stock_inout(op):
 
     new_qty = cur_qty + qty if op == "in" else cur_qty - qty
     operator = session["user"]["username"]
-    db.execute_write("UPDATE materials SET quantity=?, updated_at=datetime('now','localtime') WHERE id=?",
-                     (new_qty, mid))
+    db.execute_write("UPDATE materials SET quantity=?, updated_at=? WHERE id=?",
+                     (new_qty, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mid))
     db.execute_write(
         "INSERT INTO stock_records(material_id, type, quantity, operator, remark) VALUES (?,?,?,?,?)",
         (mid, op, qty, operator, d.get("remark", "")))
@@ -525,6 +527,13 @@ def db_info():
     info = {"type": DB_TYPE, "path": SQLITE_PATH if DB_TYPE == "sqlite" else "(postgres)"}
     if DB_TYPE == "sqlite" and os.path.exists(SQLITE_PATH):
         info["size_kb"] = round(os.path.getsize(SQLITE_PATH) / 1024, 1)
+    if DB_TYPE == "postgres":
+        # postgres 库大小（pg_database_size 返回字节）
+        try:
+            info["size_kb"] = round(db.query(
+                "SELECT pg_database_size(current_database()) AS s")[0]["s"] / 1024, 1)
+        except Exception:
+            pass
     for t in ("warehouses", "materials", "material_documents", "stock_records", "users"):
         info[t] = db.query(f"SELECT COUNT(*) AS c FROM {t}")[0]["c"]
     return jsonify(info)
