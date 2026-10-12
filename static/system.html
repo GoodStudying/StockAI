@@ -146,16 +146,34 @@ async function delUser(uid) {
 }
 
 /* ---------- 版本更新 ---------- */
+let updatePolling = null;
 async function checkUpdate() {
   const el = document.getElementById('update-info');
-  el.textContent = '正在查询 GitHub 最新版本...';
-  document.getElementById('btn-apply').style.display = 'none';
+  const btn = document.getElementById('btn-apply');
+  btn.style.display = 'none';
+  el.textContent = '正在查询...';
   try {
     const d = await api('/api/update/status');
+    if (d.check_error) {
+      el.textContent = '检查失败：' + d.check_error + '（可配置 GITHUB_PROXY 加速前缀）';
+      return;
+    }
+    const p = d.progress || {};
+    /* 后台有更新任务在跑 → 显示进度并自动轮询 */
+    if (p.state === 'running' || p.state === 'restarting') {
+      el.innerHTML = `<b>${esc(p.msg || '更新中')}</b>（${p.done}/${p.total}）`;
+      if (!updatePolling) updatePolling = setInterval(checkUpdate, 3000);
+      return;
+    }
+    if (updatePolling) { clearInterval(updatePolling); updatePolling = null; }
+    if (p.state === 'error') {
+      el.innerHTML = `<span style="color:#e5484d">${esc(p.msg)}</span> <a href="#" onclick="checkUpdate();return false;">重试检查</a>`;
+      return;
+    }
     el.innerHTML = d.update_available
       ? `当前版本 <b>${d.local === 'unknown' ? '未知(未记录)' : d.local}</b> → 最新版本 <b>${d.remote}</b>，有可用更新`
       : `已是最新版本（${d.remote}）`;
-    if (d.update_available) document.getElementById('btn-apply').style.display = '';
+    if (d.update_available) btn.style.display = '';
   } catch (e) {
     el.textContent = '检查失败：' + e.message;
   }
@@ -163,13 +181,27 @@ async function checkUpdate() {
 async function applyUpdate() {
   if (!confirm('确认从 GitHub 拉取最新代码并自动重启服务？')) return;
   const el = document.getElementById('update-info');
-  el.textContent = '正在下载并更新，请勿关闭页面...';
   document.getElementById('btn-apply').style.display = 'none';
   try {
-    const d = await api('/api/update/apply', { method: 'POST' });
-    el.textContent = d.msg;
-    /* 等 8 秒后自动刷新并重新检查版本 */
-    setTimeout(async () => { location.reload(); }, 8000);
+    await api('/api/update/apply', { method: 'POST' });
+    /* 轮询进度：running→下载中 / restarting→等重启后刷新 / error→显示失败 */
+    if (!updatePolling) updatePolling = setInterval(async () => {
+      try {
+        const d = await api('/api/update/status');
+        const p = d.progress || {};
+        if (p.state === 'running') {
+          el.innerHTML = `<b>${esc(p.msg || '更新中')}</b>（${p.done}/${p.total}）`;
+        } else if (p.state === 'restarting') {
+          clearInterval(updatePolling); updatePolling = null;
+          el.textContent = (p.msg || '更新完成') + '，8 秒后自动刷新...';
+          setTimeout(() => location.reload(), 8000);
+        } else if (p.state === 'error') {
+          clearInterval(updatePolling); updatePolling = null;
+          el.innerHTML = `<span style="color:#e5484d">${esc(p.msg)}</span>`;
+        }
+      } catch (e) { /* 平滑重启期间请求短暂失败属正常，继续轮询 */ }
+    }, 3000);
+    checkUpdate();
   } catch (e) {
     el.textContent = '更新失败：' + e.message;
   }

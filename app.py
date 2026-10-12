@@ -118,9 +118,13 @@ GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "master")
 GITHUB_PROXY = os.environ.get("GITHUB_PROXY", "").rstrip("/")
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 VERSION_FILE = os.path.join(BASE_DIR, ".version")
-# 更新时绝不覆盖的本地目录/文件（数据与环境配置）
+# 更新时绝不覆盖的本地目录/文件（数据/环境/部署配置——NAS 上改过密码Token的文件永不被覆盖）
 _UPD_KEEP = {".env", "data", "uploads", "__pycache__", ".git", ".version",
              "docker-compose.yml", "Dockerfile", "start.sh", ".dockerignore"}
+# 后台更新进度（跨请求共享；gunicorn 多 worker 间通过文件落盘同步）
+_UPDATE = {"state": "idle", "msg": "", "done": 0, "total": 0, "at": 0.0}
+_UPDATE_LOCK = threading.Lock()
+PROGRESS_FILE = os.path.join(BASE_DIR, ".update_progress")
 
 
 def _gh(path):
@@ -157,93 +161,120 @@ def _remote_version():
 @app.route("/api/update/status")
 @admin_required
 def update_status():
-    """检查 GitHub 是否有新版本"""
+    """检查 GitHub 是否有新版本；同时返回后台更新进度（progress 字段，前端轮询展示）"""
     if not GITHUB_REPO:
         return jsonify({"error": "未配置 GITHUB_REPO 环境变量（格式：用户名/仓库名）"}), 400
+    local = _local_version()
+    resp = {"repo": GITHUB_REPO, "branch": GITHUB_BRANCH, "local": local,
+            "progress": dict(_UPDATE)}
     try:
         remote = _remote_version()
+        resp.update(remote=remote[:7], update_available=local != remote)
     except Exception as e:
         hint = "。私有仓库需配置 GITHUB_TOKEN" if not GITHUB_TOKEN else ""
-        return jsonify({"error": f"无法访问 GitHub：{e}{hint}。NAS 若无法直连，可配置 GITHUB_PROXY 加速前缀"}), 502
-    local = _local_version()
-    return jsonify({"repo": GITHUB_REPO, "branch": GITHUB_BRANCH, "local": local,
-                    "remote": remote[:7], "update_available": local != remote})
+        resp.update(remote="", update_available=False, check_error=f"{e}{hint}")
+    return jsonify(resp)
+
+
+def _progress_write(state, msg, done=0, total=0):
+    """写更新进度（内存 + 落盘，gunicorn 另一 worker 读盘同步）"""
+    import time, json
+    with _UPDATE_LOCK:
+        _UPDATE.update(state=state, msg=msg, done=done, total=total, at=time.time())
+        try:
+            with open(PROGRESS_FILE, "w", encoding="utf-8") as f:
+                json.dump(_UPDATE, f)
+        except Exception:
+            pass
+
+
+def _progress_load():
+    """启动时/查询时从盘读进度（跨 worker 可见）"""
+    import time, json
+    try:
+        with open(PROGRESS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        # 30 分钟前的进度视为过期
+        if time.time() - d.get("at", 0) < 1800:
+            _UPDATE.update(d)
+    except Exception:
+        pass
+
+
+_progress_load()
+
+
+def _do_update():
+    """后台更新线程：文件树 → 逐文件下载 → 落版本号 → 平滑重启（全程走 api.github.com，国内可达）"""
+    import requests, signal, time
+    try:
+        _progress_write("running", "正在获取文件树...")
+        url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}?recursive=1")
+        r = requests.get(url, timeout=30, headers=_gh_headers())
+        if not r.ok:
+            raise RuntimeError(f"获取文件树失败 HTTP {r.status_code}（检查 GITHUB_TOKEN 权限）")
+        files = [t for t in r.json().get("tree", []) if t.get("type") == "blob"]
+        if not files:
+            raise RuntimeError("仓库文件树为空")
+        # 过滤：跳过数据/环境/部署配置文件，防目录穿越
+        files = [t for t in files if t["path"].split("/")[0] not in _UPD_KEEP
+                 and ".." not in t["path"].split("/")]
+        total = len(files)
+        done, errs = 0, []
+        for t in files:
+            rel = t["path"]
+            _progress_write("running", f"下载 {rel}", done, total)
+            url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{rel}?ref={GITHUB_BRANCH}")
+            try:
+                r = requests.get(url, timeout=30, headers=_gh_headers())
+                if not r.ok:
+                    errs.append(f"{rel}: HTTP {r.status_code}")
+                    continue
+                dest = os.path.join(BASE_DIR, rel)
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(base64.b64decode(r.json().get("content", "")))
+                done += 1
+            except Exception as e:
+                errs.append(f"{rel}: {e}")
+        if done == 0:
+            raise RuntimeError("全部文件下载失败：" + "; ".join(errs[:3]))
+        # 记录新版本号
+        try:
+            sha = _remote_version()
+        except Exception:
+            sha = ""
+        with open(VERSION_FILE, "w", encoding="utf-8") as f:
+            f.write(sha)
+        msg = f"更新完成（{done}/{total} 个文件），2 秒后平滑重启"
+        if errs:
+            msg += f"；{len(errs)} 个失败：{errs[0]}"
+        _progress_write("restarting", msg, done, total)
+        time.sleep(2)
+        # 平滑重启：容器内向 gunicorn 主进程(PID1)发 SIGHUP；本地开发直接退出
+        try:
+            if os.getppid() == 1:
+                os.kill(1, signal.SIGHUP)
+            else:
+                os._exit(0)
+        except Exception:
+            os._exit(0)
+    except Exception as e:
+        _progress_write("error", f"更新失败：{e}")
 
 
 @app.route("/api/update/apply", methods=["POST"])
 @admin_required
 def update_apply():
-    """从 GitHub 下载最新代码覆盖到 /app 并平滑重启（数据库与部署配置不受影响）"""
-    import requests
+    """启动后台更新线程并立即返回（前端轮询 /api/update/status 看进度，避开网关超时）"""
     if not GITHUB_REPO:
         return jsonify({"error": "未配置 GITHUB_REPO 环境变量（格式：用户名/仓库名）"}), 400
-
-    def _fetch_tree():
-        """经 api.github.com 拉取分支完整文件树（国内 NAS 通常可直连该域名）"""
-        url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/git/trees/{GITHUB_BRANCH}?recursive=1")
-        r = requests.get(url, timeout=30, headers=_gh_headers())
-        if not r.ok:
-            raise RuntimeError(f"获取文件树失败 HTTP {r.status_code}")
-        tree = r.json().get("tree", [])
-        files = [t for t in tree if t.get("type") == "blob"]
-        if not files:
-            raise RuntimeError("仓库文件树为空")
-        return files
-
-    def _write_base64(content_b64, rel):
-        """base64 内容写入目标文件（自动建目录）"""
-        dest = os.path.join(BASE_DIR, rel)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        with open(dest, "wb") as f:
-            f.write(base64.b64decode(content_b64))
-
-    # 1. 拉文件树
-    try:
-        files = _fetch_tree()
-    except Exception as e:
-        return jsonify({"error": f"{e}。请检查 GITHUB_TOKEN 权限（需 Contents:Read-only）或配置 GITHUB_PROXY"}), 502
-    # 过滤：跳过数据/环境/部署配置文件
-    files = [t for t in files if t["path"].split("/")[0] not in _UPD_KEEP
-             and ".." not in t["path"].split("/")]
-    # 2. 逐文件下载（经 api.github.com 的 contents 接口，走与查版本相同的可达域名）
-    done, errs = 0, []
-    for t in files:
-        rel = t["path"]
-        url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/contents/{rel}?ref={GITHUB_BRANCH}")
-        try:
-            r = requests.get(url, timeout=30, headers=_gh_headers())
-            if not r.ok:
-                errs.append(f"{rel}: HTTP {r.status_code}")
-                continue
-            _write_base64(r.json().get("content", ""), rel)
-            done += 1
-        except Exception as e:
-            errs.append(f"{rel}: {e}")
-    if errs and done == 0:
-        return jsonify({"error": "全部文件下载失败：" + "; ".join(errs[:3])}), 502
-    # 3. 记录新版本号
-    try:
-        sha = _remote_version()
-    except Exception:
-        sha = ""
-    with open(VERSION_FILE, "w", encoding="utf-8") as f:
-        f.write(sha)
-    # 4. 延迟 2 秒平滑重启：容器内向 gunicorn 主进程(PID1)发 SIGHUP；本地开发则直接退出进程
-    def _reload():
-        import signal, time
-        time.sleep(2)
-        try:
-            if os.getppid() == 1:
-                os.kill(1, signal.SIGHUP)   # gunicorn 平滑重启 worker，加载新代码
-            else:
-                os._exit(0)                 # 本地 python app.py 场景，退出后手动重启
-        except Exception:
-            os._exit(0)
-    threading.Thread(target=_reload, daemon=True).start()
-    msg = f"更新完成（{done} 个文件），服务正在平滑重启，约 5 秒后请刷新页面"
-    if errs:
-        msg += f"。{len(errs)} 个文件失败：{errs[0]}"
-    return jsonify({"ok": True, "version": sha[:7], "msg": msg})
+    with _UPDATE_LOCK:
+        if _UPDATE.get("state") == "running":
+            return jsonify({"error": "更新正在进行中，请稍候"}), 409
+    _progress_write("running", "准备更新...")
+    threading.Thread(target=_do_update, daemon=True).start()
+    return jsonify({"ok": True, "msg": "更新已启动，请通过检查更新查看进度"})
 
 
 # ---------------- 页面路由 ----------------
