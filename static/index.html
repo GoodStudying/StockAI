@@ -161,7 +161,8 @@ async function loadMaterials() {
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
     <td>${(m.documents||[]).map(d =>
       `<a href="/api/documents/${d.id}">${esc(d.file_name)}</a>`).join(' ')}
-      <button class="small" onclick="openDocModal(${m.id})">上传手册</button></td>
+      <button class="small" onclick="openDocModal(${m.id})">上传手册</button>
+      ${m.code ? `<button class="small" onclick="autoFetchDoc(${m.id}, this)">获取手册</button>` : ''}</td>
     <td style="white-space:nowrap">
       <button class="small" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'in')">入库</button>
       <button class="small gray" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'out')">出库</button>
@@ -315,12 +316,9 @@ function fillFromLcsc(it) {
   document.getElementById('m-brand').value = it.brand || '';
   document.getElementById('m-lcsc').value = it.url || '';
   document.getElementById('m-desc').value = it.description || '';
-  if (it.datasheet_url) {
-    document.getElementById('m-desc').value += (it.description ? '\n' : '') + '手册: ' + it.datasheet_url;
-  }
 }
 
-// ---------- 手册上传 ----------
+// ---------- 手册上传 / 自动获取 ----------
 function openDocModal(mid) {
   document.getElementById('doc-mid').textContent = mid;
   document.getElementById('doc-file').value = '';
@@ -338,6 +336,21 @@ async function uploadDoc() {
   if (!r.ok) { alert(data.error || '上传失败'); return; }
   closeModal('doc-modal');
   loadMaterials();
+}
+async function autoFetchDoc(mid, btn) {
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '下载中...';
+  try {
+    const r = await fetch(`/api/materials/${mid}/fetch_datasheet`, { method: 'POST' });
+    const data = await r.json();
+    if (!r.ok) { alert(data.error || '获取失败'); btn.textContent = old; btn.disabled = false; return; }
+    alert(data.note ? `手册已存在：${data.file_name}` : `手册已下载：${data.file_name}`);
+    loadMaterials();
+  } catch (e) {
+    btn.textContent = old;
+    btn.disabled = false;
+  }
 }
 
 init();

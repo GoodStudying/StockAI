@@ -1,17 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-立创商城物料信息抓取（双通道）
+立创商城物料信息抓取（双通道 + 双站合并）
 
 背景：立创官方搜索接口有反爬/域名限制，服务端不可用。
-可用通道：
-  1) C 编号 -> 英文站详情页 https://lcsc.com/product-detail/Cxxxxx.html
-     页面内嵌 __NEXT_DATA__ JSON，字段齐全（型号/品牌/封装/分类/描述/价格/库存/图片/手册）。
-  2) 型号关键字 -> DuckDuckGo HTML 搜索 site:lcsc.com 反查 C 编号 -> 再走通道1。
-失败时返回错误信息，不影响手工新建。
+抓取策略：
+  1) 英文站详情页 https://lcsc.com/product-detail/Cxxxxx.html（__NEXT_DATA__ JSON）
+     -> 拿 productId / 价格 / 库存 / 手册PDF直链
+  2) 中文站详情页 https://item.szlcsc.com/<productId>.html（productRecord JSON）
+     -> 拿中文名称 / 封装 / 品牌 / 分类 / 描述（中文信息优先）
+  两站合并输出。
+关键字搜索：Bing 搜 site:item.szlcsc.com 反查 productId -> 转 C 编号。
 """
+import os
 import re
 import json
-import html as htmllib
 import requests
 
 HEADERS = {
@@ -43,32 +45,45 @@ def _find_key(obj, key, depth=0):
     return None
 
 
+def _parse_cn_record(html_text: str):
+    """解析中文站页面的 productRecord JSON"""
+    idx = html_text.find('"productRecord"')
+    if idx < 0:
+        return {}
+    seg = html_text[idx:idx + 300000]
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(seg[seg.find("{"):])
+        return obj
+    except Exception:
+        return {}
+
+
 def fetch_detail(code: str):
     """
-    按 C 编号抓取英文站详情页，解析 __NEXT_DATA__。
+    按 C 编号抓取：英文站(productId/价格/库存/手册) + 中文站(中文名称/封装/品牌/分类)。
     返回 list[dict]（0或1条完整详情）。
     """
     code = code.strip().upper()
     if not re.fullmatch(r"C\d+", code):
         return []
+
+    # ---- 英文站 ----
+    en = {}
     try:
         r = requests.get(DETAIL_URL.format(code=code), headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code != 200:
-            return []
-        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
-        if not m:
-            return []
-        data = json.loads(m.group(1))
+        if r.status_code == 200:
+            m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+            if m:
+                en = json.loads(m.group(1))
     except Exception:
-        return []
+        en = {}
 
-    def g(k):
-        v = _find_key(data, k)
+    def eg(k):
+        v = _find_key(en, k) if en else None
         return v.strip() if isinstance(v, str) else (v if v is not None else "")
 
-    # 价格梯度（梯价列表）
     price = ""
-    prices = _find_key(data, "productPriceList") or _find_key(data, "ladderPrice") or []
+    prices = _find_key(en, "productPriceList") or _find_key(en, "ladderPrice") or []
     if isinstance(prices, list) and prices:
         try:
             first = prices[0]
@@ -79,52 +94,56 @@ def fetch_detail(code: str):
         except Exception:
             pass
 
-    # 手册PDF直链（datasheet 字段或 fileTypeVOList）
-    datasheet_url = g("pdfUrl") or g("dataManualUrl")
-    if not datasheet_url:
-        ftl = _find_key(data, "fileTypeVOList")
-        if isinstance(ftl, list):
-            for ft in ftl:
-                if isinstance(ft, dict) and "pdf_property" in str(ft.get("fileType", "")):
-                    det = (ft.get("detailVOList") or [{}])[0]
-                    fu = det.get("fileUrl", "")
-                    if fu:
-                        datasheet_url = "https://szlcsc.com" + fu if fu.startswith("/") else fu
-                        break
-
-    stock = g("stockNumber") or g("stockJs") or g("stockJhsz") or ""
+    datasheet_url = eg("pdfUrl") or eg("dataManualUrl")
 
     item = {
         "code": code,
-        "model": g("productModel"),
-        "name": g("productIntroEn") or g("productName"),
-        "brand": g("brandNameEn") or g("productGradePlateName") or g("brandName"),
-        "package": g("encapsulationStandard") or g("encapsulationModel"),
-        "category": g("catalogName") or g("productType"),
-        "description": g("productIntroEn") or g("remark"),
-        "stock": str(stock),
+        "product_id": eg("productId"),
+        "model": eg("productModel"),
+        "name": "",            # 中文站优先填充
+        "brand": "",
+        "package": "",
+        "category": "",
+        "description": eg("productIntroEn"),
+        "stock": str(eg("stockNumber") or eg("stockJs") or eg("stockJhsz") or ""),
         "price": price,
-        "image": g("productPicturePath") or g("breviaryImageUrl") or g("imageUrl"),
+        "image": eg("productPicturePath") or eg("breviaryImageUrl") or eg("imageUrl"),
         "datasheet_url": datasheet_url,
         "url": DETAIL_URL.format(code=code),
     }
-    # 中文详情页补充（品牌/分类更准，仅当英文字段缺失时）
-    if not item["brand"] or not item["category"]:
+
+    # ---- 中文站（中文名称/封装/品牌/分类优先） ----
+    pid = item["product_id"]
+    if pid:
         try:
-            pid = g("productId")
-            if pid:
-                r2 = requests.get(f"https://item.szlcsc.com/{pid}.html", headers=HEADERS, timeout=TIMEOUT)
-                idx = r2.text.find('"productRecord"')
-                if idx > 0:
-                    seg = r2.text[idx:idx + 300000]
-                    obj, _ = json.JSONDecoder().raw_decode(seg[seg.find("{"):])
-                    item["brand"] = item["brand"] or str(obj.get("productGradePlateName") or "")
-                    item["category"] = item["category"] or str(obj.get("productType") or "")
-                    item["package"] = item["package"] or str(obj.get("encapsulationModel") or "")
-                    item["name"] = item["name"] or str(obj.get("productName") or "")
-                    item["url"] = f"https://item.szlcsc.com/{pid}.html"
+            r2 = requests.get(f"https://item.szlcsc.com/{pid}.html", headers=HEADERS, timeout=TIMEOUT)
+            cn = _parse_cn_record(r2.text)
+            if cn:
+                item["name"] = str(cn.get("productName") or "")
+                item["model"] = cn.get("productModel") or item["model"]
+                item["brand"] = str(cn.get("productGradePlateName") or "")
+                item["package"] = str(cn.get("encapsulationModel") or "")
+                item["category"] = str(cn.get("productType") or "")
+                item["description"] = str(cn.get("remark") or item["description"])
+                item["stock"] = str(cn.get("stockNumber") or item["stock"])
+                if not item["image"]:
+                    item["image"] = str(cn.get("breviaryImageUrl") or "")
+                item["url"] = f"https://item.szlcsc.com/{pid}.html"
+                # 中文站手册（英文站缺失时兜底）
+                if not item["datasheet_url"]:
+                    for ft in (cn.get("fileTypeVOList") or []):
+                        if "pdf_property" in str(ft.get("fileType", "")):
+                            det = (ft.get("detailVOList") or [{}])[0]
+                            fu = det.get("fileUrl", "")
+                            if fu:
+                                item["datasheet_url"] = ("https://szlcsc.com" + fu) if fu.startswith("/") else fu
+                                break
         except Exception:
             pass
+
+    # 名称兜底：型号
+    if not item["name"]:
+        item["name"] = item["model"]
     return [item] if (item["model"] or item["name"]) else []
 
 
@@ -132,12 +151,8 @@ def _cn_item_code(pid: str):
     """中文详情页 productId -> C编号（读内嵌 productRecord.productCode）"""
     try:
         r = requests.get(f"https://item.szlcsc.com/{pid}.html", headers=HEADERS, timeout=TIMEOUT)
-        idx = r.text.find('"productRecord"')
-        if idx < 0:
-            return None
-        seg = r.text[idx:idx + 300000]
-        obj, _ = json.JSONDecoder().raw_decode(seg[seg.find("{"):])
-        return obj.get("productCode") or None
+        cn = _parse_cn_record(r.text)
+        return cn.get("productCode") or None
     except Exception:
         return None
 
@@ -173,9 +188,34 @@ def search_by_keyword_via_bing(keyword: str, limit=6):
             continue
         results.append({"code": code, "model": "", "name": "", "brand": "", "package": "",
                         "category": "", "description": "", "stock": "", "price": "",
-                        "image": "", "datasheet_url": "",
+                        "image": "", "datasheet_url": "", "product_id": pid,
                         "url": DETAIL_URL.format(code=code)})
     return results
+
+
+def download_datasheet(datasheet_url: str, save_dir: str):
+    """
+    下载立创手册 PDF 到本地。
+    返回 (保存路径, 文件名) 或 (None, None)。
+    """
+    if not datasheet_url:
+        return None, None
+    try:
+        r = requests.get(datasheet_url, headers=HEADERS, timeout=30, stream=True)
+        if r.status_code != 200:
+            return None, None
+        os.makedirs(save_dir, exist_ok=True)
+        # 文件名：优先 URL 里的哈希，否则用 C编号
+        m = re.search(r'/([0-9a-fA-F]{16,})\.pdf', datasheet_url)
+        stem = m.group(1) if m else "datasheet"
+        fname = f"{stem}.pdf"
+        path = os.path.join(save_dir, fname)
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(8192):
+                f.write(chunk)
+        return path, fname
+    except Exception:
+        return None, None
 
 
 def search_lcsc(keyword: str):

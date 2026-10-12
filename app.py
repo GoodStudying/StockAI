@@ -266,6 +266,41 @@ def lcsc_detail():
     return jsonify(result[0])
 
 
+@app.route("/api/materials/<int:mid>/fetch_datasheet", methods=["POST"])
+@login_required
+def fetch_datasheet(mid):
+    """按物料编码自动从立创下载手册PDF并登记（无需手动下载上传）"""
+    rows = db.query("SELECT code FROM materials WHERE id=?", (mid,))
+    if not rows:
+        return jsonify({"error": "物料不存在"}), 404
+    code = (rows[0]["code"] or "").strip()
+    if not code:
+        return jsonify({"error": "该物料没有立创编码（C编号），无法自动下载"}), 400
+
+    detail = lcsc.fetch_detail(code)
+    if not detail:
+        return jsonify({"error": "未获取到立创详情，请检查编号"}), 404
+    datasheet_url = detail[0].get("datasheet_url")
+    if not datasheet_url:
+        return jsonify({"error": "立创未提供该物料的手册PDF"}), 404
+
+    mat_dir = os.path.join(UPLOAD_DIR, str(mid))
+    path, fname = lcsc.download_datasheet(datasheet_url, mat_dir)
+    if not path:
+        return jsonify({"error": "手册下载失败（网络受限）"}), 502
+
+    # 避免重复登记同一手册
+    exists = db.query("SELECT id FROM material_documents WHERE material_id=? AND file_name=?",
+                      (mid, fname))
+    if exists:
+        return jsonify({"ok": True, "file_name": fname, "note": "手册已存在"})
+
+    db.execute_write(
+        "INSERT INTO material_documents(material_id, doc_type, file_path, file_name) VALUES (?,?,?,?)",
+        (mid, "datasheet", path, fname))
+    return jsonify({"ok": True, "file_name": fname})
+
+
 # ---------------- 手册上传 / 下载 ----------------
 ALLOWED_DOC_TYPES = {"datasheet", "user_manual", "other"}
 
