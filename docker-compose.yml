@@ -33,6 +33,12 @@ services:
       - DB_TYPE=postgres
       # 密码与上面 db 服务保持一致；容器间用服务名 db 互连
       - POSTGRES_DSN=host=db port=5432 dbname=erp user=erp password=erp_2024_change_me
+      # ---------- 网页一键更新（GitHub）----------
+      # 格式：用户名/仓库名；私有仓库需再配 GITHUB_TOKEN（fine-grained PAT，Contents 只读）
+      - GITHUB_REPO=Liaojianwei8/AP_ERP
+      # - GITHUB_TOKEN=github_pat_xxx
+      # NAS 访问 GitHub 不稳时启用加速前缀
+      # - GITHUB_PROXY=https://gh-proxy.com
     depends_on:
       db:
         condition: service_healthy

@@ -113,9 +113,11 @@ def default_admin_exists():
 
 # ---------------- 版本与在线更新（GitHub） ----------------
 # GITHUB_REPO：GitHub 仓库（格式 用户名/仓库名）；GITHUB_PROXY：可选加速前缀（如 https://gh-proxy.com）
+# GITHUB_TOKEN：私有仓库必填（fine-grained PAT，只给 Contents:Read-only 权限即可）
 GITHUB_REPO = os.environ.get("GITHUB_REPO", "").strip("/")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "master")
 GITHUB_PROXY = os.environ.get("GITHUB_PROXY", "").rstrip("/")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 VERSION_FILE = os.path.join(BASE_DIR, ".version")
 # 更新时绝不覆盖的本地目录/文件（数据与环境配置）
 _UPD_KEEP = {".env", "data", "uploads", "__pycache__", ".git", ".version"}
@@ -124,6 +126,14 @@ _UPD_KEEP = {".env", "data", "uploads", "__pycache__", ".git", ".version"}
 def _gh(path):
     """拼接 GitHub 地址（可选走加速代理）"""
     return GITHUB_PROXY + path if GITHUB_PROXY else path
+
+
+def _gh_headers():
+    """带 Token 的请求头（私有仓库需要）"""
+    h = {"User-Agent": "erp-updater"}
+    if GITHUB_TOKEN:
+        h["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    return h
 
 
 def _local_version():
@@ -138,7 +148,7 @@ def _remote_version():
     """查询 GitHub 远程分支最新 commit sha"""
     import requests
     url = _gh(f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_BRANCH}")
-    r = requests.get(url, timeout=15, headers={"User-Agent": "erp-updater"})
+    r = requests.get(url, timeout=15, headers=_gh_headers())
     if not r.ok:
         raise RuntimeError(f"GitHub 接口返回 HTTP {r.status_code}")
     return r.json().get("sha", "")
@@ -153,7 +163,8 @@ def update_status():
     try:
         remote = _remote_version()
     except Exception as e:
-        return jsonify({"error": f"无法访问 GitHub：{e}。NAS 若无法直连，可配置 GITHUB_PROXY 加速前缀"}), 502
+        hint = "。私有仓库需配置 GITHUB_TOKEN" if not GITHUB_TOKEN else ""
+        return jsonify({"error": f"无法访问 GitHub：{e}{hint}。NAS 若无法直连，可配置 GITHUB_PROXY 加速前缀"}), 502
     local = _local_version()
     return jsonify({"repo": GITHUB_REPO, "branch": GITHUB_BRANCH, "local": local,
                     "remote": remote[:7], "update_available": local != remote})
@@ -169,7 +180,7 @@ def update_apply():
     # 1. 仓库 tarball（stream 下载，避免占用内存）
     url = _gh(f"https://codeload.github.com/{GITHUB_REPO}/tar.gz/refs/heads/{GITHUB_BRANCH}")
     try:
-        r = requests.get(url, timeout=120, stream=True)
+        r = requests.get(url, timeout=120, stream=True, headers=_gh_headers())
         if not r.ok:
             return jsonify({"error": f"下载失败 HTTP {r.status_code}"}), 502
         tmp = os.path.join(tempfile.gettempdir(), "erp_update.tgz")
