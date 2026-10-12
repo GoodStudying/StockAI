@@ -9,7 +9,8 @@
 <body>
 <nav>
   <span class="brand">个人ERP</span>
-  <a href="/" class="active">物料 / 出入库</a>
+  <a href="/" class="active">物料管理</a>
+  <a href="/stock.html">出入库</a>
   <a href="/warehouses.html">仓库管理</a>
   <a href="/system.html">系统管理</a>
   <span class="spacer"></span>
@@ -18,7 +19,7 @@
 
 <div class="content">
   <div class="panel">
-    <h3>物料查询</h3>
+    <h3>物料管理</h3>
     <div class="toolbar">
       <input id="search-input" placeholder="按名称 / 编码 / 型号搜索" style="width:240px"
              onkeydown="if(event.key==='Enter')loadMaterials()">
@@ -30,22 +31,10 @@
     <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>ID</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th>
-        <th>库存</th><th>所在库</th><th>手册</th><th>操作</th>
+        <th>图片</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th>
+        <th>库存</th><th>所在库</th><th>新增日期</th><th>手册</th><th>操作</th>
       </tr></thead>
       <tbody id="mat-body"></tbody>
-    </table>
-    </div>
-  </div>
-
-  <div class="panel">
-    <h3>出入库流水</h3>
-    <div class="table-wrap">
-    <table>
-      <thead><tr>
-        <th>时间</th><th>物料</th><th>编码</th><th>类型</th><th>数量</th><th>操作人</th><th>备注</th>
-      </tr></thead>
-      <tbody id="record-body"></tbody>
     </table>
     </div>
   </div>
@@ -112,22 +101,6 @@
   </div>
 </div>
 
-<!-- 入库/出库弹窗 -->
-<div class="modal-mask" id="stock-modal">
-  <div class="modal" style="width:400px">
-    <h3 id="stock-title">入库</h3>
-    <input type="hidden" id="s-mid"><input type="hidden" id="s-op">
-    <div class="form-row"><label>物料</label><input id="s-name" disabled></div>
-    <div class="form-row"><label>当前库存</label><input id="s-cur" disabled></div>
-    <div class="form-row"><label>数量 *</label><input id="s-qty" type="number" min="1" value="1"></div>
-    <div class="form-row"><label>备注</label><input id="s-remark"></div>
-    <div class="modal-footer">
-      <button class="gray" onclick="closeModal('stock-modal')">取消</button>
-      <button onclick="submitStock()">确认提交</button>
-    </div>
-  </div>
-</div>
-
 <script src="/common.js"></script>
 <script>
 let warehouses = [];
@@ -138,7 +111,6 @@ async function init() {
   warehouses = await api('/api/warehouses');
   fillWarehouseSelects();
   loadMaterials();
-  loadRecords();
 }
 function fillWarehouseSelects() {
   const opts = warehouses.map(w =>
@@ -156,10 +128,14 @@ async function loadMaterials() {
   if (wid) url += `warehouse_id=${wid}`;
   const list = await api(url);
   document.getElementById('mat-body').innerHTML = list.map(m => `<tr>
-    <td>${m.id}</td><td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
+    <td>${m.image_path ? `<img src="/api/materials/${m.id}/image" style="width:44px;height:44px;object-fit:contain;cursor:zoom-in"
+         title="点击查看大图" onclick="window.open('/api/materials/${m.id}/image')"
+         onerror="this.replaceWith(document.createTextNode('—'))">` : '—'}</td>
+    <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
     <td>${esc(m.model||'')}</td><td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
-    <td>${m.documents && m.documents.length ? m.documents.map(d =>
+    <td style="white-space:nowrap">${(m.created_at||'').slice(0,10)}</td>
+    <td style="white-space:nowrap">${m.documents && m.documents.length ? m.documents.map(d =>
       `<span class="badge">${d.doc_type === 'datasheet' ? '数据手册' : d.doc_type === 'user_manual' ? '用户手册' : '其他文档'}</span>
        <button class="small" onclick="window.open('/api/documents/${d.id}?mode=preview')">预览</button>
        <button class="small gray" onclick="location.href='/api/documents/${d.id}'">下载</button>
@@ -168,8 +144,7 @@ async function loadMaterials() {
       <button class="small" onclick="openDocModal(${m.id})">上传手册</button>
       ${m.code ? `<button class="small" onclick="autoFetchDoc(${m.id}, this)">获取手册</button>` : ''}</td>
     <td style="white-space:nowrap">
-      <button class="small" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'in')">入库</button>
-      <button class="small gray" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'out')">出库</button>
+      ${m.code && !m.image_path ? `<button class="small" onclick="fetchImg(${m.id}, this)">获取图片</button>` : ''}
       <button class="small" onclick='editMaterial(${JSON.stringify(m)})'>编辑</button>
       <button class="small danger" onclick="delMaterial(${m.id})">删除</button>
     </td></tr>`).join('');
@@ -212,6 +187,7 @@ async function saveMaterial() {
     warehouse_id: document.getElementById('m-warehouse').value || null,
     lcsc_url: document.getElementById('m-lcsc').value.trim(),
     description: document.getElementById('m-desc').value.trim(),
+    image_url: window.__lcsc_image || '',
   };
   if (!body.name) { alert('名称必填'); return; }
   if (id) {
@@ -219,6 +195,7 @@ async function saveMaterial() {
   } else {
     await api('/api/materials', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
   }
+  window.__lcsc_image = '';  // 用完清空，避免污染下次手工新建
   closeModal('mat-modal');
   loadMaterials();
 }
@@ -226,34 +203,6 @@ async function delMaterial(id) {
   if (!confirm('确认删除该物料？')) return;
   await api(`/api/materials/${id}`, { method: 'DELETE' });
   loadMaterials();
-}
-
-// ---------- 出入库 ----------
-function openStock(mid, name, curQty, op) {
-  document.getElementById('s-mid').value = mid;
-  document.getElementById('s-op').value = op;
-  document.getElementById('s-name').value = name;
-  document.getElementById('s-cur').value = curQty;
-  document.getElementById('s-qty').value = 1;
-  document.getElementById('s-remark').value = '';
-  document.getElementById('stock-title').textContent = op === 'in' ? '入库' : '出库';
-  openModal('stock-modal');
-}
-async function submitStock() {
-  const mid = document.getElementById('s-mid').value;
-  const op = document.getElementById('s-op').value;
-  const body = { material_id: +mid, quantity: +document.getElementById('s-qty').value,
-                 remark: document.getElementById('s-remark').value.trim() };
-  await api(`/api/stock/${op}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
-  closeModal('stock-modal');
-  loadMaterials(); loadRecords();
-}
-async function loadRecords() {
-  const list = await api('/api/stock/records');
-  document.getElementById('record-body').innerHTML = list.map(r => `<tr>
-    <td>${r.created_at}</td><td>${esc(r.material_name)}</td><td>${esc(r.material_code||'')}</td>
-    <td><span class="badge ${r.type}">${r.type === 'in' ? '入库' : '出库'}</span></td>
-    <td>${r.quantity}</td><td>${esc(r.operator||'')}</td><td>${esc(r.remark||'')}</td></tr>`).join('');
 }
 
 // ---------- 立创商城 ----------
@@ -312,6 +261,7 @@ async function loadLcscDetail(code, btn) {
 function fillFromLcsc(it) {
   closeModal('lcsc-modal');
   openMaterialModal();
+  window.__lcsc_image = it.image || '';  // 保存图片URL，保存物料时后端下载
   document.getElementById('m-name').value = it.name || it.model || it.code;
   document.getElementById('m-code').value = it.code;
   document.getElementById('m-model').value = it.model;
@@ -358,6 +308,19 @@ async function delDoc(did) {
   if (!confirm('确认删除该手册文件？')) return;
   await api(`/api/documents/${did}`, { method: 'DELETE' });
   loadMaterials();
+}
+async function fetchImg(mid, btn) {
+  const old = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '获取中...';
+  try {
+    const data = await api(`/api/materials/${mid}/fetch_image`, { method: 'POST' });
+    if (!data.note) { /* 新下载成功 */ }
+    loadMaterials();
+  } catch (e) {
+    btn.textContent = old;
+    btn.disabled = false;
+  }
 }
 
 init();

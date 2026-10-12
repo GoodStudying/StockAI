@@ -226,6 +226,31 @@ def download_datasheet(datasheet_url: str, save_dir: str):
     return None, None
 
 
+def download_image(image_url: str, code: str, save_dir: str):
+    """
+    下载立创物料图片到本地。
+    返回 保存路径 或 None。
+    """
+    if not image_url:
+        return None
+    if image_url.startswith("//"):
+        image_url = "https:" + image_url
+    try:
+        r = requests.get(image_url, headers=HEADERS, timeout=20)
+        if r.status_code != 200 or not r.content:
+            return None
+        # 根据Content-Type或URL后缀定扩展名
+        ct = r.headers.get("Content-Type", "")
+        ext = ".png" if "png" in ct or ".png" in image_url.lower() else ".jpg"
+        os.makedirs(save_dir, exist_ok=True)
+        path = os.path.join(save_dir, f"{code}{ext}")
+        with open(path, "wb") as f:
+            f.write(r.content)
+        return path
+    except Exception:
+        return None
+
+
 def search_lcsc(keyword: str):
     """统一入口：C编号直查详情；否则关键字搜索反查"""
     kw = (keyword or "").strip()

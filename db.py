@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS materials (
     unit TEXT DEFAULT '个',
     warehouse_id INTEGER REFERENCES warehouses(id),
     lcsc_url TEXT,            -- 立创商城链接
+    image_path TEXT,          -- 立创图片本地路径
     created_at TEXT DEFAULT (datetime('now','localtime')),
     updated_at TEXT DEFAULT (datetime('now','localtime'))
 );
@@ -157,6 +158,15 @@ def ensure_default_admin():
     if not query("SELECT id FROM users WHERE username='admin'"):
         pw = hashlib.sha256("admin123".encode()).hexdigest()
         execute_write("INSERT INTO users(username, password_hash, role) VALUES ('admin', ?, 'admin')", (pw,))
+
+
+def run_migrations():
+    """轻量迁移：补充新增列（已有表不重建）"""
+    cols = {r["name"] for r in query("PRAGMA table_info(materials)")}
+    if "image_path" not in cols:
+        execute_write("ALTER TABLE materials ADD COLUMN image_path TEXT")
+
+
 
 SCHEMA_POSTGRES = """
 CREATE TABLE IF NOT EXISTS warehouses (

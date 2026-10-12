@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>出入库 - 个人ERP</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<nav>
+  <span class="brand">个人ERP</span>
+  <a href="/">物料管理</a>
+  <a href="/stock.html" class="active">出入库</a>
+  <a href="/warehouses.html">仓库管理</a>
+  <a href="/system.html">系统管理</a>
+  <span class="spacer"></span>
+  <span id="nav-user"></span>
+</nav>
+
+<div class="content">
+  <div class="panel">
+    <h3>物料出入库操作</h3>
+    <div class="toolbar">
+      <input id="search-input" placeholder="按名称 / 编码 / 型号搜索物料" style="width:260px"
+             onkeydown="if(event.key==='Enter')loadMaterials()">
+      <select id="filter-warehouse" onchange="loadMaterials()"><option value="">全部仓库</option></select>
+      <button onclick="loadMaterials()">查询</button>
+    </div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>图片</th><th>名称</th><th>编码</th><th>型号</th><th>品牌</th>
+        <th>库存</th><th>所在库</th><th>操作</th>
+      </tr></thead>
+      <tbody id="mat-body"></tbody>
+    </table>
+    </div>
+  </div>
+
+  <div class="panel">
+    <h3>出入库流水</h3>
+    <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th>时间</th><th>物料</th><th>编码</th><th>类型</th><th>数量</th><th>操作人</th><th>备注</th>
+      </tr></thead>
+      <tbody id="record-body"></tbody>
+    </table>
+    </div>
+  </div>
+</div>
+
+<!-- 入库/出库弹窗 -->
+<div class="modal-mask" id="stock-modal">
+  <div class="modal" style="width:400px">
+    <h3 id="stock-title">入库</h3>
+    <input type="hidden" id="s-mid"><input type="hidden" id="s-op">
+    <div class="form-row"><label>物料</label><input id="s-name" disabled></div>
+    <div class="form-row"><label>当前库存</label><input id="s-cur" disabled></div>
+    <div class="form-row"><label>数量 *</label><input id="s-qty" type="number" min="1" value="1"></div>
+    <div class="form-row"><label>备注</label><input id="s-remark"></div>
+    <div class="modal-footer">
+      <button class="gray" onclick="closeModal('stock-modal')">取消</button>
+      <button onclick="submitStock()">确认提交</button>
+    </div>
+  </div>
+</div>
+
+<script src="/common.js"></script>
+<script>
+let warehouses = [];
+
+async function init() {
+  const user = await checkLogin();
+  if (!user) return;
+  warehouses = await api('/api/warehouses');
+  document.getElementById('filter-warehouse').innerHTML = '<option value="">全部仓库</option>' +
+    warehouses.map(w => `<option value="${w.id}">${'　'.repeat(w.level-1)}${esc(w.name)}</option>`).join('');
+  loadMaterials();
+  loadRecords();
+}
+
+async function loadMaterials() {
+  const q = document.getElementById('search-input').value.trim();
+  const wid = document.getElementById('filter-warehouse').value;
+  let url = '/api/materials?';
+  if (q) url += `q=${encodeURIComponent(q)}&`;
+  if (wid) url += `warehouse_id=${wid}`;
+  const list = await api(url);
+  document.getElementById('mat-body').innerHTML = list.map(m => `<tr>
+    <td>${m.image_path ? `<img src="/api/materials/${m.id}/image" style="width:40px;height:40px;object-fit:contain"
+         onerror="this.replaceWith(document.createTextNode('—'))">` : '—'}</td>
+    <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td><td>${esc(m.model||'')}</td>
+    <td>${esc(m.brand||'')}</td>
+    <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
+    <td style="white-space:nowrap">
+      <button class="small" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'in')">入库</button>
+      <button class="small gray" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'out')">出库</button>
+    </td></tr>`).join('');
+}
+
+function openStock(mid, name, curQty, op) {
+  document.getElementById('s-mid').value = mid;
+  document.getElementById('s-op').value = op;
+  document.getElementById('s-name').value = name;
+  document.getElementById('s-cur').value = curQty;
+  document.getElementById('s-qty').value = 1;
+  document.getElementById('s-remark').value = '';
+  document.getElementById('stock-title').textContent = op === 'in' ? '入库' : '出库';
+  openModal('stock-modal');
+}
+async function submitStock() {
+  const mid = document.getElementById('s-mid').value;
+  const op = document.getElementById('s-op').value;
+  const body = { material_id: +mid, quantity: +document.getElementById('s-qty').value,
+                 remark: document.getElementById('s-remark').value.trim() };
+  await api(`/api/stock/${op}`, { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+  closeModal('stock-modal');
+  loadMaterials(); loadRecords();
+}
+async function loadRecords() {
+  const list = await api('/api/stock/records');
+  document.getElementById('record-body').innerHTML = list.map(r => `<tr>
+    <td>${r.created_at}</td><td>${esc(r.material_name)}</td><td>${esc(r.material_code||'')}</td>
+    <td><span class="badge ${r.type}">${r.type === 'in' ? '入库' : '出库'}</span></td>
+    <td>${r.quantity}</td><td>${esc(r.operator||'')}</td><td>${esc(r.remark||'')}</td></tr>`).join('');
+}
+
+init();
+</script>
+</body>
+</html>

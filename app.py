@@ -21,6 +21,7 @@ app.secret_key = os.urandom(24)
 
 db.init_schema()
 db.ensure_default_admin()
+db.run_migrations()
 
 
 # ---------------- 认证 ----------------
@@ -196,6 +197,14 @@ def create_material():
          d.get("package", ""), d.get("brand", ""), d.get("description", ""),
          int(d.get("quantity") or 0), d.get("unit", "个"),
          d.get("warehouse_id") or None, d.get("lcsc_url", "")))
+
+    # 立创建库时自动下载物料图片（失败不影响建物料）
+    image_url = (d.get("image_url") or "").strip()
+    if image_url and (d.get("code") or "").strip():
+        code = d["code"].strip()
+        path = lcsc.download_image(image_url, code, os.path.join(UPLOAD_DIR, str(last_id)))
+        if path:
+            db.execute_write("UPDATE materials SET image_path=? WHERE id=?", (path, last_id))
     return jsonify({"id": last_id}), 201
 
 
@@ -330,6 +339,41 @@ def fetch_datasheet(mid):
         "INSERT INTO material_documents(material_id, doc_type, file_path, file_name) VALUES (?,?,?,?)",
         (mid, "datasheet", path, fname))
     return jsonify({"ok": True, "file_name": fname})
+
+
+@app.route("/api/materials/<int:mid>/image", methods=["GET"])
+@login_required
+def material_image(mid):
+    """物料图片（本地文件）"""
+    rows = db.query("SELECT image_path FROM materials WHERE id=?", (mid,))
+    if not rows or not rows[0]["image_path"] or not os.path.exists(rows[0]["image_path"]):
+        return jsonify({"error": "无图片"}), 404
+    return send_file(rows[0]["image_path"])
+
+
+@app.route("/api/materials/<int:mid>/fetch_image", methods=["POST"])
+@login_required
+def fetch_image(mid):
+    """按编号从立创补取物料图片"""
+    rows = db.query("SELECT code, image_path FROM materials WHERE id=?", (mid,))
+    if not rows:
+        return jsonify({"error": "物料不存在"}), 404
+    code = (rows[0]["code"] or "").strip()
+    if not code:
+        return jsonify({"error": "该物料没有立创C编号，无法获取图片"}), 400
+    if rows[0]["image_path"] and os.path.exists(rows[0]["image_path"]):
+        return jsonify({"ok": True, "note": "图片已存在"})
+    try:
+        detail = lcsc.fetch_detail(code)
+    except Exception:
+        detail = []
+    if not detail or not detail[0].get("image"):
+        return jsonify({"error": "立创未提供图片或获取失败"}), 404
+    path = lcsc.download_image(detail[0]["image"], code, os.path.join(UPLOAD_DIR, str(mid)))
+    if not path:
+        return jsonify({"error": "图片下载失败"}), 502
+    db.execute_write("UPDATE materials SET image_path=? WHERE id=?", (path, mid))
+    return jsonify({"ok": True})
 
 
 # ---------------- 手册上传 / 下载 ----------------
