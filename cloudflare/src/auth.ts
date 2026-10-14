@@ -126,7 +126,15 @@ auth.post("/api/login", async (c) => {
     });
     return c.json({ ok: true, user });
   }
-  return c.json({ error: "用户名或密码错误" }, 401);
+  // 临时诊断字段（定位线上登录 401 用，确认后移除）：只报用户是否存在与哈希前缀，不泄完整值
+  return c.json({
+    error: "用户名或密码错误",
+    diag: {
+      user_found: !!row,
+      hash_head: row ? row.password_hash.slice(0, 21) : null,
+      fmt_ok: row ? /^pbkdf2:sha256:\d+\$/.test(row.password_hash) : null,
+    },
+  }, 401);
 });
 
 // ---------------- 登出 ----------------
@@ -158,6 +166,13 @@ auth.get("/api/debug/env", async (c) => {
 });
 
 // ---------------- 部署版本号（与登录页脚的版本标记同步更新，核对线上代码版本用） ----------------
-auth.get("/api/version", (c) => c.json({ version: "v261014.2" }));
+auth.get("/api/version", (c) => c.json({ version: "v261014.3" }));
+
+// ---------------- 用户表诊断（临时：从 Worker 视角查它绑定的 D1，绕开"Console操作的库对不对"的疑问） ----------------
+auth.get("/api/debug/users", async (c) => {
+  const r = await c.env.DB.prepare(
+    "SELECT id, username, role, length(password_hash) AS hash_len, substr(password_hash,1,21) AS hash_head FROM users").all<any>();
+  return c.json({ count: r.results?.length ?? 0, users: r.results ?? [] });
+});
 
 export default auth;
