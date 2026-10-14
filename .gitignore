@@ -6,3 +6,5 @@ uploads/
 .env
 pgdata/
 *.zip
+cloudflare/node_modules/
+cloudflare/.wrangler/
