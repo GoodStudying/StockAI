@@ -126,15 +126,29 @@ auth.post("/api/login", async (c) => {
     });
     return c.json({ ok: true, user });
   }
-  // 临时诊断字段（定位线上登录 401 用，确认后移除）：只报用户是否存在与哈希前缀，不泄完整值
-  return c.json({
-    error: "用户名或密码错误",
-    diag: {
-      user_found: !!row,
-      hash_head: row ? row.password_hash.slice(0, 21) : null,
-      fmt_ok: row ? /^pbkdf2:sha256:\d+\$/.test(row.password_hash) : null,
-    },
-  }, 401);
+  // 临时诊断（定位线上登录 401 用，确认后移除）：对比存储盐值/哈希前缀与现场复算前缀。
+  // 前缀均为单向派生值与格式片段，不构成密码泄露；salt 明文本就是哈希串的一部分。
+  const diag: Record<string, unknown> = { user_found: !!row };
+  if (row) {
+    const stored = row.password_hash as string;
+    diag.hash_head = stored.slice(0, 21);
+    const m = stored.match(/^pbkdf2:sha256:(\d+)\$(.+)\$([0-9a-fA-F]+)$/);
+    diag.fmt_ok = !!m;
+    if (m) {
+      diag.salt = m[2];
+      diag.stored_head = m[3].toLowerCase().slice(0, 12);
+      try {
+        const key = await crypto.subtle.importKey(
+          "raw", enc.encode(String(d.password ?? "")), "PBKDF2", false, ["deriveBits"]);
+        const bits = await crypto.subtle.deriveBits(
+          { name: "PBKDF2", hash: "SHA-256", salt: enc.encode(m[2]), iterations: Number(m[1]) }, key, 256);
+        diag.calc_head = toHex(bits).slice(0, 12);
+      } catch (e: unknown) {
+        diag.derive_err = String(e instanceof Error ? e.message : e);
+      }
+    }
+  }
+  return c.json({ error: "用户名或密码错误", diag }, 401);
 });
 
 // ---------------- 登出 ----------------
@@ -166,7 +180,7 @@ auth.get("/api/debug/env", async (c) => {
 });
 
 // ---------------- 部署版本号（与登录页脚的版本标记同步更新，核对线上代码版本用） ----------------
-auth.get("/api/version", (c) => c.json({ version: "v261014.3" }));
+auth.get("/api/version", (c) => c.json({ version: "v261014.4" }));
 
 // ---------------- 用户表诊断（临时：从 Worker 视角查它绑定的 D1，绕开"Console操作的库对不对"的疑问） ----------------
 auth.get("/api/debug/users", async (c) => {
