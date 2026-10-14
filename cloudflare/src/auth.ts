@@ -148,4 +148,13 @@ auth.get("/api/default_admin_exists", async (c) => {
   return c.json({ default_exists: isDefault });
 });
 
+// ---------------- 运行时环境诊断（排查变量绑定问题用，只报有无不泄露值） ----------------
+auth.get("/api/debug/env", async (c) => {
+  return c.json({
+    has_worker_secret: !!c.env.WORKER_SECRET,
+    worker_secret_length: (c.env.WORKER_SECRET ?? "").length,
+    has_api_token: !!c.env.API_TOKEN,
+  });
+});
+
 export default auth;
