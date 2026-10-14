@@ -5,8 +5,8 @@ main = "src/index.ts"
 compatibility_date = "2025-06-01"
 
 # 静态资源：托管仓库根目录的 static/（前端 5 个页面零改动上云）
-# not_single_page_app = 多页应用（login/index/warehouses/stock/system 各自独立 html）
-assets = { directory = "../static", binding = "ASSETS", not_single_page_app = true }
+# 默认行为即多页应用所需：静态文件命中直接返回，未命中（如 /api/*）进入 Worker 路由
+assets = { directory = "../static", binding = "ASSETS" }
 
 # D1 数据库绑定（binding 名必须是 DB，代码里 env.DB 引用）
 # ★ 部署前必改：在 Cloudflare 控制台创建 D1（名字 erp），把下面 database_id 换成网页显示的真实 ID
