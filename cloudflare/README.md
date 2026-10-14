@@ -52,12 +52,17 @@
 ## 第 5 步：D1 建表 + 导入旧数据（约 3 分钟，必做）
 
 > 顺序注意：先跑本步骤再访问页面，否则登录会报 `no such table: users`。
+> ⚠ Console 直接粘贴 `schema.sql` 会报 "Requests without any query are not supported"
+> （网页 Console 对带 `--` 注释的多语句解析有 bug），**请粘贴 `schema-console.sql`（无注释版）**。
 
 1. **Storage & Databases → D1 → erp → Console** 标签页
-2. 打开本仓库 `cloudflare/schema.sql`，**全选复制**文件内容，粘贴进 Console 输入框，点 **Execute**
+2. 打开本仓库 `cloudflare/schema-console.sql`（**注意是带 -console 后缀的这个**），
+   全选复制文件内容，粘贴进 Console 输入框，点 **Execute**
    （建 5 张表 + 默认管理员 `admin/admin123`）
-3. （可选）导入旧数据：同样方式粘贴 `cloudflare/data-migrate.sql` 全文并 Execute
+3. （可选）导入旧数据：同样方式粘贴 `cloudflare/data-migrate-console.sql` 全文并 Execute
    （包含本地版的仓库/物料/流水/用户；旧 admin 密码若改过，见下方说明）
+4. 若粘贴多语句仍报错：改用 Console 旁的 **Import** 按钮直接上传对应 .sql 文件（从 GitHub
+   文件页面 Download 原始文件），或逐条粘贴执行
 
 ## 第 6 步：验证
 
@@ -88,7 +93,8 @@ ERP_API_TOKEN=<第 4 步配置的 API_TOKEN>
 | 现象 | 原因与解决 |
 |---|---|
 | 页面打不开/转圈 | `*.workers.dev` 国内直连不稳，挂代理或绑自定义域名（Cloudflare 海外边缘无需备案） |
-| 登录报 `no such table: users` | 第 5 步没执行，去 D1 Console 跑 schema.sql |
+| 登录报 `no such table: users` | 第 5 步没执行，去 D1 Console 跑 schema-console.sql |
+| Console 报 `Requests without any query` | 粘贴的是带注释的 schema.sql，改用 **schema-console.sql**（无注释版），或用 Import 按钮上传文件 |
 | 登录报 500 提示 WORKER_SECRET | 第 4 步没配，或配完没重新部署 |
 | git push 后没更新 | Worker → Deployments 查看构建日志；确认 push 的是 master 分支 |
 | 构建失败 `database_id` 相关 | 第 2 步的 ID 没替换或复制不完整 |

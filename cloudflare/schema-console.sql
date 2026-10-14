@@ -1,0 +1,11 @@
+CREATE TABLE IF NOT EXISTS warehouses (id INTEGER PRIMARY KEY, name TEXT NOT NULL, parent_id INTEGER REFERENCES warehouses(id) ON DELETE CASCADE, level INTEGER NOT NULL CHECK(level BETWEEN 1 AND 4), created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS materials (id INTEGER PRIMARY KEY, name TEXT NOT NULL, code TEXT, model TEXT, category TEXT, package TEXT, brand TEXT, description TEXT, quantity INTEGER DEFAULT 0, unit TEXT DEFAULT '个', warehouse_id INTEGER REFERENCES warehouses(id), lcsc_url TEXT, image_path TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP, updated_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS material_documents (id INTEGER PRIMARY KEY, material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE, doc_type TEXT NOT NULL, file_path TEXT NOT NULL DEFAULT '', file_name TEXT NOT NULL, uploaded_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'user', created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS stock_records (id INTEGER PRIMARY KEY, material_id INTEGER NOT NULL REFERENCES materials(id) ON DELETE CASCADE, type TEXT NOT NULL CHECK(type IN ('in','out')), quantity INTEGER NOT NULL CHECK(quantity > 0), operator TEXT, remark TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE INDEX IF NOT EXISTS idx_materials_name ON materials(name);
+CREATE INDEX IF NOT EXISTS idx_materials_code ON materials(code);
+CREATE INDEX IF NOT EXISTS idx_materials_wh ON materials(warehouse_id);
+CREATE INDEX IF NOT EXISTS idx_wh_parent ON warehouses(parent_id);
+CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
+INSERT OR IGNORE INTO users(username, password_hash, role) VALUES ('admin', 'pbkdf2:sha256:260000$OS9IuyXpjtblWUcm$7bc711af05fbb03665aa6e403a6ec5a436ed16bbaf57c464a26e867034c68d3a', 'admin');
