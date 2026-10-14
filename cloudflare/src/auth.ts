@@ -157,4 +157,7 @@ auth.get("/api/debug/env", async (c) => {
   });
 });
 
+// ---------------- 部署版本号（与登录页脚的版本标记同步更新，核对线上代码版本用） ----------------
+auth.get("/api/version", (c) => c.json({ version: "v261014.2" }));
+
 export default auth;
