@@ -13,7 +13,7 @@ assets = { directory = "../static", binding = "ASSETS", not_single_page_app = tr
 [[d1_databases]]
 binding = "DB"
 database_name = "erp"
-database_id = "请替换为你的D1数据库ID"
+database_id = "41c8d5ba-896e-460b-8a14-bec23c846cc7"
 
 # 环境变量说明（都在网页 Worker → Settings → Variables and Secrets 里配置，不写在代码仓库）：
 #   WORKER_SECRET  会话 JWT 签名密钥（必配，随机 32 位以上字符串，Type 选 Secret）
