@@ -7,6 +7,7 @@
 """
 import os
 import sqlite3
+from contextlib import contextmanager
 from config import DB_TYPE, SQLITE_PATH, POSTGRES_DSN
 
 # ---------- 统一参数占位符 ----------
@@ -58,19 +59,30 @@ def get_conn():
     return _backend.conn()
 
 
-def execute(sql, params=()):
+def convert_sql(sql: str) -> str:
+    """对外暴露占位符转换（transaction() 事务块内手写 SQL 时使用）"""
+    return _convert(sql)
+
+
+@contextmanager
+def transaction():
+    """
+    事务上下文：块内所有写操作要么全部提交、要么全部回滚。
+    用于出入库这类「更新库存 + 写流水」必须同成败的多步写操作。
+    用法：
+        with db.transaction() as cur:
+            cur.execute(db.convert_sql("UPDATE ..."), (...))
+    """
     conn = get_conn()
     try:
         cur = _cursor(conn)
-        cur.execute(_convert(sql), params)
+        yield cur
         conn.commit()
-        return cur
     except Exception:
         conn.rollback()
         raise
     finally:
-        # SQLite 需保持连接直到 fetch 完；这里由调用方 fetchall 后关闭
-        pass
+        conn.close()
 
 
 def query(sql, params=()):
@@ -177,11 +189,13 @@ CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
 
 
 def ensure_default_admin():
-    """首次启动时创建默认管理员 admin / admin123"""
-    import hashlib
+    """首次启动时创建默认管理员 admin / admin123（加盐 PBKDF2 哈希，非旧版无盐 SHA-256）
+    哈希算法与 app.py 的 _hash_password 保持一致：pbkdf2:sha256（Cloudflare Workers
+    的 Web Crypto 不支持 scrypt，统一 pbkdf2 便于将来上云无缝校验存量密码）"""
+    from werkzeug.security import generate_password_hash
     if not query("SELECT id FROM users WHERE username='admin'"):
-        pw = hashlib.sha256("admin123".encode()).hexdigest()
-        execute_write("INSERT INTO users(username, password_hash, role) VALUES ('admin', ?, 'admin')", (pw,))
+        execute_write("INSERT INTO users(username, password_hash, role) VALUES ('admin', ?, 'admin')",
+                      (generate_password_hash("admin123", method="pbkdf2:sha256:260000"),))
 
 
 def run_migrations():

@@ -9,21 +9,53 @@
 import os
 import re
 import io
+import time
+import hmac
 import base64
 import hashlib
-import shutil
+import secrets
 import threading
 from datetime import datetime
 from functools import wraps
-from flask import Flask, request, jsonify, send_from_directory, send_file, session
+from flask import Flask, request, jsonify, send_from_directory, send_file, session, g
+from werkzeug.security import generate_password_hash, check_password_hash
 from config import UPLOAD_DIR, MAX_WAREHOUSE_LEVEL, BASE_DIR, SQLITE_PATH, DB_TYPE
 import db
 import lcsc
 
 app = Flask(__name__, static_folder="static", static_url_path="")
-# 固定密钥：gunicorn 多 worker 各自 os.urandom(24) 会导致 session 跨进程验签失败（登录后立刻被踢回登录页）
-# 可通过环境变量 SECRET_KEY 覆盖
-app.secret_key = os.environ.get("SECRET_KEY") or "personal-erp-fixed-secret-9f4c2a8e7b1d"
+
+
+def _load_or_create_secret():
+    """
+    密钥优先级：环境变量 SECRET_KEY > data/.secret_key 文件 > 随机生成并落盘。
+    必须固定：gunicorn 多 worker 各自 os.urandom() 会导致 session 跨进程验签失败
+    （登录后立刻被踢回登录页）；落盘在 data/ 下，在线更新不会覆盖。
+    """
+    key = os.environ.get("SECRET_KEY")
+    if key:
+        return key
+    p = os.path.join(BASE_DIR, "data", ".secret_key")
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            k = f.read().strip()
+            if k:
+                return k
+    except OSError:
+        pass
+    k = secrets.token_hex(32)
+    try:
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(k)
+    except OSError:
+        pass
+    return k
+
+
+app.secret_key = _load_or_create_secret()
+# 请求体上限：手册 PDF 全量读入内存存 BLOB，限制 50MB 防止超大文件把 NAS 内存打爆
+app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024
 
 db.init_schema()
 db.ensure_default_admin()
@@ -55,6 +87,15 @@ def _serve_bytes(data: bytes, download_name: str, inline: bool):
                      download_name=download_name, mimetype=mime)
 
 
+def _parse_int(v, minimum=0):
+    """解析整数入参；非法输入返回 None（避免 int('abc') 抛 ValueError 变成 500）"""
+    try:
+        q = int(str(v).strip())
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return q if q >= minimum else None
+
+
 # ---------------- 认证 ----------------
 def login_required(f):
     @wraps(f)
@@ -77,16 +118,57 @@ def admin_required(f):
     return wrapper
 
 
+# ---------------- 密码哈希（werkzeug PBKDF2 加盐，兼容旧无盐 SHA-256 自动升级） ----------------
+def _hash_password(pw: str) -> str:
+    # 显式指定 pbkdf2:sha256：新 Werkzeug 默认 scrypt，但 Cloudflare Workers 的
+    # Web Crypto 不支持 scrypt——保持 pbkdf2 是为了将来上云可无缝校验存量密码
+    return generate_password_hash(pw, method="pbkdf2:sha256:260000")
+
+
+def _verify_password(stored: str, pw: str):
+    """返回 (是否匹配, 是否为旧版哈希)。旧版无盐 sha256 校验通过后由调用方原地升级哈希。"""
+    if stored and len(stored) == 64 and all(c in "0123456789abcdef" for c in stored.lower()):
+        return hashlib.sha256(pw.encode()).hexdigest() == stored.lower(), True
+    try:
+        return check_password_hash(stored, pw), False
+    except Exception:
+        return False, False
+
+
+# 登录限流：同一 IP 5 分钟内最多 10 次尝试，防暴力破解（内存计数，重启清零）
+_LOGIN_ATTEMPTS = {}
+
+
+def _login_rate_check(ip):
+    now = time.time()
+    lst = [t for t in _LOGIN_ATTEMPTS.get(ip, []) if now - t < 300]
+    if len(lst) >= 10:
+        _LOGIN_ATTEMPTS[ip] = lst
+        return False
+    lst.append(now)
+    _LOGIN_ATTEMPTS[ip] = lst
+    return True
+
+
 @app.route("/api/login", methods=["POST"])
 def login():
+    if not _login_rate_check(request.remote_addr or "unknown"):
+        return jsonify({"error": "尝试过于频繁，请 5 分钟后再试"}), 429
     d = request.get_json(force=True)
-    pw = hashlib.sha256((d.get("password") or "").encode()).hexdigest()
-    rows = db.query("SELECT id, username, role FROM users WHERE username=? AND password_hash=?",
-                    ((d.get("username") or "").strip(), pw))
-    if not rows:
-        return jsonify({"error": "用户名或密码错误"}), 401
-    session["user"] = rows[0]
-    return jsonify({"ok": True, "user": rows[0]})
+    uname = (d.get("username") or "").strip()
+    # 先按用户名查，再验哈希（加盐哈希无法参与 WHERE 匹配）
+    rows = db.query("SELECT id, username, role, password_hash FROM users WHERE username=?", (uname,))
+    if rows:
+        ok, legacy = _verify_password(rows[0]["password_hash"], d.get("password") or "")
+        if ok:
+            if legacy:
+                # 旧无盐 SHA-256 登录成功，立即原地升级为加盐 PBKDF2
+                db.execute_write("UPDATE users SET password_hash=? WHERE id=?",
+                                 (_hash_password(d["password"]), rows[0]["id"]))
+            user = {"id": rows[0]["id"], "username": rows[0]["username"], "role": rows[0]["role"]}
+            session["user"] = user
+            return jsonify({"ok": True, "user": user})
+    return jsonify({"error": "用户名或密码错误"}), 401
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -104,10 +186,35 @@ def me():
 @app.route("/api/default_admin_exists")
 def default_admin_exists():
     """登录页探测：admin 是否仍为默认密码（是则前端显示修改提醒，改密后自动消失）"""
-    import hashlib
-    pw = hashlib.sha256("admin123".encode()).hexdigest()
-    rows = db.query("SELECT id FROM users WHERE username='admin' AND password_hash=?", (pw,))
-    return jsonify({"default_exists": bool(rows)})
+    rows = db.query("SELECT password_hash FROM users WHERE username='admin'")
+    is_default = bool(rows) and _verify_password(rows[0]["password_hash"], "admin123")[0]
+    return jsonify({"default_exists": is_default})
+
+
+# ---------------- API Token 认证（预留给 Cherry Studio / MCP 等程序化调用的 /api/v1 接口） ----------------
+# .env 配置 API_TOKEN=xxx（多个用英文逗号分隔）；未配置则 /api/v1/* 一律返回 503
+API_TOKENS = {t.strip() for t in os.environ.get("API_TOKEN", "").split(",") if t.strip()}
+
+
+def token_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not API_TOKENS:
+            return jsonify({"error": "服务端未配置 API_TOKEN（在 .env 中添加后重启生效）"}), 503
+        auth = request.headers.get("Authorization", "")
+        tok = auth[7:].strip() if auth.startswith("Bearer ") else ""
+        if not tok or not any(hmac.compare_digest(tok, t) for t in API_TOKENS):
+            return jsonify({"error": "API Token 无效或缺失（请求头 Authorization: Bearer <token>）"}), 401
+        # 流水操作人留痕：只记 token 前 4 位，不落完整 token
+        g.api_operator = f"api:{tok[:4]}***"
+        return f(*args, **kwargs)
+    return wrapper
+
+
+@app.errorhandler(413)
+def request_too_large(_e):
+    """上传超过 MAX_CONTENT_LENGTH 时返回 JSON 而不是默认 HTML 错误页"""
+    return jsonify({"error": "文件过大，上限 50MB"}), 413
 
 
 # ---------------- 版本与在线更新（GitHub） ----------------
@@ -246,17 +353,21 @@ def _do_update():
                 errs.append(f"{rel}: {e}")
         if done == 0:
             raise RuntimeError("全部文件下载失败：" + "; ".join(errs[:3]))
-        # 记录新版本号
+        if errs:
+            # 部分失败：不写版本号、不重启，保持“可重试更新”状态，
+            # 避免残缺文件被误认为已是最新版而再也触发不了更新
+            _progress_write("error",
+                            f"{len(errs)}/{total} 个文件下载失败（如 {errs[0]}），版本号未更新，请重试更新",
+                            done, total)
+            return
+        # 全部成功才记录新版本号
         try:
             sha = _remote_version()
         except Exception:
             sha = ""
         with open(VERSION_FILE, "w", encoding="utf-8") as f:
             f.write(sha)
-        msg = f"更新完成（{done}/{total} 个文件），2 秒后平滑重启"
-        if errs:
-            msg += f"；{len(errs)} 个失败：{errs[0]}"
-        _progress_write("restarting", msg, done, total)
+        _progress_write("restarting", f"更新完成（{done}/{total} 个文件），2 秒后平滑重启", done, total)
         time.sleep(2)
         # 平滑重启：容器内向 gunicorn 主进程(PID1)发 SIGHUP；本地开发直接退出
         try:
@@ -353,6 +464,14 @@ def rename_warehouse(wid):
 @app.route("/api/warehouses/<int:wid>", methods=["DELETE"])
 @login_required
 def delete_warehouse(wid):
+    # 防御：库（含子库）内还有物料时拒绝删除。
+    # materials.warehouse_id 外键无 ON DELETE 行为，直接删会触发 IntegrityError 变 500
+    ids = _descendant_ids(wid)
+    ph = ",".join("?" * len(ids))
+    cnt = db.query(f"SELECT COUNT(*) AS c FROM materials WHERE warehouse_id IN ({ph})",
+                   tuple(ids))[0]["c"]
+    if cnt:
+        return jsonify({"error": f"该库及其子库下还有 {cnt} 件物料，请先移出或删除物料"}), 400
     _, n = db.execute_write("DELETE FROM warehouses WHERE id=?", (wid,))
     if n == 0:
         return jsonify({"error": "库不存在"}), 404
@@ -364,7 +483,7 @@ def delete_warehouse(wid):
 @login_required
 def list_materials():
     kw = (request.args.get("q") or "").strip()
-    wid = request.args.get("warehouse_id")
+    wid_raw = request.args.get("warehouse_id")
     include_children = request.args.get("include_children", "1") != "0"  # 默认含子库
     sql = """SELECT m.id, m.name, m.code, m.model, m.category, m.package, m.brand,
                     m.description, m.quantity, m.unit, m.warehouse_id, m.lcsc_url,
@@ -377,10 +496,14 @@ def list_materials():
         conds.append("(m.name LIKE ? OR m.code LIKE ? OR m.model LIKE ?)")
         like = f"%{kw}%"
         params += [like, like, like]
-    if wid:
+    if wid_raw:
+        wid = _parse_int(wid_raw, 1)
+        if wid is None:
+            return jsonify({"error": "warehouse_id 不合法"}), 400
         if include_children:
             # 仓库层级包含关系：查该库及其全部子孙库的物料
-            ph = ",".join("?" * len(ids := _descendant_ids(int(wid))))
+            ids = _descendant_ids(wid)
+            ph = ",".join("?" * len(ids))
             conds.append(f"m.warehouse_id IN ({ph})")
             params += ids
         else:
@@ -407,16 +530,19 @@ def create_material():
     name = (d.get("name") or "").strip()
     if not name:
         return jsonify({"error": "物料名称不能为空"}), 400
+    qty = _parse_int(d.get("quantity") or 0, 0)
+    if qty is None:
+        return jsonify({"error": "数量必须是不小于0的整数"}), 400
     last_id, _ = db.execute_write(
         """INSERT INTO materials(name, code, model, category, package, brand,
                                  description, quantity, unit, warehouse_id, lcsc_url)
            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         (name, d.get("code", ""), d.get("model", ""), d.get("category", ""),
          d.get("package", ""), d.get("brand", ""), d.get("description", ""),
-         int(d.get("quantity") or 0), d.get("unit", "个"),
+         qty, d.get("unit", "个"),
          d.get("warehouse_id") or None, d.get("lcsc_url", "")))
 
-    # 立创建库时自动下载物料图片（失败不影响建物料）；图片内容直接存数据库
+    # 创建物料时自动下载物料图片（失败不影响建物料）；图片内容直接存数据库
     image_url = (d.get("image_url") or "").strip()
     if image_url and (d.get("code") or "").strip():
         code = d["code"].strip()
@@ -430,13 +556,19 @@ def create_material():
 @login_required
 def update_material(mid):
     d = request.get_json(force=True)
+    name = (d.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "物料名称不能为空"}), 400
+    qty = _parse_int(d.get("quantity") or 0, 0)
+    if qty is None:
+        return jsonify({"error": "数量必须是不小于0的整数"}), 400
     _, n = db.execute_write(
         """UPDATE materials SET name=?, code=?, model=?, category=?, package=?,
            brand=?, description=?, quantity=?, unit=?, warehouse_id=?, lcsc_url=?,
            updated_at=? WHERE id=?""",
-        (d.get("name", ""), d.get("code", ""), d.get("model", ""), d.get("category", ""),
+        (name, d.get("code", ""), d.get("model", ""), d.get("category", ""),
          d.get("package", ""), d.get("brand", ""), d.get("description", ""),
-         int(d.get("quantity") or 0), d.get("unit", "个"),
+         qty, d.get("unit", "个"),
          d.get("warehouse_id") or None, d.get("lcsc_url", ""),
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mid))
     if n == 0:
@@ -454,6 +586,43 @@ def delete_material(mid):
 
 
 # ---------------- 入库 / 出库 ----------------
+def _apply_stock(op, mid, qty, operator, remark):
+    """
+    原子出入库核心逻辑（网页端与 /api/v1 共用）。
+    - 出库用「UPDATE ... WHERE quantity>=?」单语句扣减，并发下也不会扣成负数（防超卖）
+    - 库存更新与流水写入同一事务，同成败
+    返回 (新库存, None)；失败返回 (None, (错误消息, HTTP状态码))
+    """
+    rows = db.query("SELECT id, quantity FROM materials WHERE id=?", (mid,))
+    if not rows:
+        return None, ("物料不存在", 404)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if op == "out":
+        with db.transaction() as cur:
+            cur.execute(db.convert_sql(
+                "UPDATE materials SET quantity=quantity-?, updated_at=? WHERE id=? AND quantity>=?"),
+                (qty, ts, mid, qty))
+            if cur.rowcount == 0:
+                # 用同一 cursor 回读真实库存（避免事务持锁期间再开新连接查询）
+                cur.execute(db.convert_sql("SELECT quantity FROM materials WHERE id=?"), (mid,))
+                r = cur.fetchone()
+                cur_qty = r["quantity"] if r is not None else 0
+                return None, (f"库存不足，当前库存 {cur_qty}", 400)
+            cur.execute(db.convert_sql(
+                "INSERT INTO stock_records(material_id, type, quantity, operator, remark) VALUES (?,?,?,?,?)"),
+                (mid, op, qty, operator, remark))
+    else:
+        with db.transaction() as cur:
+            cur.execute(db.convert_sql(
+                "UPDATE materials SET quantity=quantity+?, updated_at=? WHERE id=?"), (qty, ts, mid))
+            cur.execute(db.convert_sql(
+                "INSERT INTO stock_records(material_id, type, quantity, operator, remark) VALUES (?,?,?,?,?)"),
+                (mid, op, qty, operator, remark))
+    # 事务提交后回读真实库存返回（并发场景下不用事务前的旧值）
+    new_qty = db.query("SELECT quantity FROM materials WHERE id=?", (mid,))[0]["quantity"]
+    return new_qty, None
+
+
 @app.route("/api/stock/<op>", methods=["POST"])
 @login_required
 def stock_inout(op):
@@ -461,31 +630,20 @@ def stock_inout(op):
     if op not in ("in", "out"):
         return jsonify({"error": "操作类型不合法"}), 400
     d = request.get_json(force=True)
-    mid = d.get("material_id")
-    qty = int(d.get("quantity") or 0)
-    if qty <= 0:
-        return jsonify({"error": "数量必须大于0"}), 400
-    rows = db.query("SELECT quantity FROM materials WHERE id=?", (mid,))
-    if not rows:
-        return jsonify({"error": "物料不存在"}), 404
-    cur_qty = rows[0]["quantity"]
-    if op == "out" and qty > cur_qty:
-        return jsonify({"error": f"库存不足，当前库存 {cur_qty}"}), 400
-
-    new_qty = cur_qty + qty if op == "in" else cur_qty - qty
-    operator = session["user"]["username"]
-    db.execute_write("UPDATE materials SET quantity=?, updated_at=? WHERE id=?",
-                     (new_qty, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mid))
-    db.execute_write(
-        "INSERT INTO stock_records(material_id, type, quantity, operator, remark) VALUES (?,?,?,?,?)",
-        (mid, op, qty, operator, d.get("remark", "")))
+    mid = _parse_int(d.get("material_id"), 1)
+    qty = _parse_int(d.get("quantity"), 1)
+    if mid is None:
+        return jsonify({"error": "material_id 不合法"}), 400
+    if qty is None:
+        return jsonify({"error": "数量必须是大于0的整数"}), 400
+    new_qty, err = _apply_stock(op, mid, qty, session["user"]["username"], d.get("remark", ""))
+    if err:
+        return jsonify({"error": err[0]}), err[1]
     return jsonify({"ok": True, "quantity": new_qty})
 
 
-@app.route("/api/stock/records", methods=["GET"])
-@login_required
-def stock_records():
-    """库存流水，支持按物料过滤"""
+def _query_stock_records():
+    """库存流水查询（网页端与 /api/v1 共用）"""
     mid = request.args.get("material_id")
     sql = """SELECT r.*, m.name AS material_name, m.code AS material_code
              FROM stock_records r JOIN materials m ON r.material_id = m.id"""
@@ -494,7 +652,165 @@ def stock_records():
         sql += " WHERE r.material_id = ?"
         params = (mid,)
     sql += " ORDER BY r.id DESC LIMIT 500"
-    return jsonify(db.query(sql, params))
+    return db.query(sql, params)
+
+
+@app.route("/api/stock/records", methods=["GET"])
+@login_required
+def stock_records():
+    """库存流水，支持按物料过滤"""
+    return jsonify(_query_stock_records())
+
+
+# ---------------- 开放接口 /api/v1（API Token 认证，供 Cherry Studio / MCP 等程序化调用） ----------------
+
+@app.route("/api/v1/materials", methods=["GET"])
+@token_required
+def v1_search_materials():
+    """物料搜索：q 模糊匹配 名称/编码/型号；code 精确匹配编码"""
+    code = (request.args.get("code") or "").strip()
+    kw = (request.args.get("q") or "").strip()
+    cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id"
+    if code:
+        rows = db.query(f"SELECT {cols} FROM materials WHERE code=? LIMIT 50", (code,))
+    elif kw:
+        like = f"%{kw}%"
+        rows = db.query(
+            f"SELECT {cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ? "
+            f"ORDER BY id DESC LIMIT 50", (like, like, like))
+    else:
+        return jsonify({"error": "请提供 q 或 code 参数"}), 400
+    return jsonify({"count": len(rows), "materials": rows})
+
+
+@app.route("/api/v1/stock/<op>", methods=["POST"])
+@token_required
+def v1_stock_inout(op):
+    """程序化出入库（与网页端同一原子逻辑）。body: {material_id, quantity, remark}"""
+    if op not in ("in", "out"):
+        return jsonify({"error": "操作类型不合法"}), 400
+    d = request.get_json(force=True)
+    mid = _parse_int(d.get("material_id"), 1)
+    qty = _parse_int(d.get("quantity"), 1)
+    if mid is None:
+        return jsonify({"error": "material_id 不合法"}), 400
+    if qty is None:
+        return jsonify({"error": "数量必须是大于0的整数"}), 400
+    new_qty, err = _apply_stock(op, mid, qty, getattr(g, "api_operator", "api"), d.get("remark", ""))
+    if err:
+        return jsonify({"error": err[0]}), err[1]
+    return jsonify({"ok": True, "material_id": mid, "quantity": new_qty})
+
+
+@app.route("/api/v1/stock/records", methods=["GET"])
+@token_required
+def v1_stock_records():
+    """程序化查询库存流水"""
+    return jsonify({"records": _query_stock_records()})
+
+
+def _match_material(item):
+    """
+    BOM 条目匹配物料，优先级：编码精确 > 型号精确 > 名称精确 > 名称模糊。
+    返回 (material或None, 匹配方式, 候选列表)。匹配方式: code/model/name/name_fuzzy/ambiguous/not_found
+    """
+    code = (item.get("code") or "").strip() if isinstance(item.get("code"), str) else ""
+    model = (item.get("model") or "").strip() if isinstance(item.get("model"), str) else ""
+    name = (item.get("name") or "").strip() if isinstance(item.get("name"), str) else ""
+    cols = "id, name, code, model, quantity, unit, warehouse_id"
+    if code:
+        rows = db.query(f"SELECT {cols} FROM materials WHERE code=?", (code,))
+        if rows:
+            return rows[0], "code", []
+    if model:
+        rows = db.query(f"SELECT {cols} FROM materials WHERE model=?", (model,))
+        if len(rows) == 1:
+            return rows[0], "model", []
+        if len(rows) > 1:
+            return None, "ambiguous", rows
+    if name:
+        rows = db.query(f"SELECT {cols} FROM materials WHERE name=?", (name,))
+        if len(rows) == 1:
+            return rows[0], "name", []
+        if len(rows) > 1:
+            return None, "ambiguous", rows
+        rows = db.query(f"SELECT {cols} FROM materials WHERE name LIKE ? LIMIT 10", (f"%{name}%",))
+        if len(rows) == 1:
+            return rows[0], "name_fuzzy", []
+        if len(rows) > 1:
+            return None, "ambiguous", rows
+    return None, "not_found", []
+
+
+@app.route("/api/v1/bom/check", methods=["POST"])
+@token_required
+def v1_bom_check():
+    """
+    BOM 核对。body: {"items": [{"code"/"model"/"name", "quantity"}, ...]}
+    逐项匹配物料并对比库存，返回每行状态与汇总：
+    ok=库存充足 shortage=缺料(附缺额) not_found=未找到 ambiguous=多个匹配 invalid=入参错误
+    """
+    d = request.get_json(force=True)
+    items = d.get("items")
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "items 必须是非空数组"}), 400
+    if len(items) > 500:
+        return jsonify({"error": "单次最多核对 500 行"}), 400
+    results = []
+    summary = {"total": 0, "ok": 0, "shortage": 0, "not_found": 0, "ambiguous": 0, "invalid": 0}
+    for it in items:
+        if not isinstance(it, dict):
+            results.append({"input": it, "status": "invalid", "message": "条目格式错误（应为对象）"})
+            summary["invalid"] += 1
+            summary["total"] += 1
+            continue
+        qty = _parse_int(it.get("quantity", 1), 1)
+        if qty is None:
+            results.append({"input": it, "status": "invalid", "message": "quantity 必须是大于0的整数"})
+            summary["invalid"] += 1
+            summary["total"] += 1
+            continue
+        mat, how, cands = _match_material(it)
+        row = {"input": {"code": it.get("code"), "model": it.get("model"), "name": it.get("name")},
+               "need": qty}
+        if how == "ambiguous":
+            row.update(status="ambiguous", message="匹配到多个物料，请改用编码(code)精确定位",
+                       candidates=cands)
+            summary["ambiguous"] += 1
+        elif mat is None:
+            row.update(status="not_found", message="未找到匹配物料")
+            summary["not_found"] += 1
+        else:
+            avail = mat["quantity"] or 0
+            row.update(material=mat, matched_by=how, available=avail)
+            if avail >= qty:
+                row["status"] = "ok"
+                summary["ok"] += 1
+            else:
+                row.update(status="shortage", shortage=qty - avail)
+                summary["shortage"] += 1
+        summary["total"] += 1
+        results.append(row)
+    return jsonify({"summary": summary, "results": results})
+
+
+@app.route("/api/v1/duplicates", methods=["GET"])
+@token_required
+def v1_duplicates():
+    """重复物料核对：按 编码 / 型号 / 名称 三个维度分组找出重复项"""
+    groups = []
+    for field, label in (("code", "编码"), ("model", "型号"), ("name", "名称")):
+        dup = db.query(
+            f"SELECT {field} AS v, COUNT(*) AS c FROM materials "
+            f"WHERE {field} IS NOT NULL AND TRIM({field}) <> '' "
+            f"GROUP BY {field} HAVING COUNT(*) > 1 ORDER BY c DESC")
+        for r in dup:
+            mats = db.query(
+                f"SELECT id, name, code, model, quantity, unit, warehouse_id "
+                f"FROM materials WHERE {field}=? ORDER BY id", (r["v"],))
+            groups.append({"field": field, "field_label": label, "value": r["v"],
+                           "count": r["c"], "materials": mats})
+    return jsonify({"total_groups": len(groups), "duplicates": groups})
 
 
 # ---------------- 立创商城 ----------------
@@ -569,8 +885,17 @@ def material_image(mid):
     data = _read_material_file("image_path", "image_blob", mid)
     if data is None:
         return jsonify({"error": "无图片"}), 404
-    # 按内容判断图片类型
-    mime = "image/png" if data[:8] == b"\x89PNG\r\n\x1a\n" else "image/jpeg"
+    # 按魔数判断图片类型（PNG/JPEG/GIF/WebP，未知按二进制流）
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        mime = "image/png"
+    elif data[:3] == b"\xff\xd8\xff":
+        mime = "image/jpeg"
+    elif data[:6] in (b"GIF89a", b"GIF87a"):
+        mime = "image/gif"
+    elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        mime = "image/webp"
+    else:
+        mime = "application/octet-stream"
     return send_file(io.BytesIO(data), mimetype=mime)
 
 
@@ -679,9 +1004,9 @@ def create_user():
         return jsonify({"error": "角色不合法"}), 400
     if db.query("SELECT id FROM users WHERE username=?", (username,)):
         return jsonify({"error": "用户名已存在"}), 400
-    pw = hashlib.sha256(password.encode()).hexdigest()
     last_id, _ = db.execute_write(
-        "INSERT INTO users(username, password_hash, role) VALUES (?,?,?)", (username, pw, role))
+        "INSERT INTO users(username, password_hash, role) VALUES (?,?,?)",
+        (username, _hash_password(password), role))
     return jsonify({"id": last_id}), 201
 
 
@@ -690,11 +1015,24 @@ def create_user():
 def update_user(uid):
     """重置密码 / 修改角色"""
     d = request.get_json(force=True)
+    rows = db.query("SELECT id, role FROM users WHERE id=?", (uid,))
+    if not rows:
+        return jsonify({"error": "用户不存在"}), 404
+    old_role = rows[0]["role"]
+    new_role = d.get("role")
+    # 先校验角色变更，失败则整体不改（密码也不动）
+    if new_role in ("admin", "user") and new_role != old_role:
+        if uid == session["user"]["id"]:
+            return jsonify({"error": "不能修改自己的角色（防止误降级失去管理权限）"}), 400
+        if old_role == "admin":
+            admins = db.query("SELECT COUNT(*) AS c FROM users WHERE role='admin'")[0]["c"]
+            if admins <= 1:
+                return jsonify({"error": "至少保留一名管理员"}), 400
     if d.get("password"):
-        pw = hashlib.sha256(d["password"].encode()).hexdigest()
-        db.execute_write("UPDATE users SET password_hash=? WHERE id=?", (pw, uid))
-    if d.get("role") in ("admin", "user"):
-        db.execute_write("UPDATE users SET role=? WHERE id=?", (d["role"], uid))
+        db.execute_write("UPDATE users SET password_hash=? WHERE id=?",
+                         (_hash_password(d["password"]), uid))
+    if new_role in ("admin", "user") and new_role != old_role:
+        db.execute_write("UPDATE users SET role=? WHERE id=?", (new_role, uid))
     return jsonify({"ok": True})
 
 
@@ -703,6 +1041,11 @@ def update_user(uid):
 def delete_user(uid):
     if session["user"]["id"] == uid:
         return jsonify({"error": "不能删除当前登录账户"}), 400
+    rows = db.query("SELECT role FROM users WHERE id=?", (uid,))
+    if rows and rows[0]["role"] == "admin":
+        admins = db.query("SELECT COUNT(*) AS c FROM users WHERE role='admin'")[0]["c"]
+        if admins <= 1:
+            return jsonify({"error": "不能删除最后一名管理员"}), 400
     db.execute_write("DELETE FROM users WHERE id=?", (uid,))
     return jsonify({"ok": True})
 
@@ -733,7 +1076,18 @@ def db_backup():
     if DB_TYPE != "sqlite":
         return jsonify({"error": "仅 SQLite 支持文件备份"}), 400
     bak = SQLITE_PATH + ".bak"
-    shutil.copyfile(SQLITE_PATH, bak)
+    # 用 SQLite 在线备份 API 生成一致性快照；
+    # 直接 copyfile 可能复制到写入中途的脏页，得到损坏的备份文件
+    import sqlite3
+    src = sqlite3.connect(SQLITE_PATH)
+    try:
+        dst = sqlite3.connect(bak)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
     return send_file(bak, as_attachment=True, download_name="erp_backup.db")
 
 
