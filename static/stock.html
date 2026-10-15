@@ -31,7 +31,7 @@
     <table>
       <thead><tr>
         <th>序号</th><th>图片</th><th>名称</th><th>编码</th><th>型号</th><th>品牌</th>
-        <th>库存</th><th>所在库</th><th>操作</th>
+        <th>库存</th><th>所在库</th><th class="col-sticky">操作</th>
       </tr></thead>
       <tbody id="mat-body"></tbody>
     </table>
@@ -102,9 +102,9 @@ async function loadMaterials() {
     <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td><td>${esc(m.model||'')}</td>
     <td>${esc(m.brand||'')}</td>
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
-    <td style="white-space:nowrap">
-      <button class="small" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'in')">入库</button>
-      <button class="small gray" onclick="openStock(${m.id},'${esc(m.name)}',${m.quantity},'out')">出库</button>
+    <td class="col-sticky" style="white-space:nowrap">
+      <button class="mini-btn in" onclick="openStock(${m.id},'${esc(m.name).replace(/'/g,"\\'")}',${m.quantity},'in')">入库</button>
+      <button class="mini-btn out" onclick="openStock(${m.id},'${esc(m.name).replace(/'/g,"\\'")}',${m.quantity},'out')">出库</button>
     </td></tr>`).join('');
 }
 

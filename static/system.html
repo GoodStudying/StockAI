@@ -19,6 +19,33 @@
     <h1>系统管理</h1>
     <span class="sub">数据库信息 / 备份 / 账户管理</span>
   </div>
+  <!-- AI 接口配置 -->
+  <div class="panel">
+    <h3 class="pt">AI 接口配置</h3>
+    <p style="font-size:12px;color:var(--ink-3);margin:4px 0 10px">
+      OpenAI 兼容接口（Kimi / DeepSeek / GLM 等）。配置后即可在「AI 助手」页对话完成出入库 / BOM 核对 / 采购管理。</p>
+    <div class="toolbar" style="margin-bottom:10px">
+      <select id="ai-preset" onchange="applyPreset()">
+        <option value="">— 选择预设 —</option>
+        <option value="deepseek">DeepSeek</option>
+        <option value="kimi">Kimi（月之暗面）</option>
+        <option value="glm">智谱 GLM</option>
+      </select>
+    </div>
+    <div class="form-row"><label>接口地址 base_url</label>
+      <input id="ai-base" placeholder="https://api.deepseek.com/v1"></div>
+    <div class="form-row"><label>API Key（留空 = 不修改已保存的 Key）</label>
+      <input id="ai-key" type="password" placeholder="sk-...">
+      <span id="ai-key-masked" style="font-size:12px;color:var(--ink-3)"></span></div>
+    <div class="form-row"><label>模型名 model</label>
+      <input id="ai-model" placeholder="deepseek-chat"></div>
+    <div class="toolbar" style="margin-top:10px">
+      <button onclick="saveAiConfig()" style="background:var(--accent);color:#fff;border:none">保存配置</button>
+      <button class="gray" onclick="testAi()">测试连接</button>
+      <span id="ai-test-res" style="font-size:12px;align-self:center"></span>
+    </div>
+  </div>
+
   <!-- 数据库管理 -->
   <div class="panel">
     <h3 class="pt">数据库管理</h3>
@@ -82,7 +109,61 @@ async function init() {
   if (!user) return;
   loadDbInfo();
   loadUsers();
+  if (user.role === 'admin') loadAiConfig();
 }
+
+/* ==================== AI 接口配置 ==================== */
+/* 常用服务商预设（均可手改）：地址 + 默认模型 */
+const AI_PRESETS = {
+  deepseek: { base_url: 'https://api.deepseek.com/v1', model: 'deepseek-chat' },
+  kimi:     { base_url: 'https://api.moonshot.cn/v1',  model: 'kimi-latest' },
+  glm:      { base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4.6' },
+};
+function applyPreset() {
+  const p = AI_PRESETS[document.getElementById('ai-preset').value];
+  if (!p) return;
+  document.getElementById('ai-base').value = p.base_url;
+  document.getElementById('ai-model').value = p.model;
+  document.getElementById('ai-key').focus();
+}
+async function loadAiConfig() {
+  try {
+    const d = await api('/api/ai/config');
+    document.getElementById('ai-base').value = d.base_url || '';
+    document.getElementById('ai-model').value = d.model || '';
+    document.getElementById('ai-key-masked').textContent =
+      d.has_key ? `已保存：${d.api_key_masked}（留空即沿用）` : '尚未保存 Key';
+  } catch (e) { /* 非 admin 无权限，静默 */ }
+}
+async function saveAiConfig() {
+  await api('/api/ai/config', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      base_url: document.getElementById('ai-base').value.trim(),
+      model: document.getElementById('ai-model').value.trim(),
+      api_key: document.getElementById('ai-key').value.trim(),   // 空=保留原值
+    }) });
+  document.getElementById('ai-key').value = '';
+  await loadAiConfig();
+  alert('AI 配置已保存');
+}
+async function testAi() {
+  const res = document.getElementById('ai-test-res');
+  res.textContent = '测试中...'; res.style.color = 'var(--ink-3)';
+  try {
+    const r = await api('/api/ai/test', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        base_url: document.getElementById('ai-base').value.trim(),
+        model: document.getElementById('ai-model').value.trim(),
+        api_key: document.getElementById('ai-key').value.trim(),  // 空=用已存的
+      }) });
+    res.textContent = `连接成功，耗时 ${r.ms}ms`; res.style.color = 'var(--green)';
+  } catch (e) {
+    res.textContent = '失败：' + e.message; res.style.color = 'var(--red)';
+  }
+}
+
 async function loadDbInfo() {
   try {
     const d = await api('/api/db/info');

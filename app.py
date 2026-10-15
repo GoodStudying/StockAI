@@ -9,6 +9,7 @@
 import os
 import re
 import io
+import json
 import time
 import hmac
 import base64
@@ -17,6 +18,7 @@ import secrets
 import threading
 from datetime import datetime
 from functools import wraps
+import requests as http_req
 from flask import Flask, request, jsonify, send_from_directory, send_file, session, g
 from werkzeug.security import generate_password_hash, check_password_hash
 from config import UPLOAD_DIR, MAX_WAREHOUSE_LEVEL, BASE_DIR, SQLITE_PATH, DB_TYPE
@@ -526,6 +528,83 @@ def list_materials():
 DOC_TYPE_LABELS = {"datasheet": "数据手册", "user_manual": "用户手册", "other": "其他文档"}
 
 
+def _auto_fetch_material(mid):
+    """
+    物料自动补全（新建/编辑/AI建料卡片确认 共用）：
+    编码为立创C编号（形如 C621395）时抓取详情——
+      1) 名称/型号/品牌/封装/分类/描述/商城链接 仅在当前为空时填充（绝不覆盖用户已填内容）
+      2) 无图片时下载入库（BLOB）
+      3) 无 datasheet 记录时下载登记
+    同步执行（个人系统等 2~5s 可接受）；任何失败静默跳过（不阻塞物料创建/编辑）。
+    返回 None=无需抓取或全部成功；字符串=失败原因说明（调用方可放进响应 note 提示）。
+    """
+    rows = db.query(
+        "SELECT code, name, model, brand, package, category, description, lcsc_url, "
+        "image_path, image_blob FROM materials WHERE id=?", (mid,))
+    if not rows:
+        return "物料不存在"
+    r = rows[0]
+    code = (r["code"] or "").strip()
+    if not re.fullmatch(r"C\d+", code, re.I):
+        return None                      # 不是立创C编号，无需抓取（正常情况）
+
+    # 快速路径：参数全填 + 已有图片 + 已有手册 + 已有商城链接 → 无可补全，跳过网络请求
+    has_image = r["image_blob"] is not None or (r["image_path"] and os.path.exists(r["image_path"]))
+    has_doc = db.query(
+        "SELECT id FROM material_documents WHERE material_id=? AND doc_type='datasheet'", (mid,))
+    fields_full = all((r[c] or "").strip() for c in
+                      ("name", "model", "brand", "package", "category", "lcsc_url"))
+    if fields_full and has_image and has_doc:
+        return None
+
+    try:
+        detail = lcsc.fetch_detail(code)
+    except Exception:
+        return "访问立创失败（网络受限），参数未自动补全"
+    if not detail:
+        return "未获取到立创详情（编号可能无效），参数未自动补全"
+    d = detail[0]
+
+    # 1) 参数字段：仅填空不覆盖（★lcsc_url 列对应立创详情里的 "url" 键，做映射）
+    _map = {"name": "name", "model": "model", "brand": "brand", "package": "package",
+            "category": "category", "description": "description", "lcsc_url": "url"}
+    updates, params = [], []
+    for col, key in _map.items():
+        cur = (r[col] or "").strip() if r[col] else ""
+        new = (d.get(key) or "").strip()
+        if not cur and new:
+            updates.append(f"{col}=?")
+            params.append(new)
+
+    # 2) 图片：无 BLOB 且无有效磁盘文件时下载（失败仅记提示，不影响建料）
+    notes = []
+    if not has_image and d.get("image"):
+        img = d["image"]
+        if img.startswith("//"):
+            img = "https:" + img        # 协议相对地址补全
+        img_bytes = lcsc.fetch_image_bytes(img)
+        if img_bytes:
+            updates.append("image_blob=?")
+            params.append(img_bytes)
+        else:
+            notes.append("图片下载失败")
+
+    if updates:
+        params.append(mid)
+        db.execute_write(f"UPDATE materials SET {', '.join(updates)} WHERE id=?", tuple(params))
+
+    # 3) 手册：无 datasheet 记录时下载登记（file_blob 存内容）
+    if not has_doc and d.get("datasheet_url"):
+        pdf_bytes, fname = lcsc.fetch_datasheet_bytes(d["datasheet_url"])
+        if pdf_bytes:
+            db.execute_write(
+                "INSERT INTO material_documents(material_id, doc_type, file_path, file_name, file_blob)"
+                " VALUES (?,?,?,?,?)", (mid, "datasheet", "", fname, pdf_bytes))
+        else:
+            notes.append("手册下载失败")
+    return "；".join(notes) if notes else None
+
+
 @app.route("/api/materials", methods=["POST"])
 @login_required
 def create_material():
@@ -552,7 +631,13 @@ def create_material():
         img_bytes = lcsc.fetch_image_bytes(image_url)
         if img_bytes:
             db.execute_write("UPDATE materials SET image_blob=? WHERE id=?", (img_bytes, last_id))
-    return jsonify({"id": last_id}), 201
+
+    # 立创C编号自动补全：图片/手册/参数（仅填空不覆盖；失败静默不阻塞建料）
+    note = _auto_fetch_material(last_id)
+    resp = {"id": last_id}
+    if note:
+        resp["note"] = note
+    return jsonify(resp), 201
 
 
 @app.route("/api/materials/<int:mid>", methods=["PUT"])
@@ -576,7 +661,12 @@ def update_material(mid):
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mid))
     if n == 0:
         return jsonify({"error": "物料不存在"}), 404
-    return jsonify({"ok": True})
+    # 后补立创编号/尚有空字段时自动补全（幂等：已全填则快速路径直接跳过）
+    note = _auto_fetch_material(mid)
+    resp = {"ok": True}
+    if note:
+        resp["note"] = note
+    return jsonify(resp)
 
 
 @app.route("/api/materials/<int:mid>", methods=["DELETE"])
@@ -667,21 +757,28 @@ def stock_records():
 
 # ---------------- 开放接口 /api/v1（API Token 认证，供 Cherry Studio / MCP 等程序化调用） ----------------
 
+def _search_core(q, code, limit=20):
+    """物料搜索核心：code 精确 或 q 模糊（名称/编码/型号），返回精简字段行列表。
+    被 /api/v1（外部Token）、AI 工具 search_materials 共用，避免三处复制查询逻辑。"""
+    q = (q or "").strip()
+    code = (code or "").strip()
+    cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id"
+    if code:
+        return db.query(f"SELECT {cols} FROM materials WHERE code=? LIMIT ?", (code, limit))
+    if q:
+        like = f"%{q}%"
+        return db.query(
+            f"SELECT {cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ? "
+            f"ORDER BY id DESC LIMIT ?", (like, like, like, limit))
+    return None   # 两个参数都为空
+
+
 @app.route("/api/v1/materials", methods=["GET"])
 @token_required
 def v1_search_materials():
     """物料搜索：q 模糊匹配 名称/编码/型号；code 精确匹配编码"""
-    code = (request.args.get("code") or "").strip()
-    kw = (request.args.get("q") or "").strip()
-    cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id"
-    if code:
-        rows = db.query(f"SELECT {cols} FROM materials WHERE code=? LIMIT 50", (code,))
-    elif kw:
-        like = f"%{kw}%"
-        rows = db.query(
-            f"SELECT {cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ? "
-            f"ORDER BY id DESC LIMIT 50", (like, like, like))
-    else:
+    rows = _search_core(request.args.get("q"), request.args.get("code"), limit=50)
+    if rows is None:
         return jsonify({"error": "请提供 q 或 code 参数"}), 400
     return jsonify({"count": len(rows), "materials": rows})
 
@@ -745,20 +842,13 @@ def _match_material(item):
     return None, "not_found", []
 
 
-@app.route("/api/v1/bom/check", methods=["POST"])
-@token_required
-def v1_bom_check():
-    """
-    BOM 核对。body: {"items": [{"code"/"model"/"name", "quantity"}, ...]}
-    逐项匹配物料并对比库存，返回每行状态与汇总：
-    ok=库存充足 shortage=缺料(附缺额) not_found=未找到 ambiguous=多个匹配 invalid=入参错误
-    """
-    d = request.get_json(force=True)
-    items = d.get("items")
+def _bom_check_core(items):
+    """BOM 核对核心：items=[{code/model/name, quantity}]，返回 (summary, results) 或 (None, err_msg)。
+    被 /api/v1/bom/check（外部Token）、网页 POST /api/bom/check（会话）、AI 工具 check_bom 共用。"""
     if not isinstance(items, list) or not items:
-        return jsonify({"error": "items 必须是非空数组"}), 400
+        return None, "items 必须是非空数组"
     if len(items) > 500:
-        return jsonify({"error": "单次最多核对 500 行"}), 400
+        return None, "单次最多核对 500 行"
     results = []
     summary = {"total": 0, "ok": 0, "shortage": 0, "not_found": 0, "ambiguous": 0, "invalid": 0}
     for it in items:
@@ -794,6 +884,20 @@ def v1_bom_check():
                 summary["shortage"] += 1
         summary["total"] += 1
         results.append(row)
+    return summary, results
+
+
+@app.route("/api/v1/bom/check", methods=["POST"])
+@token_required
+def v1_bom_check():
+    """
+    BOM 核对。body: {"items": [{"code"/"model"/"name", "quantity"}, ...]}
+    逐项匹配物料并对比库存，返回每行状态与汇总：
+    ok=库存充足 shortage=缺料(附缺额) not_found=未找到 ambiguous=多个匹配 invalid=入参错误
+    """
+    summary, results = _bom_check_core(request.get_json(force=True).get("items"))
+    if summary is None:
+        return jsonify({"error": results}), 400
     return jsonify({"summary": summary, "results": results})
 
 
@@ -1067,7 +1171,8 @@ def db_info():
                 "SELECT pg_database_size(current_database()) AS s")[0]["s"] / 1024, 1)
         except Exception:
             pass
-    for t in ("warehouses", "materials", "material_documents", "stock_records", "users"):
+    for t in ("warehouses", "materials", "material_documents", "stock_records", "users",
+              "app_settings", "chat_messages", "purchase_items", "purchase_batches"):
         info[t] = db.query(f"SELECT COUNT(*) AS c FROM {t}")[0]["c"]
     return jsonify(info)
 
@@ -1092,6 +1197,742 @@ def db_backup():
     finally:
         src.close()
     return send_file(bak, as_attachment=True, download_name="erp_backup.db")
+
+
+# =====================================================================
+# AI 对话 + 采购清单 模块（2026-10）
+# 与云端版 cloudflare/src/routes.ts、ai.ts 1:1 镜像，共用 static/ 前端
+# =====================================================================
+
+# ---------------- 系统设置（app_settings key-value） ----------------
+
+def _get_setting(key):
+    """读单个设置项，不存在返回空串"""
+    rows = db.query("SELECT value FROM app_settings WHERE key=?", (key,))
+    return rows[0]["value"] if rows else ""
+
+
+def _set_setting(key, value):
+    """写设置项（UPSERT：SQLite 与 PostgreSQL 均支持 ON CONFLICT 语法）"""
+    db.execute_write(
+        "INSERT INTO app_settings(key, value) VALUES(?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+def _mask_key(k):
+    """API Key 打码回显：保头 3 位尾 4 位（太短只保头 2 位），防配置页回显泄露"""
+    if not k:
+        return ""
+    if len(k) <= 8:
+        return k[:2] + "***"
+    return k[:3] + "***" + k[-4:]
+
+
+def _ai_cfg():
+    """读取 AI 接口配置（OpenAI 兼容三件套：base_url / api_key / model）"""
+    return {"base_url": _get_setting("ai_base_url").strip(),
+            "api_key": _get_setting("ai_api_key").strip(),
+            "model": _get_setting("ai_model").strip()}
+
+
+# ---------------- AI 接口配置（管理员） ----------------
+
+@app.route("/api/ai/config", methods=["GET"])
+@admin_required
+def ai_config_get():
+    """读取 AI 配置：api_key 打码回显（前端显示用），has_key 供判断是否已配置"""
+    cfg = _ai_cfg()
+    return jsonify({"base_url": cfg["base_url"], "model": cfg["model"],
+                    "api_key_masked": _mask_key(cfg["api_key"]),
+                    "has_key": bool(cfg["api_key"])})
+
+
+@app.route("/api/ai/config", methods=["POST"])
+@admin_required
+def ai_config_set():
+    """保存 AI 配置。★ api_key 传空 = 保留原值（防打码回显覆盖清空）；显式传 "!" 清空"""
+    d = request.get_json(force=True)
+    base_url = (d.get("base_url") or "").strip()
+    model = (d.get("model") or "").strip()
+    api_key = (d.get("api_key") or "").strip()
+    if not base_url:
+        return jsonify({"error": "接口地址（base_url）不能为空"}), 400
+    if not model:
+        return jsonify({"error": "模型名（model）不能为空"}), 400
+    _set_setting("ai_base_url", base_url)
+    _set_setting("ai_model", model)
+    if api_key == "!":
+        _set_setting("ai_api_key", "")
+    elif api_key:                        # 空 = 保留原值
+        _set_setting("ai_api_key", api_key)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/ai/test", methods=["POST"])
+@admin_required
+def ai_test():
+    """测试 AI 连通性：向 {base_url}/chat/completions 发一条最小请求，返回耗时。
+    body 里缺的字段回退用已存配置（配置页"测试连接"按钮直接传表单当前值）"""
+    d = request.get_json(force=True)
+    saved = _ai_cfg()
+    base_url = (d.get("base_url") or "").strip() or saved["base_url"]
+    api_key = (d.get("api_key") or "").strip() or saved["api_key"]
+    model = (d.get("model") or "").strip() or saved["model"]
+    if not (base_url and api_key and model):
+        return jsonify({"error": "请先填写完整的 接口地址/API Key/模型名"}), 400
+    t0 = time.time()
+    try:
+        r = http_req.post(
+            base_url.rstrip("/") + "/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={"model": model, "messages": [{"role": "user", "content": "ping"}],
+                  "max_tokens": 5},
+            timeout=(10, 30))
+    except Exception as e:
+        return jsonify({"error": f"连接失败：{type(e).__name__}（检查地址/网络/代理）"}), 502
+    ms = int((time.time() - t0) * 1000)
+    if r.status_code != 200:
+        # 常见错误透传：401=key错 404=地址错(缺/v1?) 429=限流
+        return jsonify({"error": f"HTTP {r.status_code}：{r.text[:200]}"}), 502
+    return jsonify({"ok": True, "ms": ms})
+
+
+@app.route("/api/ai/status", methods=["GET"])
+@login_required
+def ai_status():
+    """聊天页判断 AI 是否已配置可用（不打码也不泄露 key 本体）"""
+    cfg = _ai_cfg()
+    ok = bool(cfg["base_url"] and cfg["api_key"] and cfg["model"])
+    return jsonify({"configured": ok, "model": cfg["model"] if ok else ""})
+
+
+# ---------------- 采购清单 ----------------
+
+def _purchase_bulk_core(project, items, operator):
+    """
+    采购批量导入核心（BOM 一键导入 & AI add_purchase_items 卡片共用）。
+    合并规则：同项目下命中已有条目（material_id 相同，或 code 非空且相同）→ need_qty 累加，
+    否则新建。返回 (created, merged, err)，err 非 None 时前两个值无效。
+    """
+    project = (project or "").strip()
+    if not project:
+        return 0, 0, "项目名不能为空"
+    if not isinstance(items, list) or not items:
+        return 0, 0, "items 必须是非空数组"
+    if len(items) > 200:
+        return 0, 0, "单次最多导入 200 行"
+    created = merged = 0
+    for it in items:
+        if not isinstance(it, dict):
+            return 0, 0, "items 内每行必须是对象"
+        name = (it.get("name") or "").strip()
+        if not name:
+            return 0, 0, "每行的 name 不能为空"
+        qty = _parse_int(it.get("need_qty"), 1)
+        if qty is None:
+            return 0, 0, f"「{name}」的 need_qty 必须是大于0的整数"
+        mid = _parse_int(it.get("material_id") or 0, 1)
+        code = (it.get("code") or "").strip()
+        # 合并查找：material_id 优先，其次 code（code 非空才参与合并，防把不同无码物料合并）
+        hit = None
+        if mid:
+            rows = db.query("SELECT id FROM purchase_items WHERE project=? AND material_id=?",
+                            (project, mid))
+            hit = rows[0]["id"] if rows else None
+        elif code:
+            rows = db.query("SELECT id FROM purchase_items WHERE project=? AND code=?",
+                            (project, code))
+            hit = rows[0]["id"] if rows else None
+        if hit:
+            db.execute_write("UPDATE purchase_items SET need_qty=need_qty+? WHERE id=?", (qty, hit))
+            merged += 1
+        else:
+            db.execute_write(
+                "INSERT INTO purchase_items(project, material_id, name, code, model, "
+                "need_qty, unit, remark, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
+                (project, mid or None, name, code, (it.get("model") or "").strip(),
+                 qty, (it.get("unit") or "个").strip() or "个",
+                 (it.get("remark") or "").strip(), operator))
+            created += 1
+    return created, merged, None
+
+
+def _purchase_list_core(project=None, status=None):
+    """
+    采购条目查询核心：LEFT JOIN 批次 SUM 派生 purchased（已购）/status（open/partial/done）。
+    ★ 不存 status 列——删批次后状态自动回退，永不与批次表脱节。
+    """
+    sql = """SELECT p.*, COALESCE(b.purchased, 0) AS purchased,
+                    CASE WHEN COALESCE(b.purchased, 0) >= p.need_qty THEN 'done'
+                         WHEN COALESCE(b.purchased, 0) > 0 THEN 'partial'
+                         ELSE 'open' END AS status
+             FROM purchase_items p
+             LEFT JOIN (SELECT purchase_item_id, SUM(qty) AS purchased
+                        FROM purchase_batches GROUP BY purchase_item_id) b
+               ON b.purchase_item_id = p.id"""
+    params = []
+    if project:
+        sql += " WHERE p.project=?"
+        params.append(project)
+    sql += " ORDER BY p.id DESC LIMIT 500"
+    rows = db.query(sql, tuple(params))
+    if status:                           # 派生列的过滤放 Python 层（SQL 兼容两端）
+        rows = [r for r in rows if r["status"] == status]
+    return rows
+
+
+@app.route("/api/purchase/items", methods=["GET"])
+@login_required
+def purchase_items_list():
+    """采购清单：?project= 按项目过滤，?status=open|partial|done 按状态过滤"""
+    return jsonify(_purchase_list_core((request.args.get("project") or "").strip() or None,
+                                       (request.args.get("status") or "").strip() or None))
+
+
+@app.route("/api/purchase/items", methods=["POST"])
+@login_required
+def purchase_items_add():
+    """新增采购条目（支持批量，BOM 一键导入同用此接口）。
+    body: {project, items:[{material_id?, name, code?, model?, need_qty, unit?, remark?}]}"""
+    d = request.get_json(force=True)
+    created, merged, err = _purchase_bulk_core(
+        d.get("project"), d.get("items"), session["user"]["username"])
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"created": created, "merged": merged}), 201
+
+
+@app.route("/api/purchase/items/<int:pid>", methods=["PUT"])
+@login_required
+def purchase_item_update(pid):
+    """编辑采购条目（项目/数量/名称等；改 code 可能影响后续合并归属，属预期行为）"""
+    d = request.get_json(force=True)
+    name = (d.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "名称不能为空"}), 400
+    qty = _parse_int(d.get("need_qty"), 1)
+    if qty is None:
+        return jsonify({"error": "需求量必须是大于0的整数"}), 400
+    _, n = db.execute_write(
+        "UPDATE purchase_items SET project=?, name=?, code=?, model=?, need_qty=?, unit=?, "
+        "remark=? WHERE id=?",
+        ((d.get("project") or "").strip(), name, (d.get("code") or "").strip(),
+         (d.get("model") or "").strip(), qty, (d.get("unit") or "个").strip() or "个",
+         (d.get("remark") or "").strip(), pid))
+    if n == 0:
+        return jsonify({"error": "条目不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/purchase/items/<int:pid>", methods=["DELETE"])
+@login_required
+def purchase_item_delete(pid):
+    """删除采购条目（级联删除其全部批次）"""
+    _, n = db.execute_write("DELETE FROM purchase_items WHERE id=?", (pid,))
+    if n == 0:
+        return jsonify({"error": "条目不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/purchase/items/<int:pid>/batches", methods=["POST"])
+@login_required
+def purchase_batch_add(pid):
+    """登记一次采购（同一物料分多次采购，每笔一条）：body {qty, remark}"""
+    if not db.query("SELECT id FROM purchase_items WHERE id=?", (pid,)):
+        return jsonify({"error": "采购条目不存在"}), 404
+    d = request.get_json(force=True)
+    qty = _parse_int(d.get("qty"), 1)
+    if qty is None:
+        return jsonify({"error": "数量必须是大于0的整数"}), 400
+    last_id, _ = db.execute_write(
+        "INSERT INTO purchase_batches(purchase_item_id, qty, remark, created_by) VALUES (?,?,?,?)",
+        (pid, qty, (d.get("remark") or "").strip(), session["user"]["username"]))
+    return jsonify({"id": last_id}), 201
+
+
+@app.route("/api/purchase/items/<int:pid>/batches", methods=["GET"])
+@login_required
+def purchase_batches_list(pid):
+    """查某采购条目的全部采购批次（前端行展开用）"""
+    if not db.query("SELECT id FROM purchase_items WHERE id=?", (pid,)):
+        return jsonify({"error": "采购条目不存在"}), 404
+    return jsonify(db.query(
+        "SELECT * FROM purchase_batches WHERE purchase_item_id=? ORDER BY id DESC", (pid,)))
+
+
+@app.route("/api/purchase/batches/<int:bid>", methods=["DELETE"])
+@login_required
+def purchase_batch_delete(bid):
+    """删除一笔采购批次（录错时用；已购数量自动回退，状态随之重算）"""
+    _, n = db.execute_write("DELETE FROM purchase_batches WHERE id=?", (bid,))
+    if n == 0:
+        return jsonify({"error": "批次不存在"}), 404
+    return jsonify({"ok": True})
+
+
+@app.route("/api/purchase/projects", methods=["GET"])
+@login_required
+def purchase_projects():
+    """项目聚合视图：条数/已完成数/需求与已购总量（采购页左侧项目列表）"""
+    rows = db.query(
+        """SELECT p.project,
+                  COUNT(*) AS item_count,
+                  SUM(CASE WHEN COALESCE((SELECT SUM(qty) FROM purchase_batches
+                            WHERE purchase_item_id = p.id), 0) >= p.need_qty THEN 1 ELSE 0 END)
+                    AS done_count,
+                  SUM(p.need_qty) AS need_total,
+                  COALESCE(SUM(COALESCE((SELECT SUM(qty) FROM purchase_batches
+                            WHERE purchase_item_id = p.id), 0)), 0) AS purchased_total,
+                  MAX(p.id) AS last_id
+           FROM purchase_items p GROUP BY p.project ORDER BY last_id DESC""")
+    return jsonify(rows)
+
+
+# ---------------- 网页端 BOM 核对（session 认证；与 /api/v1 版同核心） ----------------
+
+@app.route("/api/bom/check", methods=["POST"])
+@login_required
+def bom_check_web():
+    """BOM 核对网页入口：body {items:[{code|model|name, quantity}]}"""
+    summary, results = _bom_check_core(request.get_json(force=True).get("items"))
+    if summary is None:
+        return jsonify({"error": results}), 400
+    return jsonify({"summary": summary, "results": results})
+
+
+# ---------------- AI 对话（OpenAI 兼容协议：Kimi / DeepSeek / GLM 等） ----------------
+
+# tool loop 双保险上限：LLM 轮次 与 工具调用总数 都封顶，防模型死循环刷调用
+MAX_LLM_ROUNDS = 8
+MAX_TOOL_CALLS = 12
+
+
+def _llm_chat(cfg, messages, tools=None):
+    """
+    OpenAI 兼容 /chat/completions 单一收敛调用点（Kimi/DeepSeek/GLM 等）。
+    返回 (content, tool_calls)。所有 LLM 交互都走这里——冒烟测试 monkeypatch 本函数
+    即可脚本化整个对话流程，无需真实 API key。
+    """
+    payload = {"model": cfg["model"], "messages": messages}
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    r = http_req.post(
+        cfg["base_url"].rstrip("/") + "/chat/completions",
+        headers={"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"},
+        json=payload, timeout=(10, 90))
+    if r.status_code != 200:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+    msg = r.json()["choices"][0]["message"]
+    return msg.get("content") or "", msg.get("tool_calls") or []
+
+
+def _system_prompt(username):
+    """系统提示词：角色 + 工具规范 + 安全模式说明 + 电子领域常识 + 回复风格"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    return f"""你是「个人ERP」的库存管理 AI 助手。当前用户：{username}；今天：{today}。
+
+【职责】帮助用户查询物料库存、办理出入库、核对 BOM、管理采购清单。
+
+【工具使用规范】
+1. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造。
+2. stock_in / stock_out / create_material / add_purchase_items 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
+3. 查仓库列表用 list_warehouses；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
+4. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
+5. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
+
+【电子领域常识】
+- 电容容值换算：1µF = 1000nF（0.1µF = 100nF；三位数标注 104 = 100nF、105 = 1µF）。用户给出的不同写法若等值，主动指出并确认是否同一种物料。
+- 电阻：10k = 10kΩ = 10000Ω；贴片三位数标注 103 = 10kΩ。
+- 封装 0402/0603/0805/1206 是尺寸规格；同容值不同封装/耐压/精度是不同物料，用户未说明时要问清。
+
+【回复风格】简体中文；简洁分点，必要时用小表格；涉及写操作的回复末尾必须提醒用户确认卡片。"""
+
+
+# 9 个工具的 OpenAI function calling 声明（只读 5 个真执行 + 写 4 个转卡片）
+AI_TOOLS = [
+    {"type": "function", "function": {
+        "name": "search_materials",
+        "description": "搜索库存中的物料：code 精确匹配编码，或 q 模糊匹配名称/编码/型号（至少提供一个）。出入库/BOM 核对前先用它拿到 material_id。",
+        "parameters": {"type": "object", "properties": {
+            "q": {"type": "string", "description": "模糊关键词（匹配名称/编码/型号）"},
+            "code": {"type": "string", "description": "物料编码精确匹配（如立创C编号 C621395）"}}}}},
+    {"type": "function", "function": {
+        "name": "list_warehouses",
+        "description": "列出全部仓库（id/名称/层级/父库），入库前用它确认仓库 id。",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "lcsc_search",
+        "description": "搜索立创商城（库存没有的物料来这里找候选），返回立创C编号/型号/品牌/封装/库存/价格。用户选定 C 编号后可用 create_material 建料并自动补全参数。",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string", "description": "搜索关键词，如 '100nF 0603 电容'"}},
+            "required": ["keyword"]}}},
+    {"type": "function", "function": {
+        "name": "check_bom",
+        "description": "BOM 核对：逐项匹配库存并比对数量，返回每行状态（ok充足/shortage缺料/not_found未找到/ambiguous多个匹配）。",
+        "parameters": {"type": "object", "properties": {
+            "items": {"type": "array", "description": "BOM 行数组", "items": {"type": "object", "properties": {
+                "code": {"type": "string"}, "model": {"type": "string"},
+                "name": {"type": "string"},
+                "quantity": {"type": "integer", "description": "需求数量，默认1"}}}}}}}},
+    {"type": "function", "function": {
+        "name": "query_purchase",
+        "description": "查询采购清单（可按项目过滤），返回每条的需求量/已购量/状态（open未采/partial部分/done完成）。",
+        "parameters": {"type": "object", "properties": {
+            "project": {"type": "string", "description": "项目名（空=查全部）"}}}}},
+    {"type": "function", "function": {
+        "name": "create_material",
+        "description": "新建物料（写操作，生成待确认卡片）。填了立创C编号会自动抓取图片/数据手册/参数。",
+        "parameters": {"type": "object", "required": ["name"], "properties": {
+            "name": {"type": "string", "description": "物料名称"},
+            "code": {"type": "string", "description": "立创C编号（强烈建议填，自动补全参数）"},
+            "model": {"type": "string", "description": "型号"},
+            "category": {"type": "string"}, "package": {"type": "string"},
+            "brand": {"type": "string"}, "unit": {"type": "string"},
+            "warehouse_id": {"type": "integer", "description": "仓库 id（list_warehouses 查）"},
+            "quantity": {"type": "integer", "description": "初始库存，默认0"},
+            "description": {"type": "string"}}}}},
+    {"type": "function", "function": {
+        "name": "stock_in",
+        "description": "入库（写操作，生成待确认卡片）。material_id 必须来自 search_materials 结果。",
+        "parameters": {"type": "object", "required": ["material_id", "quantity"], "properties": {
+            "material_id": {"type": "integer"}, "quantity": {"type": "integer", "description": "数量>0"},
+            "remark": {"type": "string", "description": "备注（可选）"}}}}},
+    {"type": "function", "function": {
+        "name": "stock_out",
+        "description": "出库（写操作，生成待确认卡片）。material_id 必须来自 search_materials 结果；出库前确认库存充足。",
+        "parameters": {"type": "object", "required": ["material_id", "quantity"], "properties": {
+            "material_id": {"type": "integer"}, "quantity": {"type": "integer", "description": "数量>0"},
+            "remark": {"type": "string", "description": "备注（可选）"}}}}},
+    {"type": "function", "function": {
+        "name": "add_purchase_items",
+        "description": "向采购清单批量添加条目（写操作，生成待确认卡片）。同项目同物料自动合并累加需求量。BOM 缺料批量采购用这个工具。",
+        "parameters": {"type": "object", "required": ["project", "items"], "properties": {
+            "project": {"type": "string", "description": "项目名（归档用）"},
+            "items": {"type": "array", "items": {"type": "object", "required": ["name", "need_qty"], "properties": {
+                "material_id": {"type": "integer", "description": "库存物料 id（有则填）"},
+                "name": {"type": "string"}, "code": {"type": "string"},
+                "model": {"type": "string"},
+                "need_qty": {"type": "integer", "description": "需求数量>0"},
+                "unit": {"type": "string"}, "remark": {"type": "string"}}}}}}}},
+]
+
+# 写工具的固定回话：驱动模型产出面向用户的确认文案，而不是继续调工具
+_ACTION_NOTE = ("已生成待确认操作卡片（用户点击「确认执行」前不会执行任何写操作）。"
+                "请向用户复述操作内容（对象/数量/仓库），并提醒用户在前端卡片上点击确认。不要重复调用本工具。")
+
+
+def _build_action(name, args):
+    """
+    写工具 → 待确认操作卡片。卡片 title 由服务端从参数生成（不信任 AI 的展示文案）。
+    返回 (action, err)：action 为 None 时 err 是给模型自纠的参数错误说明。
+    """
+    base = {"id": secrets.token_hex(4), "type": name, "params": args,
+            "status": "pending", "result": None, "executed_at": None}
+    if name == "create_material":
+        mname = (args.get("name") or "").strip()
+        if not mname:
+            return None, "name 不能为空"
+        qty = _parse_int(args.get("quantity") or 0, 0)
+        if qty is None:
+            return None, "quantity 必须是不小于0的整数"
+        title = f"新建物料：{mname}"
+        code = (args.get("code") or "").strip()
+        if code:
+            title += f"（{code}）"
+        if qty > 0:
+            title += f"，初始库存 ×{qty}"
+        base["title"] = title
+        return base, None
+    if name in ("stock_in", "stock_out"):
+        mid = _parse_int(args.get("material_id"), 1)
+        qty = _parse_int(args.get("quantity"), 1)
+        if mid is None or qty is None:
+            return None, "material_id / quantity 必须是大于0的整数"
+        mat = db.query("SELECT name FROM materials WHERE id=?", (mid,))
+        if not mat:
+            return None, f"物料 #{mid} 不存在，请先通过 search_materials 获取真实 material_id"
+        base["title"] = f"{'入库' if name == 'stock_in' else '出库'}：{mat[0]['name']}（#{mid}）×{qty}"
+        return base, None
+    if name == "add_purchase_items":
+        project = (args.get("project") or "").strip()
+        items = args.get("items")
+        if not project:
+            return None, "project（项目名）不能为空"
+        if not isinstance(items, list) or not items:
+            return None, "items 必须是非空数组"
+        base["title"] = f"导入采购清单：项目「{project}」{len(items)} 项"
+        return base, None
+    return None, f"未知工具 {name}"
+
+
+def _run_tool(name, args, username):
+    """
+    执行一次 AI 工具调用。返回 (给模型的结果 dict, 待确认卡片 dict 或 None)。
+    只读工具（搜索/列表/BOM/采购查询）真执行返回数据；
+    写工具一律拦截转卡片，绝不直接落库。参数问题返回 {"error":...} 供模型自纠。
+    """
+    if name == "search_materials":
+        rows = _search_core(args.get("q"), args.get("code"), limit=20)
+        if rows is None:
+            return {"error": "q 与 code 至少提供一个"}, None
+        return {"count": len(rows), "materials": rows}, None
+    if name == "list_warehouses":
+        rows = db.query("SELECT id, name, parent_id, level FROM warehouses ORDER BY level, id")
+        return {"count": len(rows), "warehouses": rows}, None
+    if name == "lcsc_search":
+        kw = (args.get("keyword") or "").strip()
+        if not kw:
+            return {"error": "keyword 不能为空"}, None
+        try:
+            rows = lcsc.search_lcsc(kw)
+        except Exception:
+            rows = []
+        slim = [{k: r.get(k, "") for k in ("code", "model", "name", "brand",
+                                           "package", "stock", "price")} for r in rows]
+        if not slim:
+            return {"count": 0, "items": [],
+                    "note": "立创搜索无结果（可能被风控或网络受限），建议用户提供立创C编号"}, None
+        return {"count": len(slim), "items": slim}, None
+    if name == "check_bom":
+        summary, results = _bom_check_core(args.get("items"))
+        if summary is None:
+            return {"error": results}, None
+        if summary["total"] > 30:        # token 经济：超 30 行只回汇总 + 非 ok 行
+            bad = [r for r in results if r.get("status") != "ok"]
+            return {"summary": summary, "results": bad,
+                    "note": f"共 {summary['total']} 行，超出 30 行仅返回非 ok 行（{len(bad)} 条）"}, None
+        return {"summary": summary, "results": results}, None
+    if name == "query_purchase":
+        rows = _purchase_list_core((args.get("project") or "").strip() or None, None)
+        slim = [{k: r.get(k) for k in ("id", "project", "name", "code", "model",
+                                       "need_qty", "purchased", "unit", "status")} for r in rows]
+        return {"count": len(slim), "items": slim}, None
+    # ---------- 写操作：拦截转"待确认卡片" ----------
+    action, err = _build_action(name, args)
+    if err:
+        return {"error": err}, None
+    return {"ok": True, "action_id": action["id"], "note": _ACTION_NOTE}, action
+
+
+def _tool_msg(tc_id, result):
+    """构造 tool 角色消息（OpenAI 协议）：结果序列化为 JSON 文本回给模型"""
+    return {"role": "tool", "tool_call_id": tc_id,
+            "content": json.dumps(result, ensure_ascii=False, default=str)}
+
+
+@app.route("/api/chat", methods=["POST"])
+@login_required
+def chat_send():
+    """
+    AI 对话主入口。流程：存用户消息 → 组装上下文（system + 最近20条历史降级为纯文本）
+    → tool loop（只读工具真执行；写工具转卡片）→ 存 assistant 消息与卡片 → 返回。
+    """
+    d = request.get_json(force=True)
+    message = (d.get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "消息不能为空"}), 400
+    cfg = _ai_cfg()
+    if not (cfg["base_url"] and cfg["api_key"] and cfg["model"]):
+        return jsonify({"error": "AI 接口未配置，请联系管理员在「系统管理」页配置"}), 400
+    u = session["user"]
+    uid = u["id"]
+
+    # 1) 落库用户消息（先落库再查历史，本轮 user 消息自然包含在上下文里）
+    db.execute_write("INSERT INTO chat_messages(user_id, role, content) VALUES (?,?,?)",
+                     (uid, "user", message))
+
+    # 2) 组装上下文。★历史重放必须降级：数据库里没有 tool_calls 结构，
+    #   assistant 消息的卡片以文字摘要拼进 content，避免发给模型缺 tool 消息导致 400
+    history = db.query(
+        "SELECT role, content, actions_json FROM chat_messages "
+        "WHERE user_id=? ORDER BY id DESC LIMIT 20", (uid,))[::-1]
+    msgs = [{"role": "system", "content": _system_prompt(u["username"])}]
+    for h in history:
+        content = h["content"] or ""
+        if h["actions_json"]:
+            try:
+                for a in json.loads(h["actions_json"]):
+                    res = a.get("result") or {}
+                    tail = f"（结果：{res.get('error') or res.get('quantity') or res.get('material_id') or '完成'}）"
+                    content += f"\n[操作卡片 {a.get('status')}: {a.get('title')}]{tail}"
+            except (ValueError, TypeError):
+                pass
+        msgs.append({"role": h["role"], "content": content})
+
+    # 3) tool loop：模型给纯文本即结束；给 tool_calls 则逐个执行后继续
+    actions = []
+    tool_count = 0
+    content = ""
+    for _ in range(MAX_LLM_ROUNDS):
+        try:
+            content, tool_calls = _llm_chat(cfg, msgs, AI_TOOLS)
+        except Exception as e:
+            # LLM 失败也落一条 assistant 消息，保证历史连续可追溯
+            db.execute_write("INSERT INTO chat_messages(user_id, role, content) VALUES (?,?,?)",
+                             (uid, "assistant", f"[AI调用失败] {type(e).__name__}: {e}"))
+            return jsonify({"error": f"AI 调用失败：{type(e).__name__}: {e}"}), 502
+        if not tool_calls:
+            break                       # 模型给出最终文本，正常出口
+        msgs.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
+        for tc in tool_calls:
+            tool_count += 1
+            fn = tc.get("function") or {}
+            name = fn.get("name") or ""
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+                if not isinstance(args, dict):
+                    raise ValueError
+            except (ValueError, TypeError):
+                msgs.append(_tool_msg(tc.get("id"), {"error": "arguments 必须是合法的 JSON 对象"}))
+                continue
+            if tool_count > MAX_TOOL_CALLS:
+                msgs.append(_tool_msg(tc.get("id"),
+                                      {"error": "已达本轮工具调用上限，请直接用现有信息回答用户"}))
+                continue
+            result, action = _run_tool(name, args, u["username"])
+            if action:
+                actions.append(action)
+            msgs.append(_tool_msg(tc.get("id"), result))
+    else:
+        # 8 轮用尽模型仍在要工具：追加一次不带 tools 的请求逼出文本总结
+        try:
+            content, _ = _llm_chat(cfg, msgs, None)
+        except Exception:
+            content = content or "（本轮工具调用已达上限，未生成总结。请换种问法或缩小范围后重试。）"
+
+    # 4) 落库 assistant 消息 + 待确认卡片
+    actions_json = json.dumps(actions, ensure_ascii=False, default=str) if actions else None
+    aid, _ = db.execute_write(
+        "INSERT INTO chat_messages(user_id, role, content, actions_json) VALUES (?,?,?,?)",
+        (uid, "assistant", content or "", actions_json))
+    return jsonify({"message_id": aid, "content": content or "", "actions": actions})
+
+
+@app.route("/api/chat/history", methods=["GET"])
+@login_required
+def chat_history():
+    """游标分页加载历史：?before_id= 取更早消息，?limit= 默认30（旧→新顺序返回）"""
+    uid = session["user"]["id"]
+    before = _parse_int(request.args.get("before_id") or 0, 1)
+    limit = _parse_int(request.args.get("limit") or 30, 1) or 30
+    limit = min(limit, 100)
+    if before:
+        rows = db.query("SELECT id, role, content, actions_json, created_at FROM chat_messages "
+                        "WHERE user_id=? AND id<? ORDER BY id DESC LIMIT ?", (uid, before, limit))
+    else:
+        rows = db.query("SELECT id, role, content, actions_json, created_at FROM chat_messages "
+                        "WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, limit))
+    out = []
+    for r in reversed(rows):            # 反转成 旧→新，前端按序渲染
+        item = {"id": r["id"], "role": r["role"], "content": r["content"],
+                "created_at": r["created_at"]}
+        try:
+            item["actions"] = json.loads(r["actions_json"]) if r["actions_json"] else []
+        except (ValueError, TypeError):
+            item["actions"] = []
+        out.append(item)
+    return jsonify({"messages": out, "has_more": len(rows) == limit})
+
+
+@app.route("/api/chat/history", methods=["DELETE"])
+@login_required
+def chat_history_clear():
+    """清空当前用户的对话记录（只删自己的，管理员也不能删别人的）"""
+    db.execute_write("DELETE FROM chat_messages WHERE user_id=?", (session["user"]["id"],))
+    return jsonify({"ok": True})
+
+
+def _execute_action(act, username):
+    """
+    执行一张已确认的操作卡片（operator 留痕为 ai:用户名）。
+    返回结果 dict；出错时带 error 字段，keep_pending=True（库存不足）表示保持待确认可重试。
+    """
+    t = act.get("type")
+    p = act.get("params") or {}
+    operator = f"ai:{username}"
+    if t in ("stock_in", "stock_out"):
+        mid = _parse_int(p.get("material_id"), 1)
+        qty = _parse_int(p.get("quantity"), 1)
+        if mid is None or qty is None:
+            return {"error": "参数无效（material_id / quantity）"}
+        new_qty, err = _apply_stock("in" if t == "stock_in" else "out", mid, qty, operator,
+                                    (p.get("remark") or "").strip() or "AI 对话确认执行")
+        if err:
+            # 库存不足(400)：保持 pending，补货后可重试；物料不存在(404)等永久失败置 failed
+            return {"error": err[0], "keep_pending": err[1] == 400}
+        return {"material_id": mid, "quantity": new_qty}
+    if t == "create_material":
+        mname = (p.get("name") or "").strip()
+        if not mname:
+            return {"error": "name 缺失"}
+        qty = _parse_int(p.get("quantity") or 0, 0)
+        if qty is None:
+            qty = 0
+        wid = _parse_int(p.get("warehouse_id") or 0, 1)
+        new_id, _ = db.execute_write(
+            """INSERT INTO materials(name, code, model, category, package, brand,
+                                     description, quantity, unit, warehouse_id, lcsc_url)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+            (mname, (p.get("code") or "").strip(), (p.get("model") or "").strip(),
+             (p.get("category") or "").strip(), (p.get("package") or "").strip(),
+             (p.get("brand") or "").strip(), (p.get("description") or "").strip(),
+             qty, (p.get("unit") or "个").strip() or "个", wid or None, ""))
+        note = _auto_fetch_material(new_id)       # 立创C编号自动抓图/手册/参数（失败静默）
+        res = {"material_id": new_id}
+        if note:
+            res["note"] = note
+        return res
+    if t == "add_purchase_items":
+        created, merged, err = _purchase_bulk_core(p.get("project"), p.get("items"), operator)
+        if err:
+            return {"error": err}
+        return {"created": created, "merged": merged}
+    return {"error": f"未知操作类型 {t}"}
+
+
+@app.route("/api/chat/execute", methods=["POST"])
+@login_required
+def chat_execute():
+    """
+    确认/取消 AI 生成的操作卡片。body: {message_id, action_id, cancel?}
+    幂等状态机：pending → executed / cancelled / failed；非 pending 一律 409（防双击重放）。
+    """
+    d = request.get_json(force=True)
+    msg_id = _parse_int(d.get("message_id"), 1)
+    action_id = (d.get("action_id") or "").strip()
+    if not msg_id or not action_id:
+        return jsonify({"error": "message_id / action_id 不能为空"}), 400
+    uid = session["user"]["id"]
+    rows = db.query("SELECT user_id, actions_json FROM chat_messages WHERE id=?", (msg_id,))
+    if not rows or rows[0]["user_id"] != uid:
+        return jsonify({"error": "消息不存在或不属于当前用户"}), 403
+    try:
+        acts = json.loads(rows[0]["actions_json"] or "[]")
+    except (ValueError, TypeError):
+        acts = []
+    act = next((a for a in acts if a.get("id") == action_id), None)
+    if not act:
+        return jsonify({"error": "操作卡片不存在"}), 404
+    if act.get("status") != "pending":
+        return jsonify({"error": f"该卡片已处理（状态：{act.get('status')}），不可重复操作"}), 409
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    if d.get("cancel"):
+        act.update(status="cancelled", executed_at=now)
+    else:
+        result = _execute_action(act, session["user"]["username"])
+        act["result"] = result
+        if result.get("error") and result.get("keep_pending"):
+            # 库存不足：保持 pending（补货后可再点确认），不推进状态机
+            db.execute_write("UPDATE chat_messages SET actions_json=? WHERE id=?",
+                             (json.dumps(acts, ensure_ascii=False, default=str), msg_id))
+            return jsonify({"error": result["error"], "action": act}), 400
+        act["status"] = "failed" if result.get("error") else "executed"
+        act["executed_at"] = now
+    db.execute_write("UPDATE chat_messages SET actions_json=? WHERE id=?",
+                     (json.dumps(acts, ensure_ascii=False, default=str), msg_id))
+    return jsonify({"ok": True, "action": act})
 
 
 if __name__ == "__main__":

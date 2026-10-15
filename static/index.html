@@ -34,6 +34,7 @@
       <thead><tr>
         <th>序号</th><th>图片</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th>
         <th>库存</th><th>所在库</th><th>新增日期</th><th>手册</th><th>操作</th>
+        <th class="col-sticky">出入库</th>
       </tr></thead>
       <tbody id="mat-body"></tbody>
     </table>
@@ -85,6 +86,23 @@
 </div>
 
 <!-- 手册上传弹窗 -->
+<!-- 就地出入库弹窗（物料表 sticky 列按钮） -->
+<div class="modal-mask" id="stock-modal">
+  <div class="modal" style="width:400px">
+    <h3 id="stock-m-title">出入库</h3>
+    <div class="form-row"><label>类型</label>
+      <label style="width:auto;margin-right:16px"><input type="radio" name="stock-op" value="in" checked> 入库</label>
+      <label style="width:auto"><input type="radio" name="stock-op" value="out"> 出库</label>
+    </div>
+    <div class="form-row"><label>数量</label><input id="stock-qty" type="number" min="1" value="1"></div>
+    <div class="form-row"><label>备注</label><input id="stock-remark" placeholder="选填"></div>
+    <div class="modal-footer">
+      <button class="gray" onclick="closeModal('stock-modal')">取消</button>
+      <button onclick="submitStock()">确定</button>
+    </div>
+  </div>
+</div>
+
 <div class="modal-mask" id="doc-modal">
   <div class="modal">
     <h3>上传手册（物料ID: <span id="doc-mid"></span>）</h3>
@@ -156,7 +174,34 @@ async function loadMaterials() {
       ${m.code && !m.image_path && !m.has_image ? `<button class="small" onclick="fetchImg(${m.id}, this)">获取图片</button>` : ''}
       <button class="small" onclick='editMaterial(${JSON.stringify(m)})'>编辑</button>
       <button class="small danger" onclick="delMaterial(${m.id})">删除</button>
+    </td>
+    <td class="col-sticky" style="white-space:nowrap">
+      <button class="mini-btn in" onclick="openStockModal(${m.id}, '${esc(m.name).replace(/'/g, "\\'")}', ${m.quantity}, 'in')">入库</button>
+      <button class="mini-btn out" onclick="openStockModal(${m.id}, '${esc(m.name).replace(/'/g, "\\'")}', ${m.quantity}, 'out')">出库</button>
     </td></tr>`).join('');
+}
+
+/* ==================== 就地出入库（sticky 列按钮） ==================== */
+let stockMid = 0;
+function openStockModal(mid, name, curQty, op) {
+  stockMid = mid;
+  document.getElementById('stock-m-title').textContent =
+    `${op === 'in' ? '入库' : '出库'}：${name}（当前库存 ${curQty}）`;
+  document.querySelector(`input[name="stock-op"][value="${op}"]`).checked = true;
+  document.getElementById('stock-qty').value = 1;
+  document.getElementById('stock-remark').value = '';
+  openModal('stock-modal');
+}
+async function submitStock() {
+  const op = document.querySelector('input[name="stock-op"]:checked').value;
+  const qty = parseInt(document.getElementById('stock-qty').value, 10);
+  if (!qty || qty < 1) { alert('数量必须是大于0的整数'); return; }
+  await api(`/api/stock/${op}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ material_id: stockMid, quantity: qty,
+                           remark: document.getElementById('stock-remark').value }) });
+  closeModal('stock-modal');
+  loadMaterials();
 }
 function openMaterialModal() {
   document.getElementById('mat-modal-title').textContent = '新建物料';

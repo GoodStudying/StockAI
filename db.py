@@ -185,6 +185,57 @@ CREATE INDEX IF NOT EXISTS idx_materials_code ON materials(code);
 CREATE INDEX IF NOT EXISTS idx_materials_wh ON materials(warehouse_id);
 CREATE INDEX IF NOT EXISTS idx_wh_parent ON warehouses(parent_id);
 CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
+
+-- ===== AI 对话 + 采购清单 模块（2026-10） =====
+
+-- 系统设置（key-value）：AI 接口配置存这里（ai_base_url / ai_api_key / ai_model），
+-- 不走环境变量——用户要求在网页系统管理页直接配置
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- AI 对话记录：actions_json 存 AI 生成的"待确认操作卡片"数组
+-- （结构：[{id,type,title,params,status,result,executed_at}]，人确认后服务端原地改状态）
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    content TEXT NOT NULL,
+    actions_json TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+-- 采购清单条目：按项目归档；material_id 可空（未入库物料也能登记采购）
+-- name/code/model 为快照列——物料被删后采购记录仍可读（FK 置 NULL）
+-- ★ 不存 status 列：读时按 已购SUM(批次) 对比 need_qty 派生，删批次自动回退
+CREATE TABLE IF NOT EXISTS purchase_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL,
+    name TEXT NOT NULL,
+    code TEXT DEFAULT '',
+    model TEXT DEFAULT '',
+    need_qty INTEGER NOT NULL CHECK(need_qty > 0),
+    unit TEXT DEFAULT '个',
+    remark TEXT DEFAULT '',
+    created_by TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+-- 采购批次：同一物料分多次采购，每笔一条；已购数量 = SUM(qty)
+CREATE TABLE IF NOT EXISTS purchase_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    purchase_item_id INTEGER NOT NULL REFERENCES purchase_items(id) ON DELETE CASCADE,
+    qty INTEGER NOT NULL CHECK(qty > 0),
+    remark TEXT DEFAULT '',
+    created_by TEXT,
+    created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_pitem_project ON purchase_items(project);
+CREATE INDEX IF NOT EXISTS idx_pbatch_item ON purchase_batches(purchase_item_id);
 """
 
 
@@ -307,6 +358,49 @@ CREATE INDEX IF NOT EXISTS idx_materials_code ON materials(code);
 CREATE INDEX IF NOT EXISTS idx_materials_wh ON materials(warehouse_id);
 CREATE INDEX IF NOT EXISTS idx_wh_parent ON warehouses(parent_id);
 CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
+
+-- ===== AI 对话 + 采购清单 模块（2026-10，与 SQLite/D1 版同构） =====
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL CHECK(role IN ('user','assistant')),
+    content TEXT NOT NULL,
+    actions_json TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS purchase_items (
+    id SERIAL PRIMARY KEY,
+    project TEXT NOT NULL,
+    material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL,
+    name TEXT NOT NULL,
+    code TEXT DEFAULT '',
+    model TEXT DEFAULT '',
+    need_qty INTEGER NOT NULL CHECK(need_qty > 0),
+    unit TEXT DEFAULT '个',
+    remark TEXT DEFAULT '',
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS purchase_batches (
+    id SERIAL PRIMARY KEY,
+    purchase_item_id INTEGER NOT NULL REFERENCES purchase_items(id) ON DELETE CASCADE,
+    qty INTEGER NOT NULL CHECK(qty > 0),
+    remark TEXT DEFAULT '',
+    created_by TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id, id);
+CREATE INDEX IF NOT EXISTS idx_pitem_project ON purchase_items(project);
+CREATE INDEX IF NOT EXISTS idx_pbatch_item ON purchase_batches(purchase_item_id);
 """
 
 

@@ -12,14 +12,9 @@ import { Hono } from "hono";
 import type { AppEnv } from "./index";
 import { requireLogin, requireAdmin, getJson, parseIntSafe, nowStr, hashPassword } from "./auth";
 import { searchLcsc, fetchDetail } from "./lcsc";
+import { q, applyStock, bomCheckCore } from "./core";
 
 const api = new Hono<AppEnv>();
-
-/** D1 查询 helper：bind 参数 + 返回结果数组 */
-async function q<T = any>(db: D1Database, sql: string, ...params: unknown[]): Promise<T[]> {
-  const r = await db.prepare(sql).bind(...params).all<T>();
-  return r.results ?? [];
-}
 
 const MAX_WAREHOUSE_LEVEL = 4;
 
@@ -139,6 +134,67 @@ api.get("/api/materials", requireLogin, async (c) => {
   return c.json(rows);
 });
 
+/** 物料自动补全（新建/编辑共用，外链模式）：编码为立创C编号时抓详情——
+ *  参数字段仅填空不覆盖（lcsc_url 列对应详情的 url 键）；图片外链写 image_path；
+ *  手册外链登记 material_documents。失败静默返回原因说明，不阻塞物料创建/编辑。
+ *  返回 null=无需抓取或成功；字符串=失败原因（调用方放进响应 note） */
+export async function autoFetchMaterial(db: D1Database, mid: number): Promise<string | null> {
+  const rows = await q<any>(
+    db, "SELECT code, name, model, brand, package, category, description, lcsc_url, image_path FROM materials WHERE id=?", mid);
+  if (!rows.length) return "物料不存在";
+  const r = rows[0];
+  const code = String(r.code ?? "").trim();
+  if (!/^C\d+$/i.test(code)) return null;       // 不是立创C编号，无需抓取
+
+  // 快速路径：参数全填 + 已有图片外链 + 已有手册 → 无可补全，跳过网络请求
+  const hasDoc = await q(
+    db, "SELECT id FROM material_documents WHERE material_id=? AND doc_type='datasheet'", mid);
+  const fieldsFull = ["name", "model", "brand", "package", "category", "lcsc_url"]
+    .every((c) => String(r[c] ?? "").trim() !== "");
+  if (fieldsFull && r.image_path && hasDoc.length) return null;
+
+  const detail = await fetchDetail(code);
+  if (!detail.length) return "未获取到立创详情（编号可能无效），参数未自动补全";
+  const d = detail[0] as any;
+
+  // 1) 参数字段：仅填空不覆盖
+  const map: Record<string, string> = {
+    name: "name", model: "model", brand: "brand", package: "package",
+    category: "category", description: "description", lcsc_url: "url",
+  };
+  const updates: string[] = [];
+  const params: unknown[] = [];
+  for (const [col, key] of Object.entries(map)) {
+    const cur = String(r[col] ?? "").trim();
+    const nv = String(d[key] ?? "").trim();
+    if (!cur && nv) { updates.push(`${col}=?`); params.push(nv); }
+  }
+  // 2) 图片：无外链时写立创 CDN 链接（302 跳转展示，不下载文件本体）
+  if (!r.image_path && d.image) {
+    let img = String(d.image);
+    if (img.startsWith("//")) img = "https:" + img;   // 协议相对地址补全
+    updates.push("image_path=?");
+    params.push(img);
+  }
+  if (updates.length) {
+    params.push(mid);
+    await db.prepare(`UPDATE materials SET ${updates.join(", ")} WHERE id=?`).bind(...params).run();
+  }
+  // 3) 手册：无 datasheet 记录时登记外链（同一 PDF 查重）
+  if (!hasDoc.length && d.datasheet_url) {
+    const exists = await q(
+      db, "SELECT id FROM material_documents WHERE material_id=? AND doc_type='datasheet' AND file_path=?",
+      mid, d.datasheet_url);
+    if (!exists.length) {
+      const stem = (String(d.datasheet_url).match(/\/([0-9a-fA-F]{16,})\.pdf/) ?? [])[1] ?? "datasheet";
+      await db.prepare(
+        "INSERT INTO material_documents(material_id, doc_type, file_path, file_name) VALUES (?,?,?,?)")
+        .bind(mid, "datasheet", d.datasheet_url, `${stem}.pdf`).run();
+    }
+  }
+  return null;
+}
+
 api.post("/api/materials", requireLogin, async (c) => {
   const d = await getJson(c);
   const name = String(d.name ?? "").trim();
@@ -153,7 +209,11 @@ api.post("/api/materials", requireLogin, async (c) => {
           String(d.package ?? ""), String(d.brand ?? ""), String(d.description ?? ""),
           qty, String(d.unit ?? "个"), d.warehouse_id || null, String(d.lcsc_url ?? ""))
     .run();
-  return c.json({ id: r.meta.last_row_id }, 201);
+  // 立创C编号自动补全：图片/手册外链 + 参数填空（失败静默不阻塞建料）
+  const note = await autoFetchMaterial(c.env.DB, r.meta.last_row_id);
+  const resp: Record<string, unknown> = { id: r.meta.last_row_id };
+  if (note) resp.note = note;
+  return c.json(resp, 201);
 });
 
 api.put("/api/materials/:id", requireLogin, async (c) => {
@@ -172,7 +232,11 @@ api.put("/api/materials/:id", requireLogin, async (c) => {
           nowStr(), mid)
     .run();
   if ((r.meta.changes ?? 0) === 0) return c.json({ error: "物料不存在" }, 404);
-  return c.json({ ok: true });
+  // 后补立创编号/尚有空字段时自动补全（幂等：已全填则快速路径直接跳过）
+  const note = await autoFetchMaterial(c.env.DB, mid);
+  const resp: Record<string, unknown> = { ok: true };
+  if (note) resp.note = note;
+  return c.json(resp);
 });
 
 api.delete("/api/materials/:id", requireLogin, async (c) => {
@@ -182,30 +246,7 @@ api.delete("/api/materials/:id", requireLogin, async (c) => {
   return c.json({ ok: true });
 });
 
-// ---------------- 出入库 / 流水（原子扣减，防并发超卖） ----------------
-
-/** 出入库核心（与 Flask 版 _apply_stock 同逻辑）：单语句原子扣减 + 事后写流水 */
-async function applyStock(
-  db: D1Database, op: "in" | "out", mid: number, qty: number, operator: string, remark: string,
-): Promise<{ qty?: number; err?: [string, number] }> {
-  const mat = await db.prepare("SELECT id FROM materials WHERE id=?").bind(mid).first();
-  if (!mat) return { err: ["物料不存在", 404] };
-  const ts = nowStr();
-  const updSql = op === "out"
-    ? "UPDATE materials SET quantity=quantity-?, updated_at=? WHERE id=? AND quantity>=?"
-    : "UPDATE materials SET quantity=quantity+?, updated_at=? WHERE id=?";
-  const updParams: unknown[] = op === "out" ? [qty, ts, mid, qty] : [qty, ts, mid];
-  const upd = await db.prepare(updSql).bind(...updParams).run();
-  if ((upd.meta.changes ?? 0) === 0) {
-    const cur = await db.prepare("SELECT quantity FROM materials WHERE id=?").bind(mid).first<any>();
-    return { err: [`库存不足，当前库存 ${cur?.quantity ?? 0}`, 400] };
-  }
-  await db.prepare(
-    "INSERT INTO stock_records(material_id, type, quantity, operator, remark) VALUES (?,?,?,?,?)")
-    .bind(mid, op, qty, operator, remark).run();
-  const after = await db.prepare("SELECT quantity FROM materials WHERE id=?").bind(mid).first<any>();
-  return { qty: after?.quantity ?? 0 };
-}
+// ---------------- 出入库 / 流水（原子扣减核心见 core.ts 的 applyStock，与开放接口共用） ----------------
 
 api.post("/api/stock/:op", requireLogin, async (c) => {
   const op = c.req.param("op");
@@ -392,11 +433,255 @@ api.delete("/api/users/:id", requireAdmin, async (c) => {
   return c.json({ ok: true });
 });
 
+// ---------------- 系统设置 app_settings（AI 配置存这里，key-value） ----------------
+
+/** 读单个设置项，不存在返回空串 */
+async function getSetting(db: D1Database, key: string): Promise<string> {
+  const rows = await q<{ value: string }>(db, "SELECT value FROM app_settings WHERE key=?", key);
+  return rows[0]?.value ?? "";
+}
+
+/** 写设置项（UPSERT，D1 与 Flask 两侧 SQLite/PG 均支持 ON CONFLICT 语法） */
+async function setSetting(db: D1Database, key: string, value: string): Promise<void> {
+  await db.prepare(
+    "INSERT INTO app_settings(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    .bind(key, value).run();
+}
+
+/** API Key 打码回显：保头 3 尾 4（太短只保头 2），防配置页回显泄露 */
+function maskKey(k: string): string {
+  if (!k) return "";
+  if (k.length <= 8) return k.slice(0, 2) + "***";
+  return k.slice(0, 3) + "***" + k.slice(-4);
+}
+
+/** 读取 AI 接口配置（OpenAI 兼容三件套） */
+export async function aiCfg(db: D1Database) {
+  return {
+    base_url: (await getSetting(db, "ai_base_url")).trim(),
+    api_key: (await getSetting(db, "ai_api_key")).trim(),
+    model: (await getSetting(db, "ai_model")).trim(),
+  };
+}
+
+// ---------------- AI 接口配置（管理员，与 Flask 版 /api/ai/* 1:1） ----------------
+
+api.get("/api/ai/config", requireAdmin, async (c) => {
+  const cfg = await aiCfg(c.env.DB);
+  return c.json({ base_url: cfg.base_url, model: cfg.model,
+                  api_key_masked: maskKey(cfg.api_key), has_key: !!cfg.api_key });
+});
+
+api.post("/api/ai/config", requireAdmin, async (c) => {
+  const d = await getJson(c);
+  const baseUrl = String(d.base_url ?? "").trim();
+  const model = String(d.model ?? "").trim();
+  const apiKey = String(d.api_key ?? "").trim();
+  if (!baseUrl) return c.json({ error: "接口地址（base_url）不能为空" }, 400);
+  if (!model) return c.json({ error: "模型名（model）不能为空" }, 400);
+  await setSetting(c.env.DB, "ai_base_url", baseUrl);
+  await setSetting(c.env.DB, "ai_model", model);
+  if (apiKey === "!") {
+    await setSetting(c.env.DB, "ai_api_key", "");     // 显式清空
+  } else if (apiKey) {
+    await setSetting(c.env.DB, "ai_api_key", apiKey); // ★空 = 保留原值（防打码回显覆盖清空）
+  }
+  return c.json({ ok: true });
+});
+
+api.post("/api/ai/test", requireAdmin, async (c) => {
+  // 测试连通性：发一条最小 chat/completions，body 缺的字段回退用已存配置
+  const d = await getJson(c);
+  const saved = await aiCfg(c.env.DB);
+  const baseUrl = String(d.base_url ?? "").trim() || saved.base_url;
+  const apiKey = String(d.api_key ?? "").trim() || saved.api_key;
+  const model = String(d.model ?? "").trim() || saved.model;
+  if (!baseUrl || !apiKey || !model) return c.json({ error: "请先填写完整的 接口地址/API Key/模型名" }, 400);
+  const t0 = Date.now();
+  let resp: Response;
+  try {
+    resp = await fetch(baseUrl.replace(/\/+$/, "") + "/chat/completions", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages: [{ role: "user", content: "ping" }], max_tokens: 5 }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (e) {
+    return c.json({ error: `连接失败：${e instanceof Error ? e.name : "网络错误"}（检查地址/网络）` }, 502);
+  }
+  if (resp.status !== 200) {
+    return c.json({ error: `HTTP ${resp.status}：${(await resp.text()).slice(0, 200)}` }, 502);
+  }
+  return c.json({ ok: true, ms: Date.now() - t0 });
+});
+
+api.get("/api/ai/status", requireLogin, async (c) => {
+  const cfg = await aiCfg(c.env.DB);
+  const ok = !!(cfg.base_url && cfg.api_key && cfg.model);
+  return c.json({ configured: ok, model: ok ? cfg.model : "" });
+});
+
+// ---------------- 采购清单（与 Flask 版 /api/purchase/* 1:1；状态读时派生不存列） ----------------
+
+/** 采购批量导入核心（BOM 一键导入 & AI 卡片共用）：
+ *  同项目命中（material_id 相同或 code 非空相同）→ need_qty 累加，否则新建。
+ *  返回 {created, merged} 或 {error} */
+export async function purchaseBulkCore(
+  db: D1Database, project: unknown, items: unknown, operator: string,
+): Promise<{ created: number; merged: number } | { error: string }> {
+  const proj = String(project ?? "").trim();
+  if (!proj) return { error: "项目名不能为空" };
+  if (!Array.isArray(items) || !items.length) return { error: "items 必须是非空数组" };
+  if (items.length > 200) return { error: "单次最多导入 200 行" };
+  let created = 0, merged = 0;
+  for (const it of items) {
+    if (typeof it !== "object" || it === null) return { error: "items 内每行必须是对象" };
+    const row = it as Record<string, unknown>;
+    const name = String(row.name ?? "").trim();
+    if (!name) return { error: "每行的 name 不能为空" };
+    const qty = parseIntSafe(row.need_qty, 1);
+    if (qty === null) return { error: `「${name}」的 need_qty 必须是大于0的整数` };
+    const mid = parseIntSafe(row.material_id ?? 0, 1) ?? 0;
+    const code = String(row.code ?? "").trim();
+    // 合并查找：material_id 优先，其次 code（code 非空才参与，防把不同无码物料误合并）
+    let hit = 0;
+    if (mid) {
+      const r = await q<{ id: number }>(db, "SELECT id FROM purchase_items WHERE project=? AND material_id=?", proj, mid);
+      hit = r[0]?.id ?? 0;
+    } else if (code) {
+      const r = await q<{ id: number }>(db, "SELECT id FROM purchase_items WHERE project=? AND code=?", proj, code);
+      hit = r[0]?.id ?? 0;
+    }
+    if (hit) {
+      await db.prepare("UPDATE purchase_items SET need_qty=need_qty+? WHERE id=?").bind(qty, hit).run();
+      merged++;
+    } else {
+      await db.prepare(
+        `INSERT INTO purchase_items(project, material_id, name, code, model, need_qty, unit, remark, created_by)
+         VALUES (?,?,?,?,?,?,?,?,?)`)
+        .bind(proj, mid || null, name, code, String(row.model ?? "").trim(), qty,
+              String(row.unit ?? "个").trim() || "个", String(row.remark ?? "").trim(), operator)
+        .run();
+      created++;
+    }
+  }
+  return { created, merged };
+}
+
+/** 采购条目查询核心：LEFT JOIN 批次 SUM 派生 purchased/status（open/partial/done） */
+export async function purchaseListCore(db: D1Database, project?: string, status?: string) {
+  let sql = `SELECT p.*, COALESCE(b.purchased, 0) AS purchased,
+                    CASE WHEN COALESCE(b.purchased, 0) >= p.need_qty THEN 'done'
+                         WHEN COALESCE(b.purchased, 0) > 0 THEN 'partial'
+                         ELSE 'open' END AS status
+             FROM purchase_items p
+             LEFT JOIN (SELECT purchase_item_id, SUM(qty) AS purchased
+                        FROM purchase_batches GROUP BY purchase_item_id) b
+               ON b.purchase_item_id = p.id`;
+  const params: unknown[] = [];
+  if (project) { sql += " WHERE p.project=?"; params.push(project); }
+  sql += " ORDER BY p.id DESC LIMIT 500";
+  let rows = await q<any>(db, sql, ...params);
+  if (status) rows = rows.filter((r) => r.status === status);  // 派生列过滤放内存（两端行为一致）
+  return rows;
+}
+
+api.get("/api/purchase/items", requireLogin, async (c) => {
+  const project = (c.req.query("project") ?? "").trim() || undefined;
+  const status = (c.req.query("status") ?? "").trim() || undefined;
+  return c.json(await purchaseListCore(c.env.DB, project, status));
+});
+
+api.post("/api/purchase/items", requireLogin, async (c) => {
+  const d = await getJson(c);
+  const r = await purchaseBulkCore(c.env.DB, d.project, d.items, c.get("user")!.username);
+  if ("error" in r) return c.json({ error: r.error }, 400);
+  return c.json(r, 201);
+});
+
+api.put("/api/purchase/items/:id", requireLogin, async (c) => {
+  const pid = Number(c.req.param("id"));
+  const d = await getJson(c);
+  const name = String(d.name ?? "").trim();
+  if (!name) return c.json({ error: "名称不能为空" }, 400);
+  const qty = parseIntSafe(d.need_qty, 1);
+  if (qty === null) return c.json({ error: "需求量必须是大于0的整数" }, 400);
+  const r = await c.env.DB.prepare(
+    "UPDATE purchase_items SET project=?, name=?, code=?, model=?, need_qty=?, unit=?, remark=? WHERE id=?")
+    .bind(String(d.project ?? "").trim(), name, String(d.code ?? "").trim(),
+          String(d.model ?? "").trim(), qty, String(d.unit ?? "个").trim() || "个",
+          String(d.remark ?? "").trim(), pid)
+    .run();
+  if ((r.meta.changes ?? 0) === 0) return c.json({ error: "条目不存在" }, 404);
+  return c.json({ ok: true });
+});
+
+api.delete("/api/purchase/items/:id", requireLogin, async (c) => {
+  const pid = Number(c.req.param("id"));
+  const r = await c.env.DB.prepare("DELETE FROM purchase_items WHERE id=?").bind(pid).run();
+  if ((r.meta.changes ?? 0) === 0) return c.json({ error: "条目不存在" }, 404);
+  return c.json({ ok: true });
+});
+
+api.post("/api/purchase/items/:id/batches", requireLogin, async (c) => {
+  const pid = Number(c.req.param("id"));
+  const exists = await q(c.env.DB, "SELECT id FROM purchase_items WHERE id=?", pid);
+  if (!exists.length) return c.json({ error: "采购条目不存在" }, 404);
+  const d = await getJson(c);
+  const qty = parseIntSafe(d.qty, 1);
+  if (qty === null) return c.json({ error: "数量必须是大于0的整数" }, 400);
+  const r = await c.env.DB.prepare(
+    "INSERT INTO purchase_batches(purchase_item_id, qty, remark, created_by) VALUES (?,?,?,?)")
+    .bind(pid, qty, String(d.remark ?? "").trim(), c.get("user")!.username).run();
+  return c.json({ id: r.meta.last_row_id }, 201);
+});
+
+api.get("/api/purchase/items/:id/batches", requireLogin, async (c) => {
+  // 查某采购条目的全部采购批次（前端行展开用）
+  const pid = Number(c.req.param("id"));
+  const exists = await q(c.env.DB, "SELECT id FROM purchase_items WHERE id=?", pid);
+  if (!exists.length) return c.json({ error: "采购条目不存在" }, 404);
+  return c.json(await q(
+    c.env.DB, "SELECT * FROM purchase_batches WHERE purchase_item_id=? ORDER BY id DESC", pid));
+});
+
+api.delete("/api/purchase/batches/:id", requireLogin, async (c) => {
+  const bid = Number(c.req.param("id"));
+  const r = await c.env.DB.prepare("DELETE FROM purchase_batches WHERE id=?").bind(bid).run();
+  if ((r.meta.changes ?? 0) === 0) return c.json({ error: "批次不存在" }, 404);
+  return c.json({ ok: true });
+});
+
+api.get("/api/purchase/projects", requireLogin, async (c) => {
+  // 项目聚合视图：条数/已完成数/需求与已购总量（采购页项目列表）
+  const rows = await q(c.env.DB,
+    `SELECT p.project,
+            COUNT(*) AS item_count,
+            SUM(CASE WHEN COALESCE((SELECT SUM(qty) FROM purchase_batches
+                      WHERE purchase_item_id = p.id), 0) >= p.need_qty THEN 1 ELSE 0 END) AS done_count,
+            SUM(p.need_qty) AS need_total,
+            COALESCE(SUM(COALESCE((SELECT SUM(qty) FROM purchase_batches
+                      WHERE purchase_item_id = p.id), 0)), 0) AS purchased_total,
+            MAX(p.id) AS last_id
+     FROM purchase_items p GROUP BY p.project ORDER BY last_id DESC`);
+  return c.json(rows);
+});
+
+// ---------------- 网页端 BOM 核对（session 认证；核心在 core.ts，与 /api/v1 版一致） ----------------
+
+api.post("/api/bom/check", requireLogin, async (c) => {
+  const d = await getJson(c);
+  const r = await bomCheckCore(c.env.DB, d.items);
+  if ("error" in r) return c.json({ error: r.error }, r.status as 400);
+  return c.json(r);
+});
+
 // ---------------- 数据库信息（管理员） ----------------
 
 api.get("/api/db/info", requireAdmin, async (c) => {
   const info: Record<string, unknown> = { type: "d1", path: "(cloudflare d1)" };
-  for (const t of ["warehouses", "materials", "material_documents", "stock_records", "users"]) {
+  for (const t of ["warehouses", "materials", "material_documents", "stock_records", "users",
+                   "app_settings", "chat_messages", "purchase_items", "purchase_batches"]) {
     const r = await q<{ c: number }>(c.env.DB, `SELECT COUNT(*) AS c FROM ${t}`);
     info[t] = r[0]?.c ?? 0;
   }

@@ -9,6 +9,7 @@ import { Hono } from "hono";
 import authRoutes from "./auth";
 import apiRoutes from "./routes";
 import v1Routes from "./apiv1";
+import chatRoutes from "./ai";
 
 /** Worker 绑定资源（wrangler.toml / 网页 Settings 配置） */
 export interface Env {
@@ -29,10 +30,11 @@ export type AppEnv = {
 
 const app = new Hono<AppEnv>();
 
-// 三组路由：认证 / 网页端业务 API / 开放接口 /api/v1（Cherry Studio 等）
+// 四组路由：认证 / 网页端业务 API / 开放接口 /api/v1 / AI 对话 /api/chat*
 app.route("/", authRoutes);
 app.route("/", apiRoutes);
 app.route("/", v1Routes);
+app.route("/", chatRoutes);
 
 // 全局兜底：任何未捕获异常一律返回 JSON（与 Flask 版错误格式一致），避免默认 HTML 错误页
 app.onError((err, c) => {

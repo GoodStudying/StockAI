@@ -1,0 +1,423 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>采购清单 - 个人ERP</title>
+<script src="/common.js"></script>
+<script>
+/* 尽早应用主题，防止刷新时闪回默认配色 */
+(function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="layout">
+<div id="nav-mount"><script>/* 解析到即注入，侧栏随首帧出现 */document.currentScript.parentElement.innerHTML = renderNav('/purchase.html');</script></div>
+<main>
+  <div class="page-head">
+    <h1>采购清单</h1>
+    <span class="sub">BOM 核对 / 缺料一键导入 / 分批采购记录（按项目归档）</span>
+  </div>
+
+  <!-- ========== BOM 核对面板 ========== -->
+  <div class="panel bom-box">
+    <h3 class="pt">BOM 核对</h3>
+    <p style="font-size:12px;color:var(--ink-3);margin:4px 0 8px">
+      每行一条，格式：<code>C621395 ×5</code> 或 <code>100nF电容, 10</code> 或 <code>贴片电阻 103 20</code>。
+      支持从 Excel 直接粘贴（Tab/逗号/空格分隔）；数量取行尾纯数字，立创C编号自动识别。
+    </p>
+    <textarea id="bom-input" placeholder="C621395 5&#10;CL10B104KB8NNNC 20&#10;贴片电阻 10k 0603 30"></textarea>
+    <div class="toolbar" style="margin-top:10px">
+      <button onclick="parseBom()">解析预览</button>
+      <button onclick="runCheck()" id="btn-check" disabled>开始核对</button>
+      <button onclick="clearBom()" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)">清空</button>
+    </div>
+    <div id="bom-preview"></div>
+    <div id="bom-result"></div>
+  </div>
+
+  <!-- ========== 采购清单 ========== -->
+  <div class="panel">
+    <h3 class="pt">采购条目</h3>
+    <div class="proj-tabs" id="proj-tabs"></div>
+    <div class="toolbar">
+      <button onclick="openItemModal()" style="background:var(--accent);color:#fff;border:none">+ 新增采购项</button>
+      <span style="flex:1"></span>
+      <select id="status-filter" onchange="loadItems()">
+        <option value="">全部状态</option>
+        <option value="open">未采购</option>
+        <option value="partial">部分采购</option>
+        <option value="done">已完成</option>
+      </select>
+    </div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr>
+        <th></th><th>名称</th><th>编码</th><th>型号</th><th>需求</th><th>已购</th>
+        <th>缺口</th><th>单位</th><th>状态</th><th>备注</th><th>创建</th><th>操作</th>
+      </tr></thead>
+      <tbody id="item-body"></tbody>
+    </table>
+    </div>
+  </div>
+</main>
+</div>
+
+<!-- 登记采购弹窗 -->
+<div class="modal" id="batch-modal">
+  <div class="modal-box">
+    <h3 id="batch-title">登记采购</h3>
+    <div class="form-row"><label>数量</label><input id="batch-qty" type="number" min="1" value="1"></div>
+    <div class="form-row"><label>备注</label><input id="batch-remark" placeholder="如：淘宝下单 / 立创包邮车"></div>
+    <div class="modal-ops">
+      <button onclick="closeModal('batch-modal')" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)">取消</button>
+      <button onclick="saveBatch()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 新增/编辑采购项弹窗 -->
+<div class="modal" id="item-modal">
+  <div class="modal-box">
+    <h3 id="item-title">新增采购项</h3>
+    <div class="form-row"><label>项目</label><input id="item-project" placeholder="项目名（必填，如：测试板V2）"></div>
+    <div class="form-row"><label>名称</label><input id="item-name" placeholder="物料名称（必填）"></div>
+    <div class="form-row"><label>编码</label><input id="item-code" placeholder="立创C编号（选填，可后续补）"></div>
+    <div class="form-row"><label>型号</label><input id="item-model" placeholder="选填"></div>
+    <div class="form-row"><label>需求量</label><input id="item-need" type="number" min="1" value="1"></div>
+    <div class="form-row"><label>单位</label><input id="item-unit" value="个"></div>
+    <div class="form-row"><label>备注</label><input id="item-remark"></div>
+    <div class="modal-ops">
+      <button onclick="closeModal('item-modal')" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)">取消</button>
+      <button onclick="saveItem()">保存</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ==================== 采购清单页 ==================== */
+let curProject = '';         // 当前选中项目（空=全部）
+let editingItemId = 0;       // 正在编辑的采购项 id（0=新增）
+let batchItemId = 0;         // 正在登记批次的采购项 id
+let expandedRow = null;      // 当前展开批次的行
+
+/* ---------- BOM 前端解析器（防歧义最终防线是预览表，人可改） ---------- */
+function parseBomLine(line) {
+  if (!line.trim()) return null;
+  /* 切词优先级：Tab/逗号/分号 > 空格 */
+  const parts = line.split(/[\t,;、]+/).map(s => s.trim()).filter(Boolean);
+  const tokens = parts.length > 1 ? parts : parts[0].split(/\s+/).filter(Boolean);
+  /* 数量 = 最后一个纯整数词（拒绝前导零：0603 是封装不是数量） */
+  let qty = 1;
+  const last = tokens[tokens.length - 1];
+  if (tokens.length > 1 && /^[1-9]\d*$/.test(last)) { qty = parseInt(last, 10); tokens.pop(); }
+  /* 分类：首个 C 开头纯数字编号 → code；其余词拼为名称 */
+  let code = '', others = [];
+  for (const t of tokens) {
+    if (!code && /^C\d{4,}$/i.test(t)) code = t.toUpperCase();
+    else others.push(t);
+  }
+  /* 去掉 × x * 之类的连接符残留 */
+  const name = others.join(' ').replace(/[×xX*]\s*$/, '').trim();
+  return { code, name, quantity: qty };
+}
+
+let bomRows = [];            // 预览表数据（可编辑）
+function parseBom() {
+  const text = document.getElementById('bom-input').value;
+  bomRows = text.split(/\n+/).map(parseBomLine).filter(Boolean);
+  if (!bomRows.length) { alert('未解析到有效行'); return; }
+  renderPreview();
+  document.getElementById('btn-check').disabled = false;
+}
+function renderPreview() {
+  const el = document.getElementById('bom-preview');
+  let html = `<p style="font-size:12px;color:var(--ink-3);margin:10px 0 4px">
+    解析出 ${bomRows.length} 行（可编辑修正后核对；行首 ✕ 删除该行）</p>
+    <div class="table-wrap bom-preview-table"><table><thead><tr>
+      <th></th><th>编码（C编号可自动匹配）</th><th>名称/型号</th><th>数量</th></tr></thead><tbody>`;
+  bomRows.forEach((r, i) => {
+    html += `<tr>
+      <td><a href="#" onclick="bomRows.splice(${i},1);renderPreview();return false;" style="color:var(--red)">✕</a></td>
+      <td><input value="${esc(r.code)}" onchange="bomRows[${i}].code=this.value.trim()" style="width:110px"></td>
+      <td><input value="${esc(r.name)}" onchange="bomRows[${i}].name=this.value.trim()"></td>
+      <td><input type="number" min="1" value="${r.quantity}" onchange="bomRows[${i}].quantity=parseInt(this.value)||1" style="width:70px"></td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  el.innerHTML = html;
+}
+function clearBom() {
+  document.getElementById('bom-input').value = '';
+  document.getElementById('bom-preview').innerHTML = '';
+  document.getElementById('bom-result').innerHTML = '';
+  document.getElementById('btn-check').disabled = true;
+  bomRows = [];
+}
+
+/* ---------- BOM 核对与结果 ---------- */
+let checkResults = null;
+async function runCheck() {
+  if (!bomRows.length) return;
+  const items = bomRows.map(r => ({ code: r.code, name: r.name, quantity: r.quantity }));
+  const r = await api('/api/bom/check', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ items }),
+  });
+  checkResults = r;
+  const s = r.summary;
+  renderResultTable();
+}
+function renderResultTable() {
+  const r = checkResults;
+  const s = r.summary;
+  let html = `<p style="margin:12px 0 4px;font-size:13px">
+    核对结果：共 <b>${s.total}</b> 行 ·
+    <span style="color:var(--green)">充足 ${s.ok}</span> ·
+    <span style="color:var(--red)">缺料 ${s.shortage}</span> ·
+    <span style="color:var(--ink-3)">未找到 ${s.not_found}</span> ·
+    多个匹配 ${s.ambiguous} · 无效 ${s.invalid}</p>`;
+  if (s.shortage + s.not_found > 0) {
+    html += `<div class="toolbar" style="gap:8px">
+      <input id="import-project" placeholder="导入项目名（如：测试板V2）" style="max-width:220px">
+      <button onclick="importShortage()" style="background:var(--accent);color:#fff;border:none">
+        勾选项导入采购清单</button>
+    </div>`;
+  }
+  html += `<div class="table-wrap bom-preview-table"><table><thead><tr>
+    <th>导入</th><th>输入</th><th>匹配</th><th>需求</th><th>库存</th><th>状态</th></tr></thead><tbody>`;
+  r.results.forEach((row, i) => {
+    const input = row.input || {};
+    const inp = [input.code, input.model, input.name].filter(Boolean).join(' / ');
+    let st, stColor = '';
+    let chk = '';
+    if (row.status === 'shortage') {
+      st = `缺 ${row.shortage}`; stColor = 'var(--red)';
+      chk = `<input type="checkbox" checked onchange="checkResults.results[${i}]._imp=this.checked">`;
+    } else if (row.status === 'not_found') {
+      st = '未找到'; stColor = 'var(--ink-3)';
+      chk = `<input type="checkbox" onchange="checkResults.results[${i}]._imp=this.checked">`;
+    } else if (row.status === 'ambiguous') {
+      st = '多个匹配'; stColor = 'var(--blue)';
+      chk = '<span class="badge-warn">改用编码</span>';
+    } else if (row.status === 'invalid') {
+      st = '无效行'; stColor = 'var(--ink-3)';
+    } else {
+      st = '充足'; stColor = 'var(--green)';
+    }
+    const mat = row.material;
+    html += `<tr>
+      <td>${chk}</td>
+      <td>${esc(inp)}</td>
+      <td>${mat ? esc((mat.code || '') + ' ' + (mat.name || '')) + ' <small style="color:var(--ink-3)">#' + mat.id + '</small>' : '-'}</td>
+      <td>${row.need ?? '-'}</td>
+      <td>${mat ? (mat.quantity ?? 0) : '-'}</td>
+      <td style="color:${stColor};font-weight:600">${st}</td>
+    </tr>`;
+  });
+  html += '</tbody></table></div>';
+  document.getElementById('bom-result').innerHTML = html;
+  /* 默认勾选：shortage 全选（not_found 需手动勾） */
+  r.results.forEach((row, i) => { if (row.status === 'shortage') row._imp = true; });
+}
+
+/* 勾选行导入采购清单：shortage 导缺口数量，not_found 导输入数量 */
+async function importShortage() {
+  const project = document.getElementById('import-project').value.trim();
+  if (!project) { alert('请填写导入项目名'); return; }
+  const picked = checkResults.results.filter(r => r._imp);
+  if (!picked.length) { alert('请先勾选要导入的行'); return; }
+  const items = picked.map(r => ({
+    material_id: r.material ? r.material.id : undefined,
+    name: r.material ? r.material.name : ((r.input && (r.input.name || r.input.code || r.input.model)) || '未命名'),
+    code: (r.input && r.input.code) || (r.material && r.material.code) || '',
+    model: (r.input && r.input.model) || (r.material && r.material.model) || '',
+    need_qty: r.status === 'shortage' ? r.shortage : (r.need || 1),
+    remark: r.status === 'shortage' ? `BOM缺料（需${r.need}有${r.available}）` : 'BOM未找到物料',
+  }));
+  const res = await api('/api/purchase/items', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project, items }),
+  });
+  alert(`导入完成：新建 ${res.created} 项，合并累加 ${res.merged} 项`);
+  curProject = project;
+  await loadProjects();
+  await loadItems();
+}
+
+/* ---------- 项目 tab ---------- */
+async function loadProjects() {
+  const rows = await api('/api/purchase/projects');
+  const tabs = document.getElementById('proj-tabs');
+  let html = `<span class="proj-tab ${curProject === '' ? 'on' : ''}" onclick="pickProject('')">全部</span>`;
+  rows.forEach(p => {
+    const openCnt = p.item_count - p.done_count;
+    html += `<span class="proj-tab ${curProject === p.project ? 'on' : ''}"
+      onclick="pickProject('${esc(p.project).replace(/'/g, "\\'")}')">
+      ${esc(p.project)}<span class="cnt">${p.done_count}/${p.item_count}</span></span>`;
+  });
+  tabs.innerHTML = html;
+}
+function pickProject(p) { curProject = p; loadItems(); loadProjects(); }
+
+/* ---------- 采购条目表 ---------- */
+async function loadItems() {
+  const status = document.getElementById('status-filter').value;
+  const qs = new URLSearchParams();
+  if (curProject) qs.set('project', curProject);
+  if (status) qs.set('status', status);
+  const rows = await api('/api/purchase/items?' + qs.toString());
+  const body = document.getElementById('item-body');
+  if (!rows.length) {
+    body.innerHTML = '<tr><td colspan="12" style="text-align:center;color:var(--ink-3);padding:24px">暂无采购条目</td></tr>';
+    return;
+  }
+  let html = '';
+  rows.forEach(r => {
+    const gap = Math.max(r.need_qty - r.purchased, 0);
+    const stMap = { open: ['未采购', 'open'], partial: ['部分', 'partial'], done: ['已完成', 'done'] };
+    const [stTxt, stCls] = stMap[r.status] || [r.status, 'open'];
+    html += `<tr id="prow-${r.id}">
+      <td><a href="#" onclick="toggleBatches(${r.id});return false;" style="text-decoration:none" id="pexp-${r.id}">▸</a></td>
+      <td>${esc(r.name)}</td>
+      <td>${esc(r.code || '-')}</td>
+      <td>${esc(r.model || '-')}</td>
+      <td class="qty-cell"><b>${r.need_qty}</b> <small>${esc(r.unit || '')}</small></td>
+      <td class="qty-cell"><b style="color:var(--green)">${r.purchased}</b></td>
+      <td class="qty-cell">${gap > 0 ? `<b style="color:var(--red)">${gap}</b>` : '0'}</td>
+      <td>${esc(r.unit || '个')}</td>
+      <td><span class="pstatus ${stCls}">${stTxt}</span></td>
+      <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.remark || '')}">${esc(r.remark || '-')}</td>
+      <td style="font-size:12px;color:var(--ink-3)">${esc(r.created_by || '')}<br>${esc((r.created_at || '').slice(0, 10))}</td>
+      <td>
+        <button class="mini-btn" style="background:var(--green);color:#fff;border:none;border-radius:6px;padding:3px 9px;font-size:12px"
+          onclick="openBatchModal(${r.id}, '${esc(r.name).replace(/'/g, "\\'")}')">+采购</button>
+        <button class="mini-btn" style="border:1px solid var(--line-2);border-radius:6px;padding:3px 9px;font-size:12px;background:var(--btn-gray-bg)"
+          onclick="openItemModal(${r.id})">编辑</button>
+        <button class="mini-btn" style="background:var(--red);color:#fff;border:none;border-radius:6px;padding:3px 9px;font-size:12px"
+          onclick="delItem(${r.id})">删除</button>
+      </td>
+    </tr>`;
+  });
+  body.innerHTML = html;
+}
+
+/* 行展开：批次明细（每笔可删，删后已购自动回退） */
+async function toggleBatches(pid) {
+  const exp = document.getElementById('pexp-' + pid);
+  const exist = document.getElementById('batch-tr-' + pid);
+  if (exist) { exist.remove(); exp.textContent = '▸'; return; }
+  const batches = await api(`/api/purchase/items/${pid}/batches`);
+  const tr = document.createElement('tr');
+  tr.id = 'batch-tr-' + pid;
+  let html = `<td colspan="12" class="batch-list" style="background:var(--paper);padding:8px 16px">`;
+  if (!batches.length) html += '（尚无采购批次，点「+采购」登记第一笔）';
+  else {
+    html += `共 ${batches.length} 笔：`;
+    batches.forEach(b => {
+      html += `<span style="margin-right:18px">×${b.qty} · ${esc(b.created_by || '')} · ${esc((b.created_at || '').slice(0, 16))}
+        ${esc(b.remark ? '（' + b.remark + '）' : '')}
+        <a href="#" onclick="delBatch(${b.id}, ${pid});return false;" style="color:var(--red)">删</a></span>`;
+    });
+  }
+  html += '</td>';
+  tr.innerHTML = html;
+  document.getElementById('prow-' + pid).after(tr);
+  exp.textContent = '▾';
+}
+async function delBatch(bid, pid) {
+  if (!confirm('删除这笔采购批次？已购数量将自动回退。')) return;
+  await api('/api/purchase/batches/' + bid, { method: 'DELETE' });
+  await loadItems();
+  const tr = document.getElementById('batch-tr-' + pid);
+  if (tr) tr.remove();
+  await loadProjects();
+}
+
+/* ---------- 登记采购批次弹窗 ---------- */
+function openBatchModal(pid, name) {
+  batchItemId = pid;
+  document.getElementById('batch-title').textContent = `登记采购：${name}`;
+  document.getElementById('batch-qty').value = 1;
+  document.getElementById('batch-remark').value = '';
+  openModal('batch-modal');
+}
+async function saveBatch() {
+  const qty = parseInt(document.getElementById('batch-qty').value, 10);
+  if (!qty || qty < 1) { alert('数量必须是大于0的整数'); return; }
+  await api(`/api/purchase/items/${batchItemId}/batches`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ qty, remark: document.getElementById('batch-remark').value }),
+  });
+  closeModal('batch-modal');
+  await loadItems();
+  await loadProjects();
+}
+
+/* ---------- 新增/编辑采购项弹窗 ---------- */
+async function openItemModal(pid) {
+  editingItemId = pid || 0;
+  const t = document.getElementById('item-title');
+  if (pid) {
+    const rows = await api(`/api/purchase/items?project=${encodeURIComponent(curProject)}`);
+    const it = rows.find(x => x.id === pid);
+    if (!it) return;
+    t.textContent = '编辑采购项';
+    document.getElementById('item-project').value = it.project;
+    document.getElementById('item-name').value = it.name;
+    document.getElementById('item-code').value = it.code || '';
+    document.getElementById('item-model').value = it.model || '';
+    document.getElementById('item-need').value = it.need_qty;
+    document.getElementById('item-unit').value = it.unit || '个';
+    document.getElementById('item-remark').value = it.remark || '';
+  } else {
+    t.textContent = '新增采购项';
+    document.getElementById('item-project').value = curProject;
+    ['item-name', 'item-code', 'item-model', 'item-remark'].forEach(id => document.getElementById(id).value = '');
+    document.getElementById('item-need').value = 1;
+    document.getElementById('item-unit').value = '个';
+  }
+  openModal('item-modal');
+}
+async function saveItem() {
+  const body = {
+    project: document.getElementById('item-project').value.trim(),
+    name: document.getElementById('item-name').value.trim(),
+    code: document.getElementById('item-code').value.trim(),
+    model: document.getElementById('item-model').value.trim(),
+    need_qty: parseInt(document.getElementById('item-need').value, 10),
+    unit: document.getElementById('item-unit').value.trim(),
+    remark: document.getElementById('item-remark').value.trim(),
+  };
+  if (!body.project || !body.name || !body.need_qty) { alert('项目、名称、需求量为必填'); return; }
+  if (editingItemId) {
+    await api('/api/purchase/items/' + editingItemId, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body) });
+  } else {
+    await api('/api/purchase/items', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: body.project, items: [body] }) });
+  }
+  closeModal('item-modal');
+  await loadItems();
+  await loadProjects();
+}
+async function delItem(pid) {
+  if (!confirm('删除该采购条目？其下全部采购批次将一并删除。')) return;
+  await api('/api/purchase/items/' + pid, { method: 'DELETE' });
+  await loadItems();
+  await loadProjects();
+}
+
+/* 初始化 */
+(async function init() {
+  const user = await checkLogin();
+  if (!user) return;
+  await loadProjects();
+  await loadItems();
+})();
+</script>
+</body>
+</html>

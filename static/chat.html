@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 助手 - 个人ERP</title>
+<script src="/common.js"></script>
+<script>
+/* 尽早应用主题，防止刷新时闪回默认配色 */
+(function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
+</script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="layout">
+<div id="nav-mount"><script>/* 解析到即注入，侧栏随首帧出现 */document.currentScript.parentElement.innerHTML = renderNav('/chat.html');</script></div>
+<main>
+  <div class="page-head">
+    <h1>AI 助手</h1>
+    <span class="sub">对话式出入库 / BOM 核对 / 采购管理（写操作需点击卡片确认）</span>
+  </div>
+
+  <div class="panel chat-layout">
+    <div class="chat-scroll" id="chat-scroll">
+      <div class="chat-empty" id="chat-empty">
+        <div class="big">✦</div>
+        试试对我说：<br>
+        「查一下 100nF 电容的库存」<br>
+        「入库 10 个 C621395 到默认库」<br>
+        「帮我核对这份 BOM：C621395 ×5，103电阻 ×20」<br>
+        「把缺料加到采购清单，项目叫测试板V2」
+      </div>
+      <div class="typing" id="typing"><i></i><i></i><i></i></div>
+    </div>
+    <div class="chat-input">
+      <textarea id="chat-input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"
+        oninput="autoGrow(this)" onkeydown="onInputKey(event)"></textarea>
+      <button onclick="send()">发送</button>
+    </div>
+    <div class="chat-hintbar">
+      <span id="ai-status"></span>
+      <a href="#" onclick="clearHistory();return false;" style="color:var(--red)">清空对话</a>
+    </div>
+  </div>
+</main>
+</div>
+
+<script>
+/* ==================== AI 助手页 ==================== */
+let sending = false;
+let oldestId = 0;          // 已加载最早消息 id（向上翻页游标）
+const scrollEl = document.getElementById('chat-scroll');
+
+/* 文本框自动增高（最高150px） */
+function autoGrow(el) {
+  el.style.height = 'auto';
+  el.style.height = Math.min(el.scrollHeight, 150) + 'px';
+}
+/* Enter 发送 / Shift+Enter 换行 */
+function onInputKey(e) {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+}
+
+/* 卡片类型中文标签 */
+const TYPE_LABEL = {
+  stock_in: '入库', stock_out: '出库',
+  create_material: '新建物料', add_purchase_items: '导入采购',
+};
+
+/* 渲染一条消息：气泡 + 卡片组 */
+function renderMsg(m, where = 'append') {
+  const empty = document.getElementById('chat-empty');
+  if (empty) empty.remove();
+  const typing = document.getElementById('typing');
+  const div = document.createElement('div');
+  div.className = 'msg-block';
+  div.dataset.id = m.id;
+
+  const b = document.createElement('div');
+  b.className = 'bubble ' + (m.role === 'user' ? 'user' : 'assistant');
+  b.textContent = m.content || (m.role === 'assistant' ? '（已生成操作卡片）' : '');
+  const meta = document.createElement('span');
+  meta.className = 'meta';
+  meta.textContent = (m.created_at || '') + (m.role === 'user' ? ' · 我' : ' · AI');
+  b.appendChild(meta);
+  div.appendChild(b);
+
+  (m.actions || []).forEach(a => div.appendChild(renderCard(m.id, a)));
+  if (where === 'append') scrollEl.insertBefore(div, typing);
+  else scrollEl.insertBefore(div, scrollEl.firstChild);   // prepend（历史向上加载）
+  return div;
+}
+
+/* 渲染操作卡片（四态） */
+function renderCard(msgId, a) {
+  const card = document.createElement('div');
+  card.className = 'action-card ' + a.status;
+  card.dataset.aid = a.id;
+  const label = TYPE_LABEL[a.type] || a.type;
+  let html = `<div class="a-title">${esc(a.title || label)}<span class="a-type">${label}</span></div>`;
+  html += `<div class="a-detail">${esc(JSON.stringify(a.params, null, 1))}</div>`;
+  if (a.status === 'pending') {
+    html += `<div class="a-ops">
+      <button class="btn" style="background:var(--green);color:#fff;border:none" onclick="execAction(${msgId},'${a.id}',false)">确认执行</button>
+      <button class="btn" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)" onclick="execAction(${msgId},'${a.id}',true)">取消</button>
+    </div>`;
+  } else {
+    const res = a.result || {};
+    const txt = a.status === 'executed'
+      ? ('✓ 已执行' + (res.quantity !== undefined ? `，现库存 ${res.quantity}` : '')
+        + (res.material_id !== undefined && res.quantity === undefined ? `，物料 #${res.material_id}` : '')
+        + (res.created !== undefined ? `，新建 ${res.created} 项 / 合并 ${res.merged} 项` : '')
+        + (res.note ? `（${res.note}）` : ''))
+      : a.status === 'cancelled' ? '已取消' : ('✗ 失败：' + (res.error || '未知错误'));
+    html += `<div class="a-ops"><span class="res">${esc(txt)}${a.executed_at ? ' · ' + esc(a.executed_at) : ''}</span></div>`;
+  }
+  card.innerHTML = html;
+  return card;
+}
+
+/* 确认/取消卡片：成功后用服务端返回的最新状态原地替换卡片 */
+async function execAction(msgId, actionId, cancel) {
+  if (!cancel && !confirm('确认执行该操作？')) return;
+  const card = document.querySelector(`.action-card[data-aid="${actionId}"]`);
+  if (card) card.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    const r = await api('/api/chat/execute', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: msgId, action_id: actionId, cancel }),
+    });
+    if (card) card.replaceWith(renderCard(msgId, r.action));
+  } catch (e) {
+    /* 失败信息已 alert；按钮恢复（库存不足保持 pending 可重试） */
+    if (card) card.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
+/* 发送消息 */
+async function send() {
+  const input = document.getElementById('chat-input');
+  const message = input.value.trim();
+  if (!message || sending) return;
+  sending = true;
+  input.value = ''; autoGrow(input);
+  renderMsg({ id: 0, role: 'user', content: message, created_at: '刚刚' });
+  document.getElementById('typing').classList.add('on');
+  scrollToBottom();
+  try {
+    const r = await api('/api/chat', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message }),
+    });
+    renderMsg({ id: r.message_id, role: 'assistant', content: r.content,
+                created_at: '刚刚', actions: r.actions });
+  } catch (e) {
+    /* 错误已 alert；失败消息也已在服务端落库，刷新可见 */
+  } finally {
+    document.getElementById('typing').classList.remove('on');
+    sending = false;
+    scrollToBottom();
+    input.focus();
+  }
+}
+
+function scrollToBottom() { scrollEl.scrollTop = scrollEl.scrollHeight; }
+
+/* 向上翻页：滚到顶部 40px 内加载更早消息 */
+scrollEl.addEventListener('scroll', async () => {
+  if (scrollEl.scrollTop > 40 || !oldestId || loadingMore) return;
+  loadingMore = true;
+  const prevH = scrollEl.scrollHeight;
+  try {
+    const r = await api(`/api/chat/history?before_id=${oldestId}&limit=30`);
+    r.messages.forEach(m => renderMsg(m, 'prepend'));
+    if (!r.has_more) oldestId = 0;
+    /* 保持视口贴在原内容位置（不被顶走） */
+    scrollEl.scrollTop = scrollEl.scrollHeight - prevH;
+  } catch (e) {}
+  loadingMore = false;
+});
+let loadingMore = false;
+
+async function clearHistory() {
+  if (!confirm('确认清空当前账号的全部对话记录？此操作不可恢复。')) return;
+  await api('/api/chat/history', { method: 'DELETE' });
+  location.reload();
+}
+
+/* 初始化：登录检查 → AI 状态 → 历史加载 */
+(async function init() {
+  const user = await checkLogin();
+  if (!user) return;
+  try {
+    const st = await api('/api/ai/status');
+    document.getElementById('ai-status').textContent = st.configured
+      ? `AI 已就绪 · 模型 ${st.model}` : 'AI 未配置（管理员请在 系统管理 页配置 AI 接口）';
+  } catch (e) {}
+  try {
+    const r = await api('/api/chat/history?limit=30');
+    r.messages.forEach(m => renderMsg(m, 'prepend'));
+    if (r.messages.length) oldestId = r.messages[0].id;
+    if (!r.has_more) oldestId = 0;
+    scrollToBottom();
+  } catch (e) {}
+  document.getElementById('chat-input').focus();
+})();
+</script>
+</body>
+</html>
