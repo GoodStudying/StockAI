@@ -82,7 +82,8 @@ export async function currentUser(c: Context<AppEnv>): Promise<SessionUser | nul
   const token = getCookie(c, COOKIE);
   if (!token) return null;
   try {
-    const payload = await verify(token, c.env.WORKER_SECRET);
+    // ★ 必须显式传 "HS256"：新版 hono/jwt 的 verify 缺 alg 会直接抛 JwtAlgorithmRequired
+    const payload = await verify(token, c.env.WORKER_SECRET, "HS256");
     if (payload && typeof payload === "object" && typeof (payload as any).id === "number") {
       const { id, username, role } = payload as any;
       return { id, username, role };
@@ -142,7 +143,9 @@ auth.post("/api/login", async (c) => {
     if (compat) return c.json({ error: compat }, 500);
     if (await verifyPassword(row.password_hash, String(d.password ?? ""))) {
       const user = { id: row.id as number, username: row.username as string, role: row.role as string };
-      const jwt = await sign({ ...user, exp: Math.floor(Date.now() / 1000) + SESSION_HOURS }, c.env.WORKER_SECRET);
+      // sign/verify 均显式 HS256（新版 hono 的 verify 缺 alg 参数会抛 JwtAlgorithmRequired）
+      const jwt = await sign(
+        { ...user, exp: Math.floor(Date.now() / 1000) + SESSION_HOURS }, c.env.WORKER_SECRET, "HS256");
       setCookie(c, COOKIE, jwt, {
         httpOnly: true, secure: true, sameSite: "Lax", path: "/", maxAge: SESSION_HOURS,
       });
@@ -165,7 +168,7 @@ auth.get("/api/me", async (c) => {
   const raw = getCookie(c, COOKIE) ?? "";
   let verify_err: string | null = null;
   if (raw && !u) {
-    try { await verify(raw, c.env.WORKER_SECRET); } catch (e) {
+    try { await verify(raw, c.env.WORKER_SECRET, "HS256"); } catch (e) {
       verify_err = String(e instanceof Error ? e.message : e);
     }
   }
@@ -196,7 +199,7 @@ auth.get("/api/debug/env", async (c) => {
 });
 
 // ---------------- 部署版本号（与登录页脚的版本标记同步更新，核对线上代码版本用） ----------------
-auth.get("/api/version", (c) => c.json({ version: "v261015.3" }));
+auth.get("/api/version", (c) => c.json({ version: "v261015.4" }));
 
 // ---------------- 用户表诊断（临时：从 Worker 视角查它绑定的 D1，绕开"Console操作的库对不对"的疑问） ----------------
 auth.get("/api/debug/users", async (c) => {
