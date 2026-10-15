@@ -97,7 +97,7 @@ async function loadMaterials() {
   const list = await api(url);
   document.getElementById('mat-body').innerHTML = list.map((m, i) => `<tr>
     <td>${i + 1}</td>
-    <td>${(m.image_path || m.has_image) ? `<img src="/api/materials/${m.id}/image" style="width:40px;height:40px;object-fit:contain"
+    <td>${(m.image_path || m.has_image) ? `<img src="/api/materials/${m.id}/image" referrerpolicy="no-referrer" style="width:40px;height:40px;object-fit:contain"
          onerror="this.replaceWith(document.createTextNode('—'))">` : '—'}</td>
     <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td><td>${esc(m.model||'')}</td>
     <td>${esc(m.brand||'')}</td>

@@ -137,7 +137,7 @@ async function loadMaterials() {
   const list = await api(url);
   document.getElementById('mat-body').innerHTML = list.map((m, i) => `<tr>
     <td>${i + 1}</td>
-    <td>${(m.image_path || m.has_image) ? `<img src="/api/materials/${m.id}/image" style="width:44px;height:44px;object-fit:contain;cursor:zoom-in"
+    <td>${(m.image_path || m.has_image) ? `<img src="/api/materials/${m.id}/image" referrerpolicy="no-referrer" style="width:44px;height:44px;object-fit:contain;cursor:zoom-in"
          title="点击查看大图" onclick="window.open('/api/materials/${m.id}/image')"
          onerror="this.replaceWith(document.createTextNode('—'))">` : '—'}</td>
     <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>

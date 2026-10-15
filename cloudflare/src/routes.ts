@@ -1,15 +1,17 @@
 /**
  * 网页端业务 API（与 Flask 版 app.py 的路由 1:1 对应）
- * 包含：仓库管理 / 物料管理 / 出入库 / 流水 / 账户管理 / 数据库信息
+ * 包含：仓库管理 / 物料管理 / 出入库 / 流水 / 账户管理 / 数据库信息 / 立创抓取
  *
- * 云端版功能边界（阶段1）：
- * - 立创商城抓取（/api/lcsc/*、fetch_datasheet、fetch_image）：海外出口 IP 被立创风控，暂不支持 → 501
- * - 文件类（图片/手册上传下载）：待阶段2接入 R2 后开放 → 501/404
+ * 云端版功能边界：
+ * - 立创抓取已支持（存外链模式）：图片/手册只存立创 CDN 的 URL，展示时 302 跳转，
+ *   抓取一次后链接永久存于 D1，不占 Worker 存储、无需 R2（英文站 lcsc.com 对 CF 出口友好）
+ * - 手动上传文件（POST /api/materials/:id/documents）：需 R2，仍为 501
  * - /api/v1 开放接口（Cherry Studio 用）完整支持，见 apiv1.ts
  */
 import { Hono } from "hono";
 import type { AppEnv } from "./index";
 import { requireLogin, requireAdmin, getJson, parseIntSafe, nowStr, hashPassword } from "./auth";
+import { searchLcsc, fetchDetail } from "./lcsc";
 
 const api = new Hono<AppEnv>();
 
@@ -21,8 +23,8 @@ async function q<T = any>(db: D1Database, sql: string, ...params: unknown[]): Pr
 
 const MAX_WAREHOUSE_LEVEL = 4;
 
-/** 云端暂不支持的功能统一占位响应 */
-const NOT_SUPPORTED = { error: "云端版暂不支持该功能（立创抓取/文件存储），请在本地或 NAS 版使用；文件功能将在 R2 阶段开放" };
+/** 手动上传文件类功能仍需 R2（阶段2），保留占位提示 */
+const NOT_SUPPORTED = { error: "云端版暂不支持手动上传文件（待 R2 阶段开放）；立创自动抓取手册/图片已支持（存外链）" };
 
 // ---------------- 仓库管理 ----------------
 
@@ -99,7 +101,8 @@ api.get("/api/materials", requireLogin, async (c) => {
   const includeChildren = (c.req.query("include_children") ?? "1") !== "0"; // 默认含子库
   let sql = `SELECT m.id, m.name, m.code, m.model, m.category, m.package, m.brand,
                     m.description, m.quantity, m.unit, m.warehouse_id, m.lcsc_url,
-                    0 AS has_image, m.created_at, m.updated_at, w.name AS warehouse_name
+                    CASE WHEN m.image_path IS NOT NULL AND m.image_path != '' THEN 1 ELSE 0 END AS has_image,
+                    m.image_path, m.created_at, m.updated_at, w.name AS warehouse_name
              FROM materials m LEFT JOIN warehouses w ON m.warehouse_id = w.id`;
   const conds: string[] = [];
   const params: unknown[] = [];
@@ -227,15 +230,101 @@ api.get("/api/stock/records", requireLogin, async (c) => {
   return c.json(await q(c.env.DB, sql, ...params));
 });
 
-// ---------------- 立创抓取 / 文件类：云端暂不支持（阶段1 占位） ----------------
-api.get("/api/lcsc/search", requireLogin, (c) => c.json(NOT_SUPPORTED, 501));
-api.get("/api/lcsc/detail", requireLogin, (c) => c.json(NOT_SUPPORTED, 501));
-api.post("/api/materials/:id/fetch_datasheet", requireLogin, (c) => c.json(NOT_SUPPORTED, 501));
-api.post("/api/materials/:id/fetch_image", requireLogin, (c) => c.json(NOT_SUPPORTED, 501));
-api.get("/api/materials/:id/image", requireLogin, (c) => c.json({ error: "无图片" }, 404));
+// ---------------- 立创抓取（存外链模式：元数据+URL 入库，文件本体留在立创 CDN） ----------------
+
+/** 立创搜索：C 编号直查详情；关键字走 Bing 反查（海外出口对 lcsc.com 友好，中文站尽力而为） */
+api.get("/api/lcsc/search", requireLogin, async (c) => {
+  const kw = (c.req.query("q") ?? "").trim();
+  if (!kw) return c.json([]);
+  const r = await searchLcsc(kw);
+  if (!r.length) {
+    return c.json({ error: "未搜到结果（可能被风控或网络受限），建议直接用立创C编号（形如 C621395）重试" }, 404);
+  }
+  return c.json(r);
+});
+
+/** 立创详情：按 C 编号抓完整参数（搜索结果选中后调用） */
+api.get("/api/lcsc/detail", requireLogin, async (c) => {
+  const code = (c.req.query("code") ?? "").trim();
+  const r = await fetchDetail(code);
+  if (!r.length) return c.json({ error: "未获取到详情（编号可能无效或网络受限），请稍后重试" }, 404);
+  return c.json(r);
+});
+
+/** 按物料编码自动抓手册：只登记立创 PDF 直链（file_path 存外链），不下载文件本体 */
+api.post("/api/materials/:id/fetch_datasheet", requireLogin, async (c) => {
+  const mid = Number(c.req.param("id"));
+  const rows = await q<{ code: string }>(c.env.DB, "SELECT code FROM materials WHERE id=?", mid);
+  if (!rows.length) return c.json({ error: "物料不存在" }, 404);
+  const code = (rows[0].code ?? "").trim();
+  if (!/^C\d+$/i.test(code)) {
+    return c.json({ error: `编码「${code}」不是立创C编号（形如 C621395），无法自动获取` }, 400);
+  }
+  const detail = await fetchDetail(code);
+  if (!detail.length) return c.json({ error: "未获取到立创详情（编号可能无效或网络受限），请稍后重试" }, 404);
+  const url = detail[0].datasheet_url;
+  if (!url) return c.json({ error: "立创未提供该物料的手册PDF" }, 404);
+  // 按外链查重（同一 PDF 不重复登记）
+  const exists = await q(
+    c.env.DB, "SELECT id FROM material_documents WHERE material_id=? AND doc_type='datasheet' AND file_path=?", mid, url);
+  if (exists.length) return c.json({ ok: true, file_name: "datasheet.pdf", note: "手册已存在" });
+  const stem = (url.match(/\/([0-9a-fA-F]{16,})\.pdf/) ?? [])[1] ?? "datasheet";
+  await c.env.DB.prepare(
+    "INSERT INTO material_documents(material_id, doc_type, file_path, file_name) VALUES (?,?,?,?)")
+    .bind(mid, "datasheet", url, `${stem}.pdf`).run();
+  return c.json({ ok: true, file_name: `${stem}.pdf` });
+});
+
+/** 按物料编码自动抓图片：外链 URL 写入 image_path 列（有值即认为已存在） */
+api.post("/api/materials/:id/fetch_image", requireLogin, async (c) => {
+  const mid = Number(c.req.param("id"));
+  const rows = await q<{ code: string; image_path: string | null }>(
+    c.env.DB, "SELECT code, image_path FROM materials WHERE id=?", mid);
+  if (!rows.length) return c.json({ error: "物料不存在" }, 404);
+  const code = (rows[0].code ?? "").trim();
+  if (!/^C\d+$/i.test(code)) return c.json({ error: "该物料没有立创C编号，无法获取图片" }, 400);
+  if (rows[0].image_path) return c.json({ ok: true, note: "图片已存在" });
+  const detail = await fetchDetail(code);
+  if (!detail.length) return c.json({ error: "未获取到立创详情（编号可能无效或网络受限），请稍后重试" }, 404);
+  let img = detail[0].image ?? "";
+  if (!img) return c.json({ error: "立创未提供该物料的图片" }, 404);
+  if (img.startsWith("//")) img = "https:" + img; // 协议相对地址补全
+  await c.env.DB.prepare("UPDATE materials SET image_path=? WHERE id=?").bind(img, mid).run();
+  return c.json({ ok: true });
+});
+
+// ---------------- 文件访问 / 手动上传 ----------------
+
+/** 物料图片：image_path 为外链时 302 跳转到立创 CDN（前端 <img> 零改动兼容） */
+api.get("/api/materials/:id/image", requireLogin, async (c) => {
+  const mid = Number(c.req.param("id"));
+  const rows = await q<{ image_path: string | null }>(
+    c.env.DB, "SELECT image_path FROM materials WHERE id=?", mid);
+  const p = rows[0]?.image_path;
+  if (p && /^https?:\/\//.test(p)) return c.redirect(p, 302);
+  return c.json({ error: "无图片" }, 404);
+});
+
+/** 手动上传文件：需 R2 存储（阶段2），暂不支持 */
 api.post("/api/materials/:id/documents", requireLogin, (c) => c.json(NOT_SUPPORTED, 501));
-api.get("/api/documents/:id", requireLogin, (c) => c.json({ error: "文件不存在" }, 404));
-api.delete("/api/documents/:id", requireLogin, (c) => c.json({ error: "记录不存在" }, 404));
+
+/** 手册/文档：file_path 为外链时 302 跳转（浏览器直接打开立创 CDN 的 PDF） */
+api.get("/api/documents/:id", requireLogin, async (c) => {
+  const id = Number(c.req.param("id"));
+  const rows = await q<{ file_path: string | null }>(
+    c.env.DB, "SELECT file_path FROM material_documents WHERE id=?", id);
+  const p = rows[0]?.file_path;
+  if (p && /^https?:\/\//.test(p)) return c.redirect(p, 302);
+  return c.json({ error: "文件不存在" }, 404);
+});
+
+/** 删除手册登记（外链模式下只删记录，无文件需清理） */
+api.delete("/api/documents/:id", requireLogin, async (c) => {
+  const id = Number(c.req.param("id"));
+  const r = await c.env.DB.prepare("DELETE FROM material_documents WHERE id=?").bind(id).run();
+  if ((r.meta.changes ?? 0) === 0) return c.json({ error: "记录不存在" }, 404);
+  return c.json({ ok: true });
+});
 
 // 在线更新接口：云端由 git push 自动部署取代
 const UPDATE_DEPRECATED = { error: "云端版无需在线更新：git push 到 master 分支后 Cloudflare 自动重新部署" };
