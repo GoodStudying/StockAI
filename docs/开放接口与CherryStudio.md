@@ -91,13 +91,22 @@ curl -H "Authorization: Bearer $TOKEN" \
 按 **编码 / 型号 / 名称** 三个维度分组，列出所有出现 ≥2 次的物料组（含每条记录的
 id、数量、所在仓库），供人工确认后去重。
 
+### 7. 新建仓库 `POST /api/v1/warehouses`
+
+```json
+{"name": "原材料库", "parent_id": 3}
+```
+
+`parent_id` 可选（缺省建一级库），仓库树最深 4 级。返回：
+`{"ok": true, "id": 5, "name": "原材料库", "parent_id": 3, "level": 2}`
+
 ---
 
 ## 三、Cherry Studio 通过 MCP 对接（推荐）
 
 项目根目录已自带 MCP 服务器 [mcp_server.py](../mcp_server.py)，把上述接口包装成
-6 个对话工具：`search_materials` / `stock_in` / `stock_out` / `get_stock_records` /
-`check_bom` / `find_duplicates`。
+7 个对话工具：`search_materials` / `stock_in` / `stock_out` / `get_stock_records` /
+`check_bom` / `find_duplicates` / `create_warehouse`。
 
 ### 配置步骤
 
@@ -126,6 +135,7 @@ id、数量、所在仓库），供人工确认后去重。
 
 - 「查一下库存里有没有 STM32F103，还剩多少」
 - 「帮我把 C621395 出库 5 个，备注给样板组」
+- 「建三个仓库：原材料库、半成品库、成品库」
 - 「核对这份 BOM：STM32F103C8T6 x2、0603 电容 100nF x20、AMS1117-3.3 x4」
   → AI 会调用 check_bom，逐行告诉你 缺几个 / 没入库 / 有歧义
 - 「帮我查一下有没有重复录入的物料」

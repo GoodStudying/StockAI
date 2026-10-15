@@ -39,6 +39,7 @@ function renderNav(active) {
   const pages = [
     ['/', '物料管理', '◈'],
     ['/stock.html', '出入库', '⇅'],
+    ['/bom.html', 'BOM 分析', '≣'],
     ['/chat.html', 'AI 助手', '✦'],
     ['/purchase.html', '采购清单', '⇫'],
     ['/warehouses.html', '仓库管理', '▤'],

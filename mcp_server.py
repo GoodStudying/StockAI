@@ -122,6 +122,17 @@ def find_duplicates() -> str:
     return _d(_call("GET", "/api/v1/duplicates"))
 
 
+@mcp.tool()
+def create_warehouse(name: str, parent_id: int = 0) -> str:
+    """新建仓库节点。name=仓库名（必填）；parent_id=父仓库 id（0 或不传=建一级库）。
+    仓库树最深 4 级。建子库前先确认父级 id（可通过对话让用户从仓库列表中选择）。
+    ⚠ 写操作：执行前向用户复述将创建的仓库名与层级，征得确认后再调用。"""
+    body = {"name": name}
+    if parent_id:
+        body["parent_id"] = parent_id
+    return _d(_call("POST", "/api/v1/warehouses", body=body))
+
+
 if __name__ == "__main__":
     # stdio 模式运行（Cherry Studio 等客户端通过标准输入输出与之通信）
     if not TOKEN:

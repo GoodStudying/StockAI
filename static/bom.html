@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BOM 分析 - 个人ERP</title>
+<script src="/common.js"></script>
+<script>
+/* 尽早应用主题，防止刷新时闪回默认配色 */
+(function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
+</script>
+<link rel="stylesheet" href="/style.css">
+<style>
+  .drop{border:2px dashed var(--line-2);border-radius:12px;padding:26px;text-align:center;cursor:pointer;transition:.15s}
+  .drop.on{border-color:var(--accent);background:var(--accent-soft)}
+  .sums{display:flex;gap:12px;flex-wrap:wrap;margin:14px 0}
+  .sum{flex:1;min-width:110px;background:rgba(128,128,128,.07);border-radius:10px;padding:10px 14px}
+  .sum b{display:block;font-size:22px}
+  .tag{display:inline-block;padding:1px 8px;border-radius:8px;font-size:12px}
+  .t-ok{background:var(--green-soft);color:var(--green)}
+  .t-short{background:var(--accent-soft);color:var(--accent-deep)}
+  .t-none{background:var(--red-soft);color:var(--red)}
+</style>
+</head>
+<body>
+<div class="layout">
+<div id="nav-mount"><script>/* 解析到即注入，侧栏随首帧出现 */document.currentScript.parentElement.innerHTML = renderNav('/bom.html');</script></div>
+<main>
+  <div class="page-head">
+    <h1>BOM 分析</h1>
+    <span class="sub">上传 BOM 表格，自动匹配库存、找缺口、一键导入采购清单</span>
+  </div>
+
+  <div class="panel">
+    <h3 class="pt">上传 BOM（.xlsx / .xlsm / .csv）</h3>
+    <div class="drop" id="drop" onclick="document.getElementById('bom-file').click()">
+      <div style="font-size:30px">⇪</div>
+      点击选择文件，或把文件拖到这里<br>
+      <small>自动识别「立创编号 / 型号 / 数量 / 封装 / 位号」列，支持表头含这些关键词的常见 BOM 格式</small>
+    </div>
+    <input type="file" id="bom-file" accept=".xlsx,.xlsm,.csv" style="display:none" onchange="pickFile(this)">
+    <div class="toolbar" style="margin-top:12px">
+      <button id="go-btn" onclick="doAnalyze()" disabled>开始分析</button>
+      <button class="gray" onclick="exportNeedBuy()" id="buy-btn" style="display:none">下载缺料清单（CSV）</button>
+      <button class="gray" onclick="importPurchase()" id="import-btn" style="display:none">导入采购清单</button>
+      <input type="text" id="project-name" placeholder="项目名（导入采购清单用）" style="display:none;width:200px">
+      <label style="font-size:13px;color:var(--ink-3);display:flex;align-items:center;gap:4px">
+        <input type="checkbox" id="use-ai" checked> AI 智能匹配（未匹配行交 AI 判断并推荐可替代库存，较慢）
+      </label>
+      <span id="file-name" style="color:var(--ink-3);font-size:13px"></span>
+    </div>
+    <div id="colmap" style="margin-top:8px;color:var(--ink-3);font-size:13px"></div>
+  </div>
+
+  <div class="panel" id="result-panel" style="display:none">
+    <h3 class="pt">分析结果</h3>
+    <div class="sums" id="sums"></div>
+    <div class="table-wrap">
+    <table>
+      <thead><tr><th>状态</th><th>匹配方式</th><th>编码</th><th>名称 / 型号</th><th>需求</th><th>库存</th><th>缺口</th><th>位号</th><th>可替代库存</th></tr></thead>
+      <tbody id="bom-body"></tbody>
+    </table>
+    </div>
+  </div>
+</main>
+</div>
+
+<script>
+let bomFile = null, lastResult = null, analyzing = false;
+
+async function init() {
+  const user = await checkLogin();
+  if (!user) return;
+}
+
+function pickFile(input) { if (input.files[0]) setFile(input.files[0]); }
+
+function setFile(f) {
+  if (!/\.(xlsx|xlsm|csv)$/i.test(f.name)) { alert('仅支持 .xlsx / .xlsm / .csv 文件'); return; }
+  bomFile = f;
+  document.getElementById('file-name').textContent = '已选择：' + f.name + '（' + (f.size/1024).toFixed(0) + ' KB）';
+  document.getElementById('go-btn').disabled = false;
+}
+
+/* 拖拽 */
+const drop = document.getElementById('drop');
+['dragover','dragenter'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('on'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('on'); }));
+drop.addEventListener('drop', e => { const f = e.dataTransfer.files[0]; if (f) setFile(f); });
+
+async function doAnalyze() {
+  if (!bomFile || analyzing) return;
+  analyzing = true;
+  const btn = document.getElementById('go-btn');
+  btn.disabled = true; btn.textContent = '分析中...';
+  try {
+    const fd = new FormData();
+    fd.append('file', bomFile);
+    fd.append('use_ai', document.getElementById('use-ai').checked ? '1' : '0');
+    const r = await fetch('/api/bom/analyze', {method: 'POST', body: fd, credentials: 'same-origin'});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    lastResult = d;
+    render(d);
+  } catch (e) {
+    alert('分析失败：' + e.message);
+  } finally {
+    analyzing = false;
+    btn.disabled = false; btn.textContent = '开始分析';
+  }
+}
+
+function render(d) {
+  const CM = {lcsc: '立创编号', model: '型号', qty: '数量', pkg: '封装', ref: '位号'};
+  document.getElementById('colmap').textContent =
+    '识别列：' + Object.entries(d.columns || {}).map(([k, v]) => CM[k] + '=第' + (v + 1) + '列').join('，') +
+    '（表头按关键词自动识别）' + (d.ai_used ? '；本次 AI 智能匹配参与了判断/推荐' : '');
+  const s = d.summary;
+  document.getElementById('sums').innerHTML =
+    `<div class="sum"><b>${s.total}</b>物料行</div>` +
+    `<div class="sum"><b style="color:var(--green)">${s.enough}</b>库存充足</div>` +
+    `<div class="sum"><b style="color:var(--accent-deep)">${s.shortage}</b>库存缺口</div>` +
+    `<div class="sum"><b style="color:var(--red)">${s.unmatched}</b>未建档</div>`;
+
+  const tb = document.getElementById('bom-body');
+  tb.innerHTML = '';
+  for (const it of d.items) {
+    const tr = document.createElement('tr');
+    const tag = it.matched
+      ? (it.enough ? '<span class="tag t-ok">库存足够</span>' : `<span class="tag t-short">缺口 ${it.shortage}</span>`)
+      : '<span class="tag t-none">未建档</span>';
+    const altsHtml = (it.alts || []).map(a =>
+      `<div style="font-size:12px;line-height:1.5">↪ ${esc(a.name)} <span class="tag t-ok">${esc(a.code)}</span> 库存${a.stock}` +
+      (a.reason ? `<br><span style="color:var(--ink-3)">${esc(a.reason)}</span>` : '') + `</div>`).join('');
+    tr.innerHTML = `<td>${tag}</td><td>${esc(it.how)}</td>` +
+      `<td>${esc(it.code || '—')}</td>` +
+      `<td>${esc(it.name || '')}${it.name ? ' / ' : ''}${esc(it.model || '')}</td>` +
+      `<td>${it.need}</td><td>${it.stock === null ? '—' : it.stock}</td>` +
+      `<td>${it.shortage || '—'}</td><td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(it.refs || '')}</td>` +
+      `<td>${altsHtml || '—'}</td>`;
+    tb.appendChild(tr);
+  }
+  document.getElementById('result-panel').style.display = '';
+  const hasBuy = d.need_buy.length > 0;
+  document.getElementById('buy-btn').style.display = hasBuy ? '' : 'none';
+  document.getElementById('import-btn').style.display = hasBuy ? '' : 'none';
+  document.getElementById('project-name').style.display = hasBuy ? '' : 'none';
+}
+
+function exportNeedBuy() {
+  if (!lastResult || !lastResult.need_buy.length) return;
+  let csv = '﻿编码,型号,建议购买数量,原因,可替代库存物料\n';
+  for (const n of lastResult.need_buy) {
+    const alts = (n.alts || []).map(a => `${a.name}(${a.code},库存${a.stock})`).join('；');
+    csv += `"${(n.code || '').replace(/"/g, '""')}","${(n.model || '').replace(/"/g, '""')}",${n.qty},"${n.reason}","${alts.replace(/"/g, '""')}"\n`;
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([csv], {type: 'text/csv'}));
+  a.download = '缺料清单.csv';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* 缺料一键导入采购清单（复用 /api/purchase/items 批量接口，同项目同料自动合并） */
+async function importPurchase() {
+  if (!lastResult || !lastResult.need_buy.length) return;
+  const project = document.getElementById('project-name').value.trim();
+  if (!project) { alert('请先填写项目名'); document.getElementById('project-name').focus(); return; }
+  const items = lastResult.need_buy.map(n => ({
+    name: n.name || n.model || n.code || '未命名物料',
+    code: n.code || undefined,
+    model: n.model || undefined,
+    need_qty: n.qty,
+    remark: n.reason,
+  }));
+  if (!confirm(`把 ${items.length} 条缺料导入项目「${project}」的采购清单？`)) return;
+  try {
+    const r = await api('/api/purchase/items', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project, items }),
+    });
+    alert(`导入完成：新建 ${r.created} 项，合并累加 ${r.merged} 项`);
+  } catch (e) { /* 错误已 alert */ }
+}
+
+init();
+</script>
+</body>
+</html>

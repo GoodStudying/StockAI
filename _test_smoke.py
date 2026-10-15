@@ -484,6 +484,75 @@ d = c.post("/api/bom/check", json={"items": [{"name": "AI测试不存在物料�
                                    "use_ai": True}).get_json()
 check("AI未配置时不影响规则核对", d["summary"]["not_found"] == 1)
 
+# ---------- 16. 新建仓库：AI 卡片 / /api/v1 / 层级防御 ----------
+print("[16] 新建仓库（AI 工具 + 开放接口）")
+# 15 段结尾把 api_key 清空了（"!"），这里配回才能走对话
+c.post("/api/ai/config", json={"base_url": "https://api.fake/v1", "model": "fake",
+                               "api_key": "sk-fake"})
+app_module._llm_chat = scripted_llm([
+    ("", [("create_warehouse", {"name": "AI原材料库"})]),
+    "已生成仓库卡片，请确认。",
+])
+r = c.post("/api/chat", json={"message": "建个原材料库"})
+d = r.get_json()
+check("create_warehouse 生成1张卡片", len(d["actions"]) == 1, str(d["actions"]))
+a_ok = d["actions"][0]
+check("一级库卡片标题", "AI原材料库" in a_ok["title"] and "1 级" in a_ok["title"], a_ok["title"])
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "action_id": a_ok["id"]})
+check("确认建库成功", r.status_code == 200 and r.get_json()["action"]["status"] == "executed")
+row = dbm.query("SELECT name, level FROM warehouses WHERE name='AI原材料库'")
+check("仓库已落库(1级)", len(row) == 1 and row[0]["level"] == 1, str(row))
+
+# 卡片构建阶段预校验：父级不存在 → 不生成卡片，模型收到 error 自纠
+app_module._llm_chat = scripted_llm([
+    ("", [("create_warehouse", {"name": "AI子库", "parent_id": 9999})]),
+    "父级库不存在，已告知用户。",
+])
+r = c.post("/api/chat", json={"message": "建个子库"})
+check("坏父级不生成卡片", r.get_json()["actions"] == [])
+# 但是 execute 阶段失败路径也要覆盖：直接构造 pending 卡片执行（模拟旧卡片/并发边界）
+app_module._llm_chat = scripted_llm([
+    ("", [("create_warehouse", {"name": "AI孤儿库", "parent_id": 9999})]),
+    "已生成卡片。",
+])
+r = c.post("/api/chat", json={"message": "再建个子库"})
+# 上面这条同样被预校验拦（无卡片），所以改用 v1 验证失败响应：
+r = c.post("/api/v1/warehouses", json={"name": "API孤儿库", "parent_id": 9999}, headers=H)
+check("/api/v1 坏父级 400", r.status_code == 400)
+
+# 层级上限：现场搭一条 1→4 级链，第5级两端都要拒（核心逻辑共享）
+pid = None
+for nm in ("级限A", "级限B", "级限C", "级限D"):
+    body = {"name": nm}
+    if pid:
+        body["parent_id"] = pid
+    pid = c.post("/api/warehouses", json=body).get_json()["id"]
+r = c.post("/api/warehouses", json={"name": "级限E", "parent_id": pid})
+check("网页端超层级被拒", r.status_code == 400)
+r = c.post("/api/v1/warehouses", json={"name": "级限E", "parent_id": pid}, headers=H)
+check("/api/v1 超层级被拒", r.status_code == 400)
+
+# /api/v1 正常建库
+n_before = dbm.query("SELECT COUNT(*) AS n FROM warehouses")[0]["n"]
+r = c.post("/api/v1/warehouses", json={"name": "API直建库"}, headers=H)
+check("/api/v1 建库 201", r.status_code == 201 and r.get_json()["level"] == 1,
+      r.get_data(as_text=True)[:120])
+r = c.post("/api/v1/warehouses", json={"name": ""}, headers=H)
+check("/api/v1 空库名 400", r.status_code == 400)
+n_after = dbm.query("SELECT COUNT(*) AS n FROM warehouses")[0]["n"]
+check("建库数量+1", n_after == n_before + 1)
+
+# 静态资源缓存头
+r = c.get("/common.js")
+check("js 带60s缓存头", "max-age=60" in r.headers.get("Cache-Control", ""),
+      r.headers.get("Cache-Control"))
+r = c.get("/chat.html")
+check("html 不缓存", "no-cache" in r.headers.get("Cache-Control", ""),
+      r.headers.get("Cache-Control"))
+
+app_module._llm_chat = real_llm
+
+
 # ---------- 清理 ----------
 for suffix in ("", "-journal", "-wal", "-shm"):
     p = TEST_DB + suffix

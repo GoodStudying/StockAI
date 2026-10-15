@@ -9,6 +9,7 @@
 import os
 import re
 import io
+import csv
 import json
 import time
 import hmac
@@ -16,6 +17,8 @@ import base64
 import hashlib
 import secrets
 import threading
+import zipfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from functools import wraps
 import requests as http_req
@@ -406,6 +409,19 @@ def index():
     return send_from_directory("static", "index.html")
 
 
+@app.after_request
+def _cache_headers(resp):
+    """静态资源缓存策略：css/js 短缓存（60s），侧栏切换不再每次回源发条件请求
+    （NAS/Cloudflare 隧道的 RTT 是栏目切换'卡'的主因之一）；HTML 不缓存保证发版即生效。
+    一键更新后最长 60 秒内自然收敛，个人 ERP 可接受。"""
+    p = request.path
+    if p.endswith((".css", ".js")):
+        resp.headers["Cache-Control"] = "max-age=60, must-revalidate"
+    elif p.endswith(".html") or p == "/":
+        resp.headers["Cache-Control"] = "no-cache"
+    return resp
+
+
 # ---------------- 仓库管理 ----------------
 def _descendant_ids(wid):
     """递归收集仓库及全部子孙库 id 列表"""
@@ -429,28 +445,36 @@ def list_warehouses():
     return jsonify(rows)
 
 
+def _warehouse_create_core(name, parent_id):
+    """新建仓库核心（网页端 / AI 卡片 / /api/v1 共用）。
+    返回 (结果dict, err)；err 非 None 时结果dict为 {"error": err} 并带建议状态码 hint。"""
+    name = (name or "").strip()
+    if not name:
+        return None, "库名不能为空"
+    if parent_id:
+        rows = db.query("SELECT level FROM warehouses WHERE id=?", (parent_id,))
+        if not rows:
+            return None, f"父级库 #{parent_id} 不存在（用 list_warehouses 查现有仓库 id）"
+        level = rows[0]["level"] + 1
+    else:
+        level = 1
+    if level > MAX_WAREHOUSE_LEVEL:
+        return None, f"最多支持 {MAX_WAREHOUSE_LEVEL} 级库（父级已是 {MAX_WAREHOUSE_LEVEL} 级）"
+    last_id, _ = db.execute_write(
+        "INSERT INTO warehouses(name, parent_id, level) VALUES (?,?,?)",
+        (name, parent_id, level))
+    return {"id": last_id, "name": name, "parent_id": parent_id, "level": level}, None
+
+
 @app.route("/api/warehouses", methods=["POST"])
 @login_required
 def create_warehouse():
     """新建仓库节点，1~4级"""
     d = request.get_json(force=True)
-    name = (d.get("name") or "").strip()
-    parent_id = d.get("parent_id")
-    if not name:
-        return jsonify({"error": "库名不能为空"}), 400
-    if parent_id:
-        rows = db.query("SELECT level FROM warehouses WHERE id=?", (parent_id,))
-        if not rows:
-            return jsonify({"error": "父级库不存在"}), 404
-        level = rows[0]["level"] + 1
-    else:
-        level = 1
-    if level > MAX_WAREHOUSE_LEVEL:
-        return jsonify({"error": f"最多支持 {MAX_WAREHOUSE_LEVEL} 级库"}), 400
-    last_id, _ = db.execute_write(
-        "INSERT INTO warehouses(name, parent_id, level) VALUES (?,?,?)",
-        (name, parent_id, level))
-    return jsonify({"id": last_id, "name": name, "parent_id": parent_id, "level": level}), 201
+    row, err = _warehouse_create_core(d.get("name"), d.get("parent_id"))
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify(row), 201
 
 
 @app.route("/api/warehouses/<int:wid>", methods=["PUT"])
@@ -904,6 +928,17 @@ def v1_bom_check():
     if summary is None:
         return jsonify({"error": results}), 400
     return jsonify({"summary": summary, "results": results})
+
+
+@app.route("/api/v1/warehouses", methods=["POST"])
+@token_required
+def v1_create_warehouse():
+    """程序化新建仓库（MCP / Cherry Studio 用）。body: {name, parent_id?}，与网页端同一核心。"""
+    d = request.get_json(force=True)
+    row, err = _warehouse_create_core(d.get("name"), d.get("parent_id"))
+    if err:
+        return jsonify({"error": err}), 400
+    return jsonify({"ok": True, **row}), 201
 
 
 @app.route("/api/v1/duplicates", methods=["GET"])
@@ -1600,6 +1635,233 @@ def bom_check_web():
     return jsonify({"summary": summary, "results": results})
 
 
+# ---------------- BOM 文件解析（xlsx / csv，纯标准库，移植自参考实现） ----------------
+
+_BOM_NUM_RE = re.compile(r'^\d+(\.\d+)?$')
+_BOM_LCSC_RE = re.compile(r'^[Cc]\d{4,}$')
+_BOM_XLSX_NS = '{http://schemas.openxmlformats.org/spreadsheetml/2006/main}'
+
+_BOM_HINTS = {
+    'lcsc': ['立创', 'lcsc'],
+    'model': ['型号', '规格', '值', 'value', 'comment', 'description', '名称', '器件', '参数'],
+    'qty': ['数量', 'qty', 'quantity', '用量', '个数'],
+    'pkg': ['封装', 'package', 'footprint'],
+    'ref': ['位号', 'reference', 'designator'],
+}
+
+
+def _bom_col_letter_to_idx(ref):
+    """Excel 单元格引用 'B12' -> 列索引 1"""
+    s = ''.join(ch for ch in ref if ch.isalpha())
+    n = 0
+    for ch in s:
+        n = n * 26 + (ord(ch.upper()) - 64)
+    return n - 1
+
+
+def _bom_parse_xlsx(data: bytes):
+    """极简 xlsx 读取：返回首个工作表的二维表（单元格已字符串化）。无需 openpyxl。"""
+    z = zipfile.ZipFile(io.BytesIO(data))
+    shared = []
+    if 'xl/sharedStrings.xml' in z.namelist():
+        root = ET.fromstring(z.read('xl/sharedStrings.xml'))
+        for si in root.findall(_BOM_XLSX_NS + 'si'):
+            shared.append(''.join(t.text or '' for t in si.iter(_BOM_XLSX_NS + 't')))
+    sheet = next((n for n in z.namelist() if n.startswith('xl/worksheets/sheet')), None)
+    if not sheet:
+        raise ValueError('xlsx 中没有工作表')
+    root = ET.fromstring(z.read(sheet))
+    rows = []
+    for row in root.iter(_BOM_XLSX_NS + 'row'):
+        cells = {}
+        for c in row:
+            ref = c.get('r', '')
+            idx = _bom_col_letter_to_idx(ref) if ref else max(cells) + 1 if cells else 0
+            t = c.get('t')
+            v = c.find(_BOM_XLSX_NS + 'v')
+            val = ''
+            if t == 's' and v is not None and v.text and v.text.isdigit():
+                val = shared[int(v.text)] if int(v.text) < len(shared) else ''
+            elif t == 'inlineStr':
+                is_el = c.find(_BOM_XLSX_NS + 'is')
+                val = ''.join(x.text or '' for x in is_el.iter(_BOM_XLSX_NS + 't')) if is_el is not None else ''
+            elif v is not None:
+                val = v.text or ''
+            cells[idx] = val.strip()
+        if cells:
+            width = max(cells) + 1
+            rows.append([cells.get(i, '') for i in range(width)])
+    return rows
+
+
+def _bom_parse_csv(data: bytes):
+    text = None
+    for enc in ('utf-8-sig', 'gb18030'):
+        try:
+            text = data.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        text = data.decode('utf-8', errors='replace')
+    for sep in (',', '\t', ';'):
+        if text.count(sep) >= text.count('\n'):
+            break
+    return [r for r in csv.reader(io.StringIO(text), delimiter=sep)]
+
+
+def _bom_detect_columns(header, sample_rows):
+    """表头列自动识别：先按关键词，数量/立创列再按数据形态兜底。"""
+    col = {}
+    for i, h in enumerate(header):
+        hl = str(h).strip().lower()
+        for key, hints in _BOM_HINTS.items():
+            if key in col:
+                continue
+            if any(x in hl for x in hints):
+                col[key] = i
+    if 'qty' not in col and sample_rows:
+        for i in range(len(header)):
+            vals = [r[i] for r in sample_rows if i < len(r) and r[i] != '']
+            if vals and len(vals) >= 2 and all(_BOM_NUM_RE.match(v) for v in vals):
+                col['qty'] = i
+                break
+    if 'lcsc' not in col and sample_rows:
+        for i in range(len(header)):
+            vals = [r[i] for r in sample_rows if i < len(r) and r[i] != '']
+            if vals and sum(1 for v in vals if _BOM_LCSC_RE.match(v)) >= max(1, len(vals) // 2):
+                col['lcsc'] = i
+                break
+    return col
+
+
+@app.route("/api/bom/analyze", methods=["POST"])
+@login_required
+def bom_analyze():
+    """
+    上传 BOM 文件（.xlsx/.csv）→ 解析 → 聚合 → 库存核对（可选 AI 智能匹配）。
+    multipart 表单：file（必填）、use_ai（'1'/'0'，默认 '1'）。
+    返回结构对齐前端 bom.html：columns / ai_used / summary / items / need_buy。
+    """
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "请选择要上传的 BOM 文件"}), 400
+    data = f.read()
+    if not data:
+        return jsonify({"error": "文件内容为空"}), 400
+    if len(data) > 10 * 1024 * 1024:
+        return jsonify({"error": "文件过大（上限 10MB）"}), 400
+    fname = f.filename.lower()
+    try:
+        if fname.endswith((".xlsx", ".xlsm")):
+            rows = _bom_parse_xlsx(data)
+        elif fname.endswith(".csv"):
+            rows = _bom_parse_csv(data)
+        else:
+            return jsonify({"error": "仅支持 .xlsx / .xlsm / .csv 文件"}), 400
+    except (zipfile.BadZipFile, ET.ParseError, ValueError) as e:
+        return jsonify({"error": f"文件解析失败：{e}"}), 400
+    if not rows:
+        return jsonify({"error": "表格为空"}), 400
+
+    header, body = list(rows[0]), [list(r) for r in rows[1:]]
+    body = [r for r in body if any(str(c).strip() for c in r)]
+    if not body:
+        return jsonify({"error": "没有数据行"}), 400
+    colmap = _bom_detect_columns(header, body[:30])
+    if 'model' not in colmap and 'lcsc' not in colmap:
+        return jsonify({"error": "未能识别列：表头需包含「型号/规格/值」或「立创编号」"}), 400
+
+    def cell(r, k):
+        i = colmap.get(k)
+        return str(r[i]).strip() if i is not None and i < len(r) else ''
+
+    # 按 编码|型号 聚合（同料多位号合并需求、收集位号/封装），避免核对/采购碎片化
+    groups, order = {}, []
+    for r in body:
+        lcsc, model = cell(r, 'lcsc'), cell(r, 'model')
+        if not lcsc and not model:
+            continue
+        try:
+            need = int(float(cell(r, 'qty'))) if cell(r, 'qty') else 1
+        except ValueError:
+            need = 1
+        need = max(1, need)
+        key = (lcsc or model).upper()
+        g = groups.get(key)
+        if not g:
+            g = groups[key] = {"code": lcsc, "model": model, "need": 0,
+                               "refs": [], "pkg": cell(r, 'pkg')}
+            order.append(g)
+        g["need"] += need
+        ref = cell(r, 'ref')
+        if ref:
+            g["refs"].append(ref)
+    if not order:
+        return jsonify({"error": "没有可核对的物料行（需包含立创编号或型号列）"}), 400
+    if len(order) > 500:
+        return jsonify({"error": "单次最多核对 500 行（按编号/型号聚合后）"}), 400
+
+    items = [{"code": g["code"], "model": g["model"], "quantity": g["need"]} for g in order]
+    summary, results = _bom_check_core(items)
+    if summary is None:
+        return jsonify({"error": results}), 400
+    use_ai = request.form.get("use_ai", "1") not in ("0", "false")
+    if use_ai:
+        _bom_ai_enhance(results, summary)
+
+    # 核对结果 → 前端行结构（matched/how/need/stock/shortage/refs/alts）
+    HOW = {"code": "编号", "model": "型号", "name": "名称", "name_fuzzy": "模糊", "ai": "AI"}
+    out_items, need_buy = [], []
+    for row, g in zip(results, order):
+        refs = ",".join(g["refs"][:20])
+        pkg = g["pkg"]
+        inp = row.get("input") or {}
+        mat = row.get("material")
+        status = row.get("status")
+        alts = row.get("alts") or []
+        if status in ("ok", "shortage"):
+            shortage = row.get("shortage") or 0
+            out_items.append({"matched": True, "name": mat["name"], "code": mat["code"] or "",
+                              "model": mat["model"] or inp.get("model") or "", "pkg": pkg,
+                              "need": row["need"], "stock": row.get("available"),
+                              "shortage": shortage, "enough": status == "ok",
+                              "how": HOW.get(row.get("matched_by"), row.get("matched_by") or ""),
+                              "refs": refs, "alts": []})
+            if shortage:
+                need_buy.append({"code": mat["code"] or "", "model": mat["model"] or "",
+                                 "name": mat["name"], "qty": shortage, "reason": "库存缺口",
+                                 "alts": []})
+        elif status == "ambiguous":
+            cands = row.get("candidates") or []
+            disp = (inp.get("model") or inp.get("code") or "未命名物料")
+            out_items.append({"matched": False, "name": "", "code": inp.get("code") or "",
+                              "model": inp.get("model") or "", "pkg": pkg, "need": row["need"],
+                              "stock": None, "shortage": row["need"], "enough": False,
+                              "how": "多候选", "refs": refs,
+                              "alts": [{"code": c.get("code") or "", "name": c.get("name") or "",
+                                        "stock": c.get("quantity") or 0, "reason": "同编码/型号多候选，需确认"}
+                                       for c in cands[:3]]})
+            need_buy.append({"code": inp.get("code") or "", "model": inp.get("model") or "",
+                             "name": disp, "qty": row["need"], "reason": "多个候选需人工确认", "alts": []})
+        else:  # not_found（聚合入口不会产生 invalid 行）
+            disp = (inp.get("model") or inp.get("code") or "未命名物料")
+            out_items.append({"matched": False, "name": "", "code": inp.get("code") or "",
+                              "model": inp.get("model") or "", "pkg": pkg, "need": row["need"],
+                              "stock": None, "shortage": row["need"], "enough": False,
+                              "how": "", "refs": refs, "alts": alts})
+            need_buy.append({"code": inp.get("code") or "", "model": inp.get("model") or "",
+                             "name": disp, "qty": row["need"],
+                             "reason": "未建档（有可替代库存）" if alts else "未建档", "alts": alts})
+
+    ai_used = use_ai and any(r.get("matched_by") == "ai" or r.get("alts") for r in results)
+    return jsonify({"columns": colmap, "total": len(out_items), "ai_used": ai_used,
+                    "summary": {"total": summary["total"], "enough": summary["ok"],
+                                "shortage": summary["shortage"],
+                                "unmatched": summary["not_found"] + summary["ambiguous"] + summary["invalid"]},
+                    "items": out_items, "need_buy": need_buy})
+
+
 # ---------------- AI 对话（OpenAI 兼容协议：Kimi / DeepSeek / GLM 等） ----------------
 
 # tool loop 双保险上限：LLM 轮次 与 工具调用总数 都封顶，防模型死循环刷调用
@@ -1627,7 +1889,7 @@ def _llm_chat(cfg, messages, tools=None):
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        r = http_req.post(url, headers=headers, json=payload, timeout=(10, 90))
+        r = http_req.post(url, headers=headers, json=payload, timeout=(10, 180))
         if r.status_code == 200:
             msg = r.json()["choices"][0]["message"]
             return msg.get("content") or "", msg.get("tool_calls") or []
@@ -1667,9 +1929,10 @@ def _system_prompt(username):
 1. 用户问"有哪些库存/库存情况/看看库存"等无关键词问题时，直接调 search_materials 不带参数列出全部，不要反问用户要关键词。
 2. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造；用户直接给了编码（如 C621395）时可跳过搜索，直接给 stock_in/stock_out 传 code。
 3. stock_in / stock_out / create_material / add_purchase_items 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
-4. 查仓库列表用 list_warehouses；查出入库历史用 stock_records；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
+4. 查仓库列表用 list_warehouses；新建仓库用 create_warehouse（写操作，生成卡片；层级最深4级，parent_id 从 list_warehouses 结果取，缺省建一级库）；查出入库历史用 stock_records；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
 5. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
 6. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
+7. 用户一次给多行/多种物料要办理时（如批量入库、整份BOM建料）：逐行连续调用对应工具，每行生成一张卡片，全部列完后一次性提醒用户逐张确认；不得以"只能一次一个""系统不支持批量"等理由拒绝或只做一部分。
 
 【电子领域常识】
 - 电容容值换算：1µF = 1000nF（0.1µF = 100nF；三位数标注 104 = 100nF、105 = 1µF）。用户给出的不同写法若等值，主动指出并确认是否同一种物料。
@@ -1679,7 +1942,7 @@ def _system_prompt(username):
 【回复风格】简体中文；简洁分点，必要时用小表格；涉及写操作的回复末尾必须提醒用户确认卡片。"""
 
 
-# 10 个工具的 OpenAI function calling 声明（只读 6 个真执行 + 写 4 个转卡片）
+# 11 个工具的 OpenAI function calling 声明（只读 6 个真执行 + 写 5 个转卡片）
 # description 写成"使用说明书"（用途+示例+前置条件），是引导模型正确调用的关键（借鉴参考实现）
 AI_TOOLS = [
     {"type": "function", "function": {
@@ -1701,6 +1964,15 @@ AI_TOOLS = [
         "name": "list_warehouses",
         "description": "列出全部仓库（id/名称/层级/父库），入库前用它确认仓库 id。",
         "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "create_warehouse",
+        "description": "新建仓库（写操作，生成待确认卡片）。仓库树最深4级；"
+                       "parent_id 填父仓库 id（用 list_warehouses 查），不填建一级库。"
+                       "用户说'建几个仓库/加个子库'时用。",
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": "仓库名称（必填）"},
+            "parent_id": {"type": "integer", "description": "父仓库 id（可选，缺省=一级库）"}},
+            "required": ["name"]}}},
     {"type": "function", "function": {
         "name": "lcsc_search",
         "description": "搜索立创商城（库存没有的物料来这里找候选），返回立创C编号/型号/品牌/封装/库存/价格。用户选定 C 编号后可用 create_material 建料并自动补全参数。",
@@ -1818,6 +2090,26 @@ def _build_action(name, args):
         if qty > 0:
             title += f"，初始库存 ×{qty}"
         base["title"] = title
+        return base, None
+    if name == "create_warehouse":
+        wname = (args.get("name") or "").strip()
+        if not wname:
+            return None, "name（仓库名）不能为空"
+        parent_id = _parse_int(args.get("parent_id") or 0, 1)
+        if args.get("parent_id") and parent_id is None:
+            return None, "parent_id 必须是正整数"
+        # 预校验父级/层级（复用核心逻辑），让卡片生成前就发现明显错误
+        if parent_id:
+            rows = db.query("SELECT level, name FROM warehouses WHERE id=?", (parent_id,))
+            if not rows:
+                return None, f"父级库 #{parent_id} 不存在，先用 list_warehouses 查现有仓库 id"
+            lvl = rows[0]["level"] + 1
+            if lvl > MAX_WAREHOUSE_LEVEL:
+                return None, f"父级「{rows[0]['name']}」已是 {MAX_WAREHOUSE_LEVEL} 级（最深），不能再建子库"
+            base["title"] = f"新建仓库：{wname}（{lvl} 级，父级「{rows[0]['name']}」）"
+        else:
+            base["title"] = f"新建仓库：{wname}（1 级）"
+        base["params"] = {"name": wname, "parent_id": parent_id}
         return base, None
     if name in ("stock_in", "stock_out"):
         qty = _parse_int(args.get("quantity"), 1)
@@ -1975,6 +2267,9 @@ def chat_send():
             # LLM 失败也落一条 assistant 消息，保证历史连续可追溯
             db.execute_write("INSERT INTO chat_messages(user_id, role, content) VALUES (?,?,?)",
                              (uid, "assistant", f"[AI调用失败] {type(e).__name__}: {e}"))
+            # 服务端留详细日志：排查超时 / HTTP 状态 / 地址配错（打码 key）
+            app.logger.warning("AI chat 失败: model=%s base=%s err=%s: %s",
+                               cfg["model"], cfg["base_url"], type(e).__name__, e)
             return jsonify({"error": f"AI 调用失败：{type(e).__name__}: {e}"}), 502
         if not tool_calls:
             break                       # 模型给出最终文本，正常出口
@@ -1994,7 +2289,12 @@ def chat_send():
                 msgs.append(_tool_msg(tc.get("id"),
                                       {"error": "已达本轮工具调用上限，请直接用现有信息回答用户"}))
                 continue
-            result, action = _run_tool(name, args, u["username"])
+            # 单个工具抛异常不许炸整轮对话：转为错误结果让模型自纠/向用户说明
+            # （借鉴参考实现：try 包住工具执行，异常 = 普通工具结果）
+            try:
+                result, action = _run_tool(name, args, u["username"])
+            except Exception as e:
+                result, action = {"error": f"{type(e).__name__}: {e}"}, None
             if action:
                 actions.append(action)
             msgs.append(_tool_msg(tc.get("id"), result))
@@ -2092,6 +2392,11 @@ def _execute_action(act, username):
         if err:
             return {"error": err}
         return {"created": created, "merged": merged}
+    if t == "create_warehouse":
+        row, err = _warehouse_create_core(p.get("name"), p.get("parent_id"))
+        if err:
+            return {"error": err}
+        return {"warehouse_id": row["id"], "name": row["name"], "level": row["level"]}
     return {"error": f"未知操作类型 {t}"}
 
 

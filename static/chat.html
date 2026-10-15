@@ -10,6 +10,47 @@
 (function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
 </script>
 <link rel="stylesheet" href="/style.css">
+<style>
+/* ===== 对话式布局：头像 + 左右分侧 + 状态 ===== */
+.msg-row { display: flex; gap: 10px; align-items: flex-start; }
+.msg-row.user { flex-direction: row-reverse; }
+.avatar { width: 32px; height: 32px; border-radius: 50%; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center; font-size: 13px; user-select: none; }
+.msg-row.user .avatar { background: var(--accent-soft); color: var(--accent-deep); font-weight: 600; }
+.msg-row.assistant .avatar { background: var(--card); border: 1px solid var(--line); }
+.msg-main { max-width: min(80%, 840px); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.msg-row.user .msg-main { align-items: flex-end; }
+.msg-row.assistant .msg-main { align-items: flex-start; }
+.msg-main .bubble { align-self: auto; }
+.msg-main .action-card { align-self: stretch; width: auto; }
+.m-meta { font-size: 11px; color: var(--ink-3); white-space: nowrap; padding: 0 4px; }
+
+/* 状态徽标：就绪 / 思考中(呼吸) / 已完成 / 已停止 / 失败 */
+.status-chip { margin-left: auto; font-size: 12px; padding: 3px 12px; border-radius: 999px;
+  border: 1px solid var(--line-2); color: var(--ink-3); display: inline-flex; align-items: center; gap: 6px; }
+.status-chip .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-3); }
+.status-chip.thinking { color: var(--accent-deep); border-color: var(--accent); }
+.status-chip.thinking .dot { background: var(--accent); animation: pulse 1s infinite; }
+.status-chip.done { color: var(--green); border-color: var(--green); }
+.status-chip.done .dot { background: var(--green); }
+.status-chip.stopped { color: var(--ink-2); }
+.status-chip.error { color: var(--red); border-color: var(--red); }
+.status-chip.error .dot { background: var(--red); }
+@keyframes pulse { 50% { opacity: .25; } }
+
+/* 发送/停止双态按钮 */
+#send-btn.stopping { background: var(--red); }
+
+/* AI 回复的 Markdown 轻渲染（表格/代码/加粗） */
+.bubble table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+.bubble th, .bubble td { border: 1px solid var(--line-2); padding: 3px 8px; text-align: left; }
+.bubble th { background: rgba(128,128,128,.08); }
+.bubble pre { background: rgba(128,128,128,.08); border-radius: 6px; padding: 8px 10px;
+  overflow-x: auto; font-size: 12px; margin: 6px 0; }
+.bubble code { font-family: Consolas, monospace; font-size: .92em;
+  background: rgba(128,128,128,.12); padding: 0 4px; border-radius: 4px; }
+.bubble pre code { background: none; padding: 0; }
+</style>
 </head>
 <body>
 <div class="layout">
@@ -18,6 +59,7 @@
   <div class="page-head">
     <h1>AI 助手</h1>
     <span class="sub">对话式出入库 / BOM 核对 / 采购管理（写操作需点击卡片确认）</span>
+    <span class="status-chip" id="status-chip"><span class="dot"></span><span id="status-text">就绪</span></span>
   </div>
 
   <div class="panel chat-layout">
@@ -28,6 +70,7 @@
         「我现在有哪些库存」<br>
         「最近出入库流水」<br>
         「入库 10 个 C621395」<br>
+        「建三个仓库：原材料库、半成品库、成品库」<br>
         「帮我核对这份 BOM：C621395 ×5，103电阻 ×20」<br>
         「把缺料加到采购清单，项目叫测试板V2」
       </div>
@@ -44,10 +87,11 @@
     <div class="chat-input">
       <textarea id="chat-input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"
         oninput="autoGrow(this)" onkeydown="onInputKey(event)"></textarea>
-      <button onclick="send()">发送</button>
+      <button id="send-btn" onclick="onSendBtn()">发送</button>
     </div>
     <div class="chat-hintbar">
       <span id="ai-status"></span>
+      <span style="color:var(--ink-3)">AI 思考期间可点「停止」中断</span>
       <a href="#" onclick="clearHistory();return false;" style="color:var(--red)">清空对话</a>
     </div>
   </div>
@@ -57,6 +101,7 @@
 <script>
 /* ==================== AI 助手页 ==================== */
 let sending = false;
+let abortCtrl = null;      // 停止用 AbortController
 let oldestId = 0;          // 已加载最早消息 id（向上翻页游标）
 const scrollEl = document.getElementById('chat-scroll');
 
@@ -70,34 +115,110 @@ function onInputKey(e) {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
 }
 
+/* ---------- 对话状态徽标 ---------- */
+const chipEl = document.getElementById('status-chip');
+const chipText = document.getElementById('status-text');
+function setStatus(state, detail) {
+  chipEl.className = 'status-chip' + (state !== 'idle' ? ' ' + state : '');
+  const map = {
+    idle: '就绪',
+    thinking: '思考中…',
+    done: '已完成' + (detail ? ' · ' + detail : ''),
+    stopped: '已停止' + (detail ? ' · ' + detail : ''),
+    error: '失败' + (detail ? ' · ' + detail : ''),
+  };
+  chipText.textContent = map[state] || '就绪';
+}
+
+/* ---------- 时间格式化 ---------- */
+function fmtTime(s) {
+  if (!s || s === '刚刚') return s || '';
+  const d = new Date(String(s).replace(' ', 'T'));
+  if (isNaN(d)) return s;
+  const p = n => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function nowTime() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return p(d.getHours()) + ':' + p(d.getMinutes());
+}
+
 /* 卡片类型中文标签 */
 const TYPE_LABEL = {
   stock_in: '入库', stock_out: '出库',
   create_material: '新建物料', add_purchase_items: '导入采购',
+  create_warehouse: '新建仓库',
 };
 
-/* 渲染一条消息：气泡 + 卡片组 */
+/* AI 回复 Markdown 轻渲染：先 esc 防注入，再支持 表格/代码块/行内代码/加粗/换行。
+   （参考实现 ai.html 的 md() 同款能力；模型爱输出小表格，纯文本显示会很难看） */
+function mdLite(src) {
+  let s = esc(src || '');
+  const codes = [];
+  s = s.replace(/```[\s\S]*?```/g, m => {
+    codes.push('<pre><code>' + m.slice(3, -3).replace(/^\n/, '') + '</code></pre>');
+    return '@@CODE' + (codes.length - 1) + '@@';
+  });
+  // 表格：连续的 | a | b | 行（可选分隔行）
+  s = s.replace(/(?:^\|.*\|$(?:\n|$))+/gm, block => {
+    const rows = block.trim().split('\n').filter(r => r.trim());
+    if (!rows.length) return block;
+    const cells = r => r.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim());
+    const isSep = r => /^\|[\s:|-]+\|$/.test(r.trim());
+    let html = '<table>';
+    rows.forEach((r, i) => {
+      if (isSep(r)) return;
+      const tag = i === 0 ? 'th' : 'td';
+      html += '<tr>' + cells(r).map(c => '<' + tag + '>' + c + '</' + tag + '>').join('') + '</tr>';
+    });
+    return html + '</table>';
+  });
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+       .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+       .replace(/^[ \t]*[-*] /gm, '· ');
+  s = s.replace(/\n{2,}/g, '<br><br>').replace(/\n/g, '<br>');
+  s = s.replace(/@@CODE(\d+)@@/g, (m, i) => codes[+i]);
+  return s;
+}
+
+/* 渲染一条消息：头像 + 气泡（左右分侧）+ 卡片组 + 时间戳 */
 function renderMsg(m, where = 'append') {
   const empty = document.getElementById('chat-empty');
   if (empty) empty.remove();
   const typing = document.getElementById('typing');
-  const div = document.createElement('div');
-  div.className = 'msg-block';
-  div.dataset.id = m.id;
+  const row = document.createElement('div');
+  row.className = 'msg-row ' + (m.role === 'user' ? 'user' : 'assistant');
+  row.dataset.id = m.id;
+
+  const avatar = document.createElement('div');
+  avatar.className = 'avatar';
+  avatar.textContent = m.role === 'user' ? '我' : '✦';
+
+  const main = document.createElement('div');
+  main.className = 'msg-main';
 
   const b = document.createElement('div');
-  b.className = 'bubble ' + (m.role === 'user' ? 'user' : 'assistant');
-  b.textContent = m.content || (m.role === 'assistant' ? '（已生成操作卡片）' : '');
-  const meta = document.createElement('span');
-  meta.className = 'meta';
-  meta.textContent = (m.created_at || '') + (m.role === 'user' ? ' · 我' : ' · AI');
-  b.appendChild(meta);
-  div.appendChild(b);
+  b.className = 'bubble';
+  if (m.role === 'user') {
+    b.textContent = m.content || '';
+  } else {
+    /* AI 消息按 Markdown 渲染（已 esc 防注入） */
+    b.innerHTML = mdLite(m.content || '（已生成操作卡片）');
+  }
+  main.appendChild(b);
 
-  (m.actions || []).forEach(a => div.appendChild(renderCard(m.id, a)));
-  if (where === 'append') scrollEl.insertBefore(div, typing);
-  else scrollEl.insertBefore(div, scrollEl.firstChild);   // prepend（历史向上加载）
-  return div;
+  (m.actions || []).forEach(a => main.appendChild(renderCard(m.id, a)));
+
+  const meta = document.createElement('div');
+  meta.className = 'm-meta';
+  meta.textContent = (m.role === 'user' ? '我' : 'AI') + ' · ' + (m.created_at ? fmtTime(m.created_at) : '');
+  main.appendChild(meta);
+
+  row.appendChild(avatar);
+  row.appendChild(main);
+  if (where === 'append') scrollEl.insertBefore(row, typing);
+  else scrollEl.insertBefore(row, scrollEl.firstChild);   // prepend（历史向上加载）
+  return row;
 }
 
 /* 渲染操作卡片（四态） */
@@ -118,6 +239,7 @@ function renderCard(msgId, a) {
     const txt = a.status === 'executed'
       ? ('✓ 已执行' + (res.quantity !== undefined ? `，现库存 ${res.quantity}` : '')
         + (res.material_id !== undefined && res.quantity === undefined ? `，物料 #${res.material_id}` : '')
+        + (res.warehouse_id !== undefined ? `，仓库「${res.name || '#' + res.warehouse_id}」（${res.level} 级）` : '')
         + (res.created !== undefined ? `，新建 ${res.created} 项 / 合并 ${res.merged} 项` : '')
         + (res.note ? `（${res.note}）` : ''))
       : a.status === 'cancelled' ? '已取消' : ('✗ 失败：' + (res.error || '未知错误'));
@@ -151,28 +273,63 @@ function quickSend(btn) {
   send();
 }
 
+/* 发送/停止双态按钮 */
+function onSendBtn() {
+  if (sending) { stopGenerating(); return; }
+  send();
+}
+function stopGenerating() {
+  if (abortCtrl) abortCtrl.abort();
+}
+
+/* 发送期间锁定输入：思考中禁止新发（可点停止中断） */
+function setSendingUI(on) {
+  const input = document.getElementById('chat-input');
+  const btn = document.getElementById('send-btn');
+  input.readOnly = on;
+  btn.textContent = on ? '停止' : '发送';
+  btn.classList.toggle('stopping', on);
+}
+
 /* 发送消息 */
 async function send() {
   const input = document.getElementById('chat-input');
   const message = input.value.trim();
   if (!message || sending) return;
   sending = true;
+  abortCtrl = new AbortController();
+  const t0 = Date.now();
   input.value = ''; autoGrow(input);
-  renderMsg({ id: 0, role: 'user', content: message, created_at: '刚刚' });
+  setSendingUI(true);
+  setStatus('thinking');
+  renderMsg({ id: 0, role: 'user', content: message, created_at: nowTime() });
   document.getElementById('typing').classList.add('on');
   scrollToBottom();
   try {
     const r = await api('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ message }),
+      signal: abortCtrl.signal,
     });
     renderMsg({ id: r.message_id, role: 'assistant', content: r.content,
-                created_at: '刚刚', actions: r.actions });
+                created_at: nowTime(), actions: r.actions });
+    setStatus('done', ((Date.now() - t0) / 1000).toFixed(1) + 's');
   } catch (e) {
-    /* 错误已 alert；失败消息也已在服务端落库，刷新可见 */
+    if (e && e.name === 'AbortError') {
+      /* 已停止：服务端可能仍在处理，本次结果不展示，刷新后可看 */
+      renderMsg({ id: 0, role: 'assistant',
+                  content: '⏹ 已停止生成。（服务端可能仍在处理本条消息，刷新页面可见完整结果。）',
+                  created_at: nowTime() });
+      setStatus('stopped', ((Date.now() - t0) / 1000).toFixed(1) + 's');
+    } else {
+      /* 错误已 alert；失败消息也已在服务端落库，刷新可见 */
+      setStatus('error', '详见提示');
+    }
   } finally {
     document.getElementById('typing').classList.remove('on');
     sending = false;
+    abortCtrl = null;
+    setSendingUI(false);
     scrollToBottom();
     input.focus();
   }
