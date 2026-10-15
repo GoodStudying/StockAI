@@ -440,6 +440,12 @@ tbody tr:last-child td { border-bottom: none; }
 
 /* 输入区 */
 .chat-input { display: flex; gap: 10px; padding: 12px 0 2px; border-top: 1px solid var(--line); }
+/* 快捷指令 chips：输入框上方一行可横滑，引导用户用对问法 */
+.quick-chips { display: flex; gap: 8px; padding: 10px 0 0; overflow-x: auto; }
+.quick-chips .chip { flex: 0 0 auto; padding: 6px 14px; border-radius: 999px; font-size: 13px;
+  background: var(--accent-soft); color: var(--accent); border: 1px solid transparent;
+  cursor: pointer; white-space: nowrap; }
+.quick-chips .chip:hover { border-color: var(--accent); }
 .chat-input textarea { flex: 1; resize: none; min-height: 46px; max-height: 150px; padding: 11px 13px;
   border: 1px solid var(--line-2); border-radius: var(--radius); background: var(--input-bg);
   color: var(--ink); font: inherit; font-size: 14px; line-height: 1.5; }

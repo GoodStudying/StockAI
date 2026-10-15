@@ -25,12 +25,21 @@
       <div class="chat-empty" id="chat-empty">
         <div class="big">✦</div>
         试试对我说：<br>
-        「查一下 100nF 电容的库存」<br>
-        「入库 10 个 C621395 到默认库」<br>
+        「我现在有哪些库存」<br>
+        「最近出入库流水」<br>
+        「入库 10 个 C621395」<br>
         「帮我核对这份 BOM：C621395 ×5，103电阻 ×20」<br>
         「把缺料加到采购清单，项目叫测试板V2」
       </div>
       <div class="typing" id="typing"><i></i><i></i><i></i></div>
+    </div>
+    <!-- 快捷指令：一键填入发送，引导用户用对问法（借鉴参考实现） -->
+    <div class="quick-chips">
+      <button class="chip" onclick="quickSend(this)">我现在有哪些库存</button>
+      <button class="chip" onclick="quickSend(this)">最近出入库流水</button>
+      <button class="chip" onclick="quickSend(this)">查一下 100nF 电容的库存</button>
+      <button class="chip" onclick="quickSend(this)">列出全部仓库</button>
+      <button class="chip" onclick="quickSend(this)">采购清单还有多少没买齐</button>
     </div>
     <div class="chat-input">
       <textarea id="chat-input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行"
@@ -133,6 +142,13 @@ async function execAction(msgId, actionId, cancel) {
     /* 失败信息已 alert；按钮恢复（库存不足保持 pending 可重试） */
     if (card) card.querySelectorAll('button').forEach(b => b.disabled = false);
   }
+}
+
+/* 快捷指令：点击直接发送 */
+function quickSend(btn) {
+  if (sending) return;
+  document.getElementById('chat-input').value = btn.textContent.trim();
+  send();
 }
 
 /* 发送消息 */

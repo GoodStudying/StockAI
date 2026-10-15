@@ -13,6 +13,7 @@ import type { AppEnv } from "./index";
 import { requireLogin, requireAdmin, getJson, parseIntSafe, nowStr, hashPassword } from "./auth";
 import { searchLcsc, fetchDetail } from "./lcsc";
 import { q, applyStock, bomCheckCore } from "./core";
+import { llmPlain } from "./ai";
 
 const api = new Hono<AppEnv>();
 
@@ -669,10 +670,88 @@ api.get("/api/purchase/projects", requireLogin, async (c) => {
 
 // ---------------- 网页端 BOM 核对（session 认证；核心在 core.ts，与 /api/v1 版一致） ----------------
 
+// BOM 智能匹配提示词（移植自参考实现）：对规则匹配失败的行做语义匹配与替代建议
+const BOM_AI_PROMPT = `你是电子元器件库存匹配助手。下面是 BOM 中未能按编号/型号精确匹配的物料行，以及系统库存物料清单。
+任务：
+1. matches：为每个 BOM 行判断库存清单中是否存在**同一个物料**（编号或型号语义相同；忽略大小写、空格、精度/包装后缀差异如 ±1%、5%、编带）。找到填库存物料的 [编码]，没有填 null。不确定就 null，不要硬凑。
+2. alternatives：对库存中确实没有的 BOM 行，从库存清单里找**规格相近可替代采购**的物料（同封装、同阻值/容值、同系列），每行最多 2 个，附一句中文理由；找不到就不给。
+只输出 JSON（不要输出其他文字），格式：
+{"matches":[{"index":0,"code":"C12345"}],"alternatives":[{"index":1,"code":"C678","reason":"同封装同阻值"}]}
+其中 code 为 null 的条目不要输出。
+
+BOM 未匹配行：
+{bom_lines}
+
+库存物料清单（[编码] 名称|型号|类别|封装|库存数量）：
+{lib}`;
+
+/**
+ * BOM 智能匹配（AI 增强核对）：对规则核对为 not_found 的行，调用 AI 做语义匹配。
+ * 命中 → 该行按匹配物料重新算 ok/shortage（matched_by='ai'）；未命中但给替代建议 → 行附 alts。
+ * AI 未配置/调用失败/返回坏 JSON 时静默跳过（增强不是依赖，纯规则结果不受影响）。
+ */
+async function bomAiEnhance(db: D1Database, results: any[], summary: any): Promise<void> {
+  const badIdx = results.map((r, i) => (r.status === "not_found" ? i : -1)).filter((i) => i >= 0);
+  if (!badIdx.length) return;
+  const cfg = await aiCfg(db);
+  if (!cfg.base_url || !cfg.api_key || !cfg.model) return;
+  const mats = await q<any>(
+    db, "SELECT id, code, name, model, category, package, quantity, unit FROM materials ORDER BY id DESC LIMIT 200");
+  const code2mat = new Map(mats.filter((m) => m.code).map((m) => [m.code, m]));
+  if (!code2mat.size) return;
+  const lib = mats.filter((m) => m.code).map((m) =>
+    `[${m.code}] ${m.name}|${m.model ?? "-"}|${m.category ?? "-"}|${m.package ?? "-"}|库存${m.quantity ?? 0}`
+  ).join("\n");
+  // bom_lines 的 index 用 results 下标，便于就地回写
+  const bomLines = badIdx.map((i) => {
+    const r = results[i];
+    const inp = r.input ?? {};
+    return `#${i}: 编号=${inp.code ?? "无"} 型号=${inp.model ?? "无"} 名称=${inp.name ?? "无"} 需求=${r.need ?? 1}`;
+  }).join("\n");
+  let data: any = {};
+  try {
+    const content = await llmPlain(cfg, [{ role: "user",
+      content: BOM_AI_PROMPT.replace("{bom_lines}", bomLines).replace("{lib}", lib) }]);
+    const m = (content ?? "").match(/\{[\s\S]*\}/);
+    data = m ? JSON.parse(m[0]) : {};
+  } catch {
+    return;                                       // AI 失败静默降级为纯规则结果
+  }
+  for (const it of data.matches ?? []) {
+    const idx = Number(it?.index);
+    const code = String(it?.code ?? "").trim();
+    if (!Number.isInteger(idx) || idx < 0 || idx >= results.length) continue;
+    const mm = code2mat.get(code);
+    const row = results[idx];
+    if (!mm || row.status !== "not_found") continue;
+    const avail = mm.quantity ?? 0;
+    const need = row.need ?? 1;
+    // 命中：按匹配物料重算状态与汇总计数
+    row.material = mm; row.matched_by = "ai"; row.available = avail;
+    delete row.message;
+    summary.not_found--;
+    if (avail >= need) { row.status = "ok"; summary.ok++; }
+    else { row.status = "shortage"; row.shortage = need - avail; summary.shortage++; }
+  }
+  for (const it of data.alternatives ?? []) {
+    const idx = Number(it?.index);
+    const code = String(it?.code ?? "").trim();
+    const reason = String(it?.reason ?? "").trim().slice(0, 80);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= results.length) continue;
+    const mm = code2mat.get(code);
+    const row = results[idx];
+    if (!mm || row.status !== "not_found") continue;   // 已匹配到的行不需要替代建议
+    row.alts = row.alts ?? [];
+    row.alts.push({ code: mm.code, name: mm.name, stock: mm.quantity ?? 0, reason });
+  }
+}
+
 api.post("/api/bom/check", requireLogin, async (c) => {
   const d = await getJson(c);
   const r = await bomCheckCore(c.env.DB, d.items);
   if ("error" in r) return c.json({ error: r.error }, r.status as 400);
+  // use_ai 默认 true：规则核对后对 not_found 行做 AI 智能匹配（未配置 AI 时静默跳过）
+  if (d.use_ai !== false) await bomAiEnhance(c.env.DB, r.results, r.summary);
   return c.json(r);
 });
 

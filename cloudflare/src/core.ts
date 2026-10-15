@@ -14,9 +14,11 @@ export async function q<T = any>(db: D1Database, sql: string, ...params: unknown
 
 // ---------------- 物料搜索核心（对应 Flask 版 _search_core） ----------------
 
-/** 物料搜索核心：code 精确查询，否则 q 关键字模糊（name/code/model），两参皆空返回 null（调用方报 400） */
+/** 物料搜索核心：code 精确查询，否则 q 关键字模糊（name/code/model）。
+ * 两参皆空时：allowAll=true（仅 AI 工具）列出全部库存（最新在前），解决"我有哪些库存"
+ * 这类无关键词提问；否则返回 null 由调用方报 400（/api/v1 保持严格）。 */
 export async function searchCore(
-  db: D1Database, kw: string, code: string, limit = 20,
+  db: D1Database, kw: string, code: string, limit = 20, allowAll = false,
 ): Promise<any[] | null> {
   const cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id";
   code = (code ?? "").trim();
@@ -29,6 +31,10 @@ export async function searchCore(
     return await q(db,
       `SELECT ${cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ?
        ORDER BY id DESC LIMIT ?`, like, like, like, limit);
+  }
+  if (allowAll) {
+    // 无关键词 = 全量列表（参考实现的做法：查询类工具空参数合法，AI 不会被逼拒答）
+    return await q(db, `SELECT ${cols} FROM materials ORDER BY id DESC LIMIT ?`, limit);
   }
   return null;
 }

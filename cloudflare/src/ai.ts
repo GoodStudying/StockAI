@@ -34,43 +34,76 @@ function nowStrLocal(): string {
 }
 
 /** OpenAI 兼容 /chat/completions 单一收敛调用点。
- *  返回 {content, toolCalls}；非 200 抛错（外层负责落失败消息并返 502） */
+ *  返回 {content, toolCalls}；非 200 抛错（外层负责落失败消息并返 502）。
+ *  鲁棒性（借鉴参考实现）：temperature 三档降级 0.3 → 不带 → 1
+ *  （部分模型如 Kimi 思考模型限制取值）；
+ *  429 限速不做长等待（Worker 挂钟成本高），直接抛出明确提示让前端稍后重试。 */
 async function llmChat(
   cfg: { base_url: string; api_key: string; model: string },
   messages: any[],
   tools?: any[] | null,
 ): Promise<{ content: string; toolCalls: any[] }> {
-  const payload: Record<string, unknown> = { model: cfg.model, messages };
-  if (tools) {
-    payload.tools = tools;
-    payload.tool_choice = "auto";
+  const url = cfg.base_url.replace(/\/+$/, "") + "/chat/completions";
+  const tempVariants: Record<string, number>[] = [{ temperature: 0.3 }, {}, { temperature: 1 }];
+  let ti = 0;
+  for (;;) {
+    const payload: Record<string, unknown> = { model: cfg.model, messages, ...tempVariants[ti] };
+    if (tools) {
+      payload.tools = tools;
+      payload.tool_choice = "auto";
+    }
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${cfg.api_key}`, "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(90_000),      // 对齐 Flask 版 timeout=(10, 90)
+    });
+    if (r.status === 200) {
+      const msg = (await r.json()).choices[0].message;
+      return { content: msg.content ?? "", toolCalls: msg.tool_calls ?? [] };
+    }
+    const errTxt = (await r.text()).slice(0, 300);
+    if (r.status === 429) {
+      throw new Error("AI 接口限速（HTTP 429）：请稍后几秒重发（免费档常见 3 次/分钟限制）");
+    }
+    if (errTxt.toLowerCase().includes("temperature") && ti < tempVariants.length - 1) {
+      ti++;                                      // 该模型限制 temperature，换下一档重试
+      continue;
+    }
+    throw new Error(`HTTP ${r.status}: ${errTxt.slice(0, 200)}`);
   }
-  const r = await fetch(cfg.base_url.replace(/\/+$/, "") + "/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${cfg.api_key}`, "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(90_000),      // 对齐 Flask 版 timeout=(10, 90)
-  });
-  if (r.status !== 200) {
-    throw new Error(`HTTP ${r.status}: ${(await r.text()).slice(0, 200)}`);
-  }
-  const msg = (await r.json()).choices[0].message;
-  return { content: msg.content ?? "", toolCalls: msg.tool_calls ?? [] };
 }
 
-/** 系统提示词：角色 + 工具规范 + 安全模式说明 + 电子领域常识 + 回复风格 */
-function systemPrompt(username: string): string {
+/** 纯文本对话（不带工具），供 BOM 智能匹配等确定性任务用；复用降级逻辑 */
+export async function llmPlain(
+  cfg: { base_url: string; api_key: string; model: string },
+  messages: any[],
+): Promise<string> {
+  const r = await llmChat(cfg, messages, null);
+  return r.content;
+}
+
+/** 系统提示词：角色 + 实时仓库/物料概况 + 工具规范 + 安全模式说明 + 电子领域常识 + 回复风格。
+ *  仓库列表与物料总数每次请求现查注入（参考实现的做法），让 AI 建料/答问时有实时依据。 */
+async function systemPrompt(db: D1Database, username: string): Promise<string> {
   const today = new Date().toISOString().slice(0, 10);
+  const whs = await q<{ name: string; level: number }>(
+    db, "SELECT name, level FROM warehouses ORDER BY level, id LIMIT 30");
+  const whStr = whs.map((w) => "　".repeat(w.level - 1) + w.name).join("、") || "（暂无仓库）";
+  const totalRow = await db.prepare("SELECT COUNT(*) AS n FROM materials").first<{ n: number }>();
   return `你是「个人ERP」的库存管理 AI 助手。当前用户：${username}；今天：${today}。
+现有仓库：${whStr}
+库存物料总数：${totalRow?.n ?? 0} 种
 
 【职责】帮助用户查询物料库存、办理出入库、核对 BOM、管理采购清单。
 
 【工具使用规范】
-1. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造。
-2. stock_in / stock_out / create_material / add_purchase_items 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
-3. 查仓库列表用 list_warehouses；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
-4. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
-5. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
+1. 用户问"有哪些库存/库存情况/看看库存"等无关键词问题时，直接调 search_materials 不带参数列出全部，不要反问用户要关键词。
+2. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造；用户直接给了编码（如 C621395）时可跳过搜索，直接给 stock_in/stock_out 传 code。
+3. stock_in / stock_out / create_material / add_purchase_items 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
+4. 查仓库列表用 list_warehouses；查出入库历史用 stock_records；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
+5. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
+6. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
 
 【电子领域常识】
 - 电容容值换算：1µF = 1000nF（0.1µF = 100nF；三位数标注 104 = 100nF、105 = 1µF）。用户给出的不同写法若等值，主动指出并确认是否同一种物料。
@@ -80,14 +113,24 @@ function systemPrompt(username: string): string {
 【回复风格】简体中文；简洁分点，必要时用小表格；涉及写操作的回复末尾必须提醒用户确认卡片。`;
 }
 
-// 9 个工具的 OpenAI function calling 声明（只读 5 个真执行 + 写 4 个转卡片）
+// 10 个工具的 OpenAI function calling 声明（只读 6 个真执行 + 写 4 个转卡片）
+// description 写成"使用说明书"（用途+示例+前置条件），是引导模型正确调用的关键（借鉴参考实现）
 const AI_TOOLS = [
   { type: "function", function: {
     name: "search_materials",
-    description: "搜索库存中的物料：code 精确匹配编码，或 q 模糊匹配名称/编码/型号（至少提供一个）。出入库/BOM 核对前先用它拿到 material_id。",
+    description: "查询库存物料。不带任何参数 = 列出全部库存（用户问'有哪些库存/库存情况'时用）；"
+      + "q 模糊匹配名称/编码/型号（如 '电容'、'10k'、'0603'）；code 精确匹配编码（如立创C编号 C621395）。"
+      + "出入库/BOM 核对前先用它拿到 material_id。",
     parameters: { type: "object", properties: {
-      q: { type: "string", description: "模糊关键词（匹配名称/编码/型号）" },
+      q: { type: "string", description: "模糊关键词（匹配名称/编码/型号），留空=全部" },
       code: { type: "string", description: "物料编码精确匹配（如立创C编号 C621395）" } } } } },
+  { type: "function", function: {
+    name: "stock_records",
+    description: "查询出入库流水记录。不带参数 = 最近 10 条（用户问'最近谁动了库存/出入库记录'时用）；"
+      + "keyword 按物料名称/编码模糊过滤（如 'C25804'、'电容'）。",
+    parameters: { type: "object", properties: {
+      keyword: { type: "string", description: "物料名称/编码关键词，留空=最近记录" },
+      limit: { type: "integer", description: "返回条数，默认10，上限30" } } } } },
   { type: "function", function: {
     name: "list_warehouses",
     description: "列出全部仓库（id/名称/层级/父库），入库前用它确认仓库 id。",
@@ -125,15 +168,21 @@ const AI_TOOLS = [
       description: { type: "string" } } } } },
   { type: "function", function: {
     name: "stock_in",
-    description: "入库（写操作，生成待确认卡片）。material_id 必须来自 search_materials 结果。",
-    parameters: { type: "object", required: ["material_id", "quantity"], properties: {
-      material_id: { type: "integer" }, quantity: { type: "integer", description: "数量>0" },
+    description: "入库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
+      + "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认，此时无需先搜索）。",
+    parameters: { type: "object", required: ["quantity"], properties: {
+      material_id: { type: "integer", description: "物料 id（与 code 二选一）" },
+      code: { type: "string", description: "物料编码/型号（与 material_id 二选一）" },
+      quantity: { type: "integer", description: "数量>0" },
       remark: { type: "string", description: "备注（可选）" } } } } },
   { type: "function", function: {
     name: "stock_out",
-    description: "出库（写操作，生成待确认卡片）。material_id 必须来自 search_materials 结果；出库前确认库存充足。",
-    parameters: { type: "object", required: ["material_id", "quantity"], properties: {
-      material_id: { type: "integer" }, quantity: { type: "integer", description: "数量>0" },
+    description: "出库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
+      + "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认）。出库前确认库存充足。",
+    parameters: { type: "object", required: ["quantity"], properties: {
+      material_id: { type: "integer", description: "物料 id（与 code 二选一）" },
+      code: { type: "string", description: "物料编码/型号（与 material_id 二选一）" },
+      quantity: { type: "integer", description: "数量>0" },
       remark: { type: "string", description: "备注（可选）" } } } } },
   { type: "function", function: {
     name: "add_purchase_items",
@@ -150,6 +199,37 @@ const AI_TOOLS = [
 
 // 写工具的固定回话：驱动模型产出面向用户的确认文案，而不是继续调工具
 const ACTION_NOTE = "已生成待确认操作卡片（用户点击「确认执行」前不会执行任何写操作）。请向用户复述操作内容（对象/数量/仓库），并提醒用户在前端卡片上点击确认。不要重复调用本工具。";
+
+/** 出入库目标物料解析：material_id 优先；否则按 code 精确匹配编码 → 型号；再按名称/型号模糊。
+ *  多候选时不猜：err 带 candidates 列表，由 AI 列给用户确认（借鉴参考实现）。 */
+async function resolveStockTarget(db: D1Database, args: Record<string, any>):
+  Promise<{ mid?: number; mname?: string; err?: any }> {
+  const mid = parseIntSafe(args.material_id, 1);
+  if (mid !== null) {
+    const mat = await q<{ name: string }>(db, "SELECT name FROM materials WHERE id=?", mid);
+    if (!mat.length) {
+      return { err: { error: `物料 #${mid} 不存在，请先通过 search_materials 获取真实 material_id` } };
+    }
+    return { mid, mname: mat[0].name };
+  }
+  const kw = String(args.code ?? "").trim();
+  if (!kw) return { err: { error: "material_id 与 code 至少提供一个" } };
+  const cols = "id, name, code, model, quantity, unit";
+  let rows = await q<any>(db, `SELECT ${cols} FROM materials WHERE code=? OR model=?`, kw, kw);
+  if (!rows.length) {
+    const like = `%${kw}%`;
+    rows = await q<any>(db,
+      `SELECT ${cols} FROM materials WHERE name LIKE ? OR model LIKE ? LIMIT 10`, like, like);
+  }
+  if (!rows.length) {
+    return { err: { error: `未找到「${kw}」对应的物料，可用 search_materials 搜索确认` } };
+  }
+  if (rows.length > 1) {
+    return { err: { error: `「${kw}」匹配到 ${rows.length} 个物料，请把候选列给用户确认后再用 material_id 重试`,
+                    candidates: rows } };
+  }
+  return { mid: rows[0].id, mname: rows[0].name };
+}
 
 /** 写工具 → 待确认卡片。title 由服务端从参数生成（不信任 AI 的展示文案）。
  *  返回 {action} 或 {err}（err 是给模型自纠的参数错误说明） */
@@ -171,13 +251,6 @@ function buildAction(name: string, args: Record<string, any>):
     base.title = title;
     return { action: base };
   }
-  if (name === "stock_in" || name === "stock_out") {
-    const mid = parseIntSafe(args.material_id, 1);
-    const qty = parseIntSafe(args.quantity, 1);
-    if (mid === null || qty === null) return { err: "material_id / quantity 必须是大于0的整数" };
-    // title 需要物料名：由 runTool 补查后填入（查不到则不生成卡片，让模型重搜）
-    return { action: base };
-  }
   if (name === "add_purchase_items") {
     const project = String(args.project ?? "").trim();
     const items = args.items;
@@ -194,9 +267,35 @@ function buildAction(name: string, args: Record<string, any>):
 async function runTool(db: D1Database, name: string, args: Record<string, any>):
   Promise<{ result: any; action?: any }> {
   if (name === "search_materials") {
-    const rows = await searchCore(db, String(args.q ?? ""), String(args.code ?? ""), 20);
-    if (rows === null) return { result: { error: "q 与 code 至少提供一个" } };
-    return { result: { count: rows.length, materials: rows } };
+    // 空参数合法（=列出全部库存）：用户问"有哪些库存"时 AI 有合法路径可走
+    const rows = await searchCore(db, String(args.q ?? ""), String(args.code ?? ""), 30, true);
+    const totalRow = await db.prepare("SELECT COUNT(*) AS n FROM materials").first<{ n: number }>();
+    const total = totalRow?.n ?? 0;
+    const result: Record<string, unknown> = { total, count: rows!.length, materials: rows };
+    if (rows!.length < total) {
+      result.note = `共 ${total} 种物料，已列出最新 ${rows!.length} 条，可用 q 关键词缩小范围`;
+    }
+    return { result };
+  }
+  if (name === "stock_records") {
+    // 出入库流水：空关键词=最近记录；有关键词按物料名称/编码模糊过滤
+    const kw = String(args.keyword ?? "").trim();
+    let limit = parseIntSafe(args.limit ?? 10, 1) ?? 10;
+    limit = Math.min(limit, 30);
+    const sql = kw
+      ? `SELECT r.created_at, r.type, r.quantity, r.operator, r.remark,
+                m.name AS material_name, m.code AS material_code
+         FROM stock_records r JOIN materials m ON m.id = r.material_id
+         WHERE m.name LIKE ? OR m.code LIKE ?
+         ORDER BY r.id DESC LIMIT ?`
+      : `SELECT r.created_at, r.type, r.quantity, r.operator, r.remark,
+                m.name AS material_name, m.code AS material_code
+         FROM stock_records r JOIN materials m ON m.id = r.material_id
+         ORDER BY r.id DESC LIMIT ?`;
+    const rows = kw
+      ? await q(db, sql, `%${kw}%`, `%${kw}%`, limit)
+      : await q(db, sql, limit);
+    return { result: { count: rows.length, records: rows } };
   }
   if (name === "list_warehouses") {
     const rows = await q(db, "SELECT id, name, parent_id, level FROM warehouses ORDER BY level, id");
@@ -241,24 +340,33 @@ async function runTool(db: D1Database, name: string, args: Record<string, any>):
     return { result: { count: slim.length, items: slim } };
   }
   // ---------- 写操作：拦截转"待确认卡片" ----------
+  if (name === "stock_in" || name === "stock_out") {
+    const qty = parseIntSafe(args.quantity, 1);
+    if (qty === null) return { result: { error: "quantity 必须是大于0的整数" } };
+    // 目标解析（material_id 或 code 二选一；多候选返回列表让 AI 请用户确认）
+    const target = await resolveStockTarget(db, args);
+    if (target.err) return { result: target.err };
+    const base: Record<string, any> = {
+      id: randHex8(), type: name,
+      // 卡片参数落库为解析后的 material_id（执行时不再依赖 code 二次解析）
+      params: { ...args, material_id: target.mid, code: undefined },
+      status: "pending", result: null, executed_at: null,
+      title: `${name === "stock_in" ? "入库" : "出库"}：${target.mname}（#${target.mid}）×${qty}`,
+    };
+    delete base.params.code;
+    return { result: { ok: true, action_id: base.id, note: ACTION_NOTE }, action: base };
+  }
   const built = buildAction(name, args);
   if (built.err) return { result: { error: built.err } };
-  // stock_in/out 卡片标题需要物料名：这里补查（查不到让模型重搜，卡片不落地）
-  if (name === "stock_in" || name === "stock_out") {
-    const mid = parseIntSafe(args.material_id, 1)!;
-    const mat = await q<{ name: string }>(db, "SELECT name FROM materials WHERE id=?", mid);
-    if (!mat.length) {
-      return { result: { error: `物料 #${mid} 不存在，请先通过 search_materials 获取真实 material_id` } };
-    }
-    const qty = parseIntSafe(args.quantity, 1)!;
-    built.action.title = `${name === "stock_in" ? "入库" : "出库"}：${mat[0].name}（#${mid}）×${qty}`;
-  }
   return { result: { ok: true, action_id: built.action.id, note: ACTION_NOTE }, action: built.action };
 }
 
-/** 构造 tool 角色消息（OpenAI 协议）：结果序列化为 JSON 文本回给模型 */
+/** 构造 tool 角色消息（OpenAI 协议）：结果序列化为 JSON 文本回给模型。
+ *  截断 4000 字符防爆 token（借鉴参考实现）。 */
 function toolMsg(tcId: string, result: any) {
-  return { role: "tool", tool_call_id: tcId, content: JSON.stringify(result) };
+  let content = JSON.stringify(result);
+  if (content.length > 4000) content = content.slice(0, 4000) + "…(结果过长已截断)";
+  return { role: "tool", tool_call_id: tcId, content };
 }
 
 // ---------------- AI 对话主入口 ----------------
@@ -283,7 +391,7 @@ chat.post("/api/chat", requireLogin, async (c) => {
   const hRows = await q<any>(
     db, "SELECT role, content, actions_json FROM chat_messages WHERE user_id=? ORDER BY id DESC LIMIT 20", u.id);
   const history = hRows.reverse();
-  const msgs: any[] = [{ role: "system", content: systemPrompt(u.username) }];
+  const msgs: any[] = [{ role: "system", content: await systemPrompt(db, u.username) }];
   for (const h of history) {
     let content = h.content ?? "";
     if (h.actions_json) {

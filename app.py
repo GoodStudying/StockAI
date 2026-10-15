@@ -757,9 +757,11 @@ def stock_records():
 
 # ---------------- 开放接口 /api/v1（API Token 认证，供 Cherry Studio / MCP 等程序化调用） ----------------
 
-def _search_core(q, code, limit=20):
+def _search_core(q, code, limit=20, allow_all=False):
     """物料搜索核心：code 精确 或 q 模糊（名称/编码/型号），返回精简字段行列表。
-    被 /api/v1（外部Token）、AI 工具 search_materials 共用，避免三处复制查询逻辑。"""
+    被 /api/v1（外部Token）、AI 工具 search_materials 共用，避免三处复制查询逻辑。
+    allow_all=True（仅 AI 工具用）：两个参数都为空时列出全部库存（最新的在前），
+    解决"我现在有哪些库存"这类无关键词提问；/api/v1 仍要求至少一个参数。"""
     q = (q or "").strip()
     code = (code or "").strip()
     cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id"
@@ -770,7 +772,10 @@ def _search_core(q, code, limit=20):
         return db.query(
             f"SELECT {cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ? "
             f"ORDER BY id DESC LIMIT ?", (like, like, like, limit))
-    return None   # 两个参数都为空
+    if allow_all:
+        # 无关键词 = 全量列表（参考实现的做法：查询类工具空参数合法，AI 不会被逼拒答）
+        return db.query(f"SELECT {cols} FROM materials ORDER BY id DESC LIMIT ?", (limit,))
+    return None   # 两个参数都为空且未允许全量
 
 
 @app.route("/api/v1/materials", methods=["GET"])
@@ -1490,13 +1495,108 @@ def purchase_projects():
 
 # ---------------- 网页端 BOM 核对（session 认证；与 /api/v1 版同核心） ----------------
 
+# BOM 智能匹配提示词（移植自参考实现）：对规则匹配失败的行做语义匹配与替代建议
+_BOM_AI_PROMPT = """你是电子元器件库存匹配助手。下面是 BOM 中未能按编号/型号精确匹配的物料行，以及系统库存物料清单。
+任务：
+1. matches：为每个 BOM 行判断库存清单中是否存在**同一个物料**（编号或型号语义相同；忽略大小写、空格、精度/包装后缀差异如 ±1%、5%、编带）。找到填库存物料的 [编码]，没有填 null。不确定就 null，不要硬凑。
+2. alternatives：对库存中确实没有的 BOM 行，从库存清单里找**规格相近可替代采购**的物料（同封装、同阻值/容值、同系列），每行最多 2 个，附一句中文理由；找不到就不给。
+只输出 JSON（不要输出其他文字），格式：
+{{"matches":[{{"index":0,"code":"C12345"}}],"alternatives":[{{"index":1,"code":"C678","reason":"同封装同阻值"}}]}}
+其中 code 为 null 的条目不要输出。
+
+BOM 未匹配行：
+{bom_lines}
+
+库存物料清单（[编码] 名称|型号|类别|封装|库存数量）：
+{lib}"""
+
+
+def _bom_ai_enhance(results, summary):
+    """
+    BOM 智能匹配（AI 增强核对）：对规则核对为 not_found 的行，调用 AI 做语义匹配。
+    命中 → 该行按匹配物料重新算 ok/shortage（matched_by='ai'）；未命中但给替代建议 → 行附 alts。
+    AI 未配置/调用失败/返回坏 JSON 时静默跳过（增强不是依赖，纯规则结果不受影响）。
+    """
+    bad_idx = [i for i, r in enumerate(results) if r.get("status") == "not_found"]
+    if not bad_idx:
+        return
+    cfg = _ai_cfg()
+    if not (cfg["base_url"] and cfg["api_key"] and cfg["model"]):
+        return
+    mats = db.query(
+        "SELECT id, code, name, model, category, package, quantity, unit "
+        "FROM materials ORDER BY id DESC LIMIT 200")
+    code2mat = {m["code"]: m for m in mats if m["code"]}
+    if not code2mat:
+        return
+    lib = "\n".join("[%s] %s|%s|%s|%s|库存%s" % (
+        m["code"], m["name"], m["model"] or "-", m["category"] or "-", m["package"] or "-",
+        m["quantity"] if m["quantity"] is not None else 0) for m in mats if m["code"])
+    # bom_lines 的 index 用 results 下标，便于就地回写
+    bom_lines = "\n".join("#%d: 编号=%s 型号=%s 名称=%s 需求=%d" % (
+        i, (results[i].get("input") or {}).get("code") or "无",
+        (results[i].get("input") or {}).get("model") or "无",
+        (results[i].get("input") or {}).get("name") or "无",
+        results[i].get("need") or 1) for i in bad_idx)
+    try:
+        content = _llm_plain(cfg, [{"role": "user", "content":
+                                    _BOM_AI_PROMPT.format(bom_lines=bom_lines, lib=lib)}])
+        m = re.search(r"\{[\s\S]*\}", content or "")
+        data = json.loads(m.group(0)) if m else {}
+    except Exception:
+        return                                        # AI 失败静默降级为纯规则结果
+    for it in (data.get("matches") or []):
+        try:
+            idx = int(it.get("index"))
+        except (TypeError, ValueError):
+            continue
+        code = (it.get("code") or "").strip()
+        if not (0 <= idx < len(results)) or code not in code2mat:
+            continue
+        row = results[idx]
+        if row.get("status") != "not_found":
+            continue
+        mm = code2mat[code]
+        avail = mm["quantity"] or 0
+        need = row.get("need") or 1
+        # 命中：按匹配物料重算状态与汇总计数
+        row.update(material=mm, matched_by="ai", available=avail)
+        row.pop("message", None)
+        summary["not_found"] -= 1
+        if avail >= need:
+            row["status"] = "ok"
+            summary["ok"] += 1
+        else:
+            row.update(status="shortage", shortage=need - avail)
+            summary["shortage"] += 1
+    for it in (data.get("alternatives") or []):
+        try:
+            idx = int(it.get("index"))
+        except (TypeError, ValueError):
+            continue
+        code = (it.get("code") or "").strip()
+        reason = (it.get("reason") or "").strip()[:80]
+        if not (0 <= idx < len(results)) or code not in code2mat:
+            continue
+        row = results[idx]
+        if row.get("status") != "not_found":
+            continue                              # 已匹配到的行不需要替代建议
+        mm = code2mat[code]
+        row.setdefault("alts", []).append(
+            {"code": mm["code"], "name": mm["name"], "stock": mm["quantity"] or 0, "reason": reason})
+
+
 @app.route("/api/bom/check", methods=["POST"])
 @login_required
 def bom_check_web():
-    """BOM 核对网页入口：body {items:[{code|model|name, quantity}]}"""
-    summary, results = _bom_check_core(request.get_json(force=True).get("items"))
+    """BOM 核对网页入口：body {items:[{code|model|name, quantity}], use_ai?}。
+    use_ai 默认 true：规则核对后对 not_found 行做 AI 智能匹配（未配置 AI 时静默跳过）。"""
+    d = request.get_json(force=True)
+    summary, results = _bom_check_core(d.get("items"))
     if summary is None:
         return jsonify({"error": results}), 400
+    if d.get("use_ai", True):
+        _bom_ai_enhance(results, summary)
     return jsonify({"summary": summary, "results": results})
 
 
@@ -1512,34 +1612,64 @@ def _llm_chat(cfg, messages, tools=None):
     OpenAI 兼容 /chat/completions 单一收敛调用点（Kimi/DeepSeek/GLM 等）。
     返回 (content, tool_calls)。所有 LLM 交互都走这里——冒烟测试 monkeypatch 本函数
     即可脚本化整个对话流程，无需真实 API key。
+    鲁棒性（借鉴参考实现）：
+    - temperature 三档降级 0.3 → 不带 → 1（部分模型如 Kimi 思考模型限制取值）
+    - 429 限速：等待 21 秒后重试，最多 2 次（免费档常见 3 RPM 窗口）
     """
-    payload = {"model": cfg["model"], "messages": messages}
-    if tools:
-        payload["tools"] = tools
-        payload["tool_choice"] = "auto"
-    r = http_req.post(
-        cfg["base_url"].rstrip("/") + "/chat/completions",
-        headers={"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"},
-        json=payload, timeout=(10, 90))
-    if r.status_code != 200:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-    msg = r.json()["choices"][0]["message"]
-    return msg.get("content") or "", msg.get("tool_calls") or []
+    url = cfg["base_url"].rstrip("/") + "/chat/completions"
+    headers = {"Authorization": f"Bearer {cfg['api_key']}", "Content-Type": "application/json"}
+    temp_variants = [{"temperature": 0.3}, {}, {"temperature": 1}]
+    ti = 0
+    rate_retries = 0
+    while True:
+        payload = {"model": cfg["model"], "messages": messages}
+        payload.update(temp_variants[ti])
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        r = http_req.post(url, headers=headers, json=payload, timeout=(10, 90))
+        if r.status_code == 200:
+            msg = r.json()["choices"][0]["message"]
+            return msg.get("content") or "", msg.get("tool_calls") or []
+        err_txt = (r.text or "")[:300]
+        if r.status_code == 429 and rate_retries < 2:
+            # 限速：等一个 RPM 窗口后重试
+            rate_retries += 1
+            time.sleep(21)
+            continue
+        if "temperature" in err_txt.lower() and ti < len(temp_variants) - 1:
+            ti += 1                       # 该模型限制 temperature，换下一档重试
+            continue
+        raise RuntimeError(f"HTTP {r.status_code}: {err_txt[:200]}")
+
+
+def _llm_plain(cfg, messages):
+    """纯文本对话（不带工具），供 BOM 智能匹配等确定性任务用。
+    复用 _llm_chat 的降级/限速逻辑；返回回复文本，失败抛 RuntimeError。"""
+    content, _ = _llm_chat(cfg, messages, None)
+    return content
 
 
 def _system_prompt(username):
-    """系统提示词：角色 + 工具规范 + 安全模式说明 + 电子领域常识 + 回复风格"""
+    """系统提示词：角色 + 实时仓库/物料概况 + 工具规范 + 安全模式说明 + 电子领域常识 + 回复风格。
+    仓库列表与物料总数每次请求现查注入（参考实现的做法），让 AI 建料/答问时有实时依据。"""
     today = datetime.now().strftime("%Y-%m-%d")
+    whs = db.query("SELECT name, level FROM warehouses ORDER BY level, id LIMIT 30")
+    wh_str = "、".join(("　" * (w["level"] - 1)) + w["name"] for w in whs) or "（暂无仓库）"
+    mat_total = db.query("SELECT COUNT(*) AS n FROM materials")[0]["n"]
     return f"""你是「个人ERP」的库存管理 AI 助手。当前用户：{username}；今天：{today}。
+现有仓库：{wh_str}
+库存物料总数：{mat_total} 种
 
 【职责】帮助用户查询物料库存、办理出入库、核对 BOM、管理采购清单。
 
 【工具使用规范】
-1. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造。
-2. stock_in / stock_out / create_material / add_purchase_items 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
-3. 查仓库列表用 list_warehouses；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
-4. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
-5. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
+1. 用户问"有哪些库存/库存情况/看看库存"等无关键词问题时，直接调 search_materials 不带参数列出全部，不要反问用户要关键词。
+2. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造；用户直接给了编码（如 C621395）时可跳过搜索，直接给 stock_in/stock_out 传 code。
+3. stock_in / stock_out / create_material / add_purchase_items 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
+4. 查仓库列表用 list_warehouses；查出入库历史用 stock_records；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
+5. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
+6. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
 
 【电子领域常识】
 - 电容容值换算：1µF = 1000nF（0.1µF = 100nF；三位数标注 104 = 100nF、105 = 1µF）。用户给出的不同写法若等值，主动指出并确认是否同一种物料。
@@ -1549,14 +1679,24 @@ def _system_prompt(username):
 【回复风格】简体中文；简洁分点，必要时用小表格；涉及写操作的回复末尾必须提醒用户确认卡片。"""
 
 
-# 9 个工具的 OpenAI function calling 声明（只读 5 个真执行 + 写 4 个转卡片）
+# 10 个工具的 OpenAI function calling 声明（只读 6 个真执行 + 写 4 个转卡片）
+# description 写成"使用说明书"（用途+示例+前置条件），是引导模型正确调用的关键（借鉴参考实现）
 AI_TOOLS = [
     {"type": "function", "function": {
         "name": "search_materials",
-        "description": "搜索库存中的物料：code 精确匹配编码，或 q 模糊匹配名称/编码/型号（至少提供一个）。出入库/BOM 核对前先用它拿到 material_id。",
+        "description": "查询库存物料。不带任何参数 = 列出全部库存（用户问'有哪些库存/库存情况'时用）；"
+                       "q 模糊匹配名称/编码/型号（如 '电容'、'10k'、'0603'）；code 精确匹配编码（如立创C编号 C621395）。"
+                       "出入库/BOM 核对前先用它拿到 material_id。",
         "parameters": {"type": "object", "properties": {
-            "q": {"type": "string", "description": "模糊关键词（匹配名称/编码/型号）"},
+            "q": {"type": "string", "description": "模糊关键词（匹配名称/编码/型号），留空=全部"},
             "code": {"type": "string", "description": "物料编码精确匹配（如立创C编号 C621395）"}}}}},
+    {"type": "function", "function": {
+        "name": "stock_records",
+        "description": "查询出入库流水记录。不带参数 = 最近 10 条（用户问'最近谁动了库存/出入库记录'时用）；"
+                       "keyword 按物料名称/编码模糊过滤（如 'C25804'、'电容'）。",
+        "parameters": {"type": "object", "properties": {
+            "keyword": {"type": "string", "description": "物料名称/编码关键词，留空=最近记录"},
+            "limit": {"type": "integer", "description": "返回条数，默认10，上限30"}}}}},
     {"type": "function", "function": {
         "name": "list_warehouses",
         "description": "列出全部仓库（id/名称/层级/父库），入库前用它确认仓库 id。",
@@ -1594,15 +1734,21 @@ AI_TOOLS = [
             "description": {"type": "string"}}}}},
     {"type": "function", "function": {
         "name": "stock_in",
-        "description": "入库（写操作，生成待确认卡片）。material_id 必须来自 search_materials 结果。",
-        "parameters": {"type": "object", "required": ["material_id", "quantity"], "properties": {
-            "material_id": {"type": "integer"}, "quantity": {"type": "integer", "description": "数量>0"},
+        "description": "入库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
+                       "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认，此时无需先搜索）。",
+        "parameters": {"type": "object", "required": ["quantity"], "properties": {
+            "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
+            "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"},
+            "quantity": {"type": "integer", "description": "数量>0"},
             "remark": {"type": "string", "description": "备注（可选）"}}}}},
     {"type": "function", "function": {
         "name": "stock_out",
-        "description": "出库（写操作，生成待确认卡片）。material_id 必须来自 search_materials 结果；出库前确认库存充足。",
-        "parameters": {"type": "object", "required": ["material_id", "quantity"], "properties": {
-            "material_id": {"type": "integer"}, "quantity": {"type": "integer", "description": "数量>0"},
+        "description": "出库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
+                       "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认）。出库前确认库存充足。",
+        "parameters": {"type": "object", "required": ["quantity"], "properties": {
+            "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
+            "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"},
+            "quantity": {"type": "integer", "description": "数量>0"},
             "remark": {"type": "string", "description": "备注（可选）"}}}}},
     {"type": "function", "function": {
         "name": "add_purchase_items",
@@ -1622,10 +1768,39 @@ _ACTION_NOTE = ("已生成待确认操作卡片（用户点击「确认执行」
                 "请向用户复述操作内容（对象/数量/仓库），并提醒用户在前端卡片上点击确认。不要重复调用本工具。")
 
 
+def _resolve_stock_target(args):
+    """
+    出入库目标物料解析：material_id 优先；否则按 code 精确匹配编码 → 型号；
+    再按名称/型号模糊。返回 (material_id, material_name, err_dict)。
+    多候选时不猜：err_dict 带 candidates 列表，由 AI 列给用户确认（借鉴参考实现）。
+    """
+    mid = _parse_int(args.get("material_id"), 1)
+    if mid is not None:
+        mat = db.query("SELECT name FROM materials WHERE id=?", (mid,))
+        if not mat:
+            return None, None, {"error": f"物料 #{mid} 不存在，请先通过 search_materials 获取真实 material_id"}
+        return mid, mat[0]["name"], None
+    kw = (args.get("code") or "").strip()
+    if not kw:
+        return None, None, {"error": "material_id 与 code 至少提供一个"}
+    cols = "id, name, code, model, quantity, unit"
+    rows = db.query(f"SELECT {cols} FROM materials WHERE code=? OR model=?", (kw, kw))
+    if not rows:
+        like = f"%{kw}%"
+        rows = db.query(f"SELECT {cols} FROM materials WHERE name LIKE ? OR model LIKE ? LIMIT 10",
+                        (like, like))
+    if not rows:
+        return None, None, {"error": f"未找到「{kw}」对应的物料，可用 search_materials 搜索确认"}
+    if len(rows) > 1:
+        return None, None, {"error": f"「{kw}」匹配到 {len(rows)} 个物料，请把候选列给用户确认后再用 material_id 重试",
+                            "candidates": rows}
+    return rows[0]["id"], rows[0]["name"], None
+
+
 def _build_action(name, args):
     """
     写工具 → 待确认操作卡片。卡片 title 由服务端从参数生成（不信任 AI 的展示文案）。
-    返回 (action, err)：action 为 None 时 err 是给模型自纠的参数错误说明。
+    返回 (action, err)：err 是给模型自纠的错误说明（str 或带 candidates 的 dict）。
     """
     base = {"id": secrets.token_hex(4), "type": name, "params": args,
             "status": "pending", "result": None, "executed_at": None}
@@ -1645,14 +1820,16 @@ def _build_action(name, args):
         base["title"] = title
         return base, None
     if name in ("stock_in", "stock_out"):
-        mid = _parse_int(args.get("material_id"), 1)
         qty = _parse_int(args.get("quantity"), 1)
-        if mid is None or qty is None:
-            return None, "material_id / quantity 必须是大于0的整数"
-        mat = db.query("SELECT name FROM materials WHERE id=?", (mid,))
-        if not mat:
-            return None, f"物料 #{mid} 不存在，请先通过 search_materials 获取真实 material_id"
-        base["title"] = f"{'入库' if name == 'stock_in' else '出库'}：{mat[0]['name']}（#{mid}）×{qty}"
+        if qty is None:
+            return None, "quantity 必须是大于0的整数"
+        mid, mname, err = _resolve_stock_target(args)
+        if err:
+            return None, err
+        # 卡片参数落库为解析后的 material_id（执行时不再依赖 code 二次解析）
+        base["params"] = dict(args, material_id=mid)
+        base["params"].pop("code", None)
+        base["title"] = f"{'入库' if name == 'stock_in' else '出库'}：{mname}（#{mid}）×{qty}"
         return base, None
     if name == "add_purchase_items":
         project = (args.get("project") or "").strip()
@@ -1673,10 +1850,33 @@ def _run_tool(name, args, username):
     写工具一律拦截转卡片，绝不直接落库。参数问题返回 {"error":...} 供模型自纠。
     """
     if name == "search_materials":
-        rows = _search_core(args.get("q"), args.get("code"), limit=20)
-        if rows is None:
-            return {"error": "q 与 code 至少提供一个"}, None
-        return {"count": len(rows), "materials": rows}, None
+        # 空参数合法（=列出全部库存）：用户问"有哪些库存"时 AI 有合法路径可走
+        rows = _search_core(args.get("q"), args.get("code"), limit=30, allow_all=True)
+        total = db.query("SELECT COUNT(*) AS n FROM materials")[0]["n"]
+        result = {"total": total, "count": len(rows), "materials": rows}
+        if len(rows) < total:
+            result["note"] = f"共 {total} 种物料，已列出最新 {len(rows)} 条，可用 q 关键词缩小范围"
+        return result, None
+    if name == "stock_records":
+        # 出入库流水：空关键词=最近记录；有关键词按物料名称/编码模糊过滤
+        kw = (args.get("keyword") or "").strip()
+        limit = _parse_int(args.get("limit") or 10, 1) or 10
+        limit = min(limit, 30)
+        if kw:
+            like = f"%{kw}%"
+            rows = db.query(
+                """SELECT r.created_at, r.type, r.quantity, r.operator, r.remark,
+                          m.name AS material_name, m.code AS material_code
+                   FROM stock_records r JOIN materials m ON m.id = r.material_id
+                   WHERE m.name LIKE ? OR m.code LIKE ?
+                   ORDER BY r.id DESC LIMIT ?""", (like, like, limit))
+        else:
+            rows = db.query(
+                """SELECT r.created_at, r.type, r.quantity, r.operator, r.remark,
+                          m.name AS material_name, m.code AS material_code
+                   FROM stock_records r JOIN materials m ON m.id = r.material_id
+                   ORDER BY r.id DESC LIMIT ?""", (limit,))
+        return {"count": len(rows), "records": rows}, None
     if name == "list_warehouses":
         rows = db.query("SELECT id, name, parent_id, level FROM warehouses ORDER BY level, id")
         return {"count": len(rows), "warehouses": rows}, None
@@ -1711,14 +1911,18 @@ def _run_tool(name, args, username):
     # ---------- 写操作：拦截转"待确认卡片" ----------
     action, err = _build_action(name, args)
     if err:
-        return {"error": err}, None
+        # err 可能是 str（普通参数错误）或 dict（多候选等带附加数据的错误）
+        return (err if isinstance(err, dict) else {"error": err}), None
     return {"ok": True, "action_id": action["id"], "note": _ACTION_NOTE}, action
 
 
 def _tool_msg(tc_id, result):
-    """构造 tool 角色消息（OpenAI 协议）：结果序列化为 JSON 文本回给模型"""
-    return {"role": "tool", "tool_call_id": tc_id,
-            "content": json.dumps(result, ensure_ascii=False, default=str)}
+    """构造 tool 角色消息（OpenAI 协议）：结果序列化为 JSON 文本回给模型。
+    截断 4000 字符防爆 token（借鉴参考实现）。"""
+    content = json.dumps(result, ensure_ascii=False, default=str)
+    if len(content) > 4000:
+        content = content[:4000] + "…(结果过长已截断)"
+    return {"role": "tool", "tool_call_id": tc_id, "content": content}
 
 
 @app.route("/api/chat", methods=["POST"])

@@ -32,6 +32,10 @@
       <button onclick="parseBom()">解析预览</button>
       <button onclick="runCheck()" id="btn-check" disabled>开始核对</button>
       <button onclick="clearBom()" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)">清空</button>
+      <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:var(--ink-3);cursor:pointer"
+             title="规则核对后，对'未找到'的行用 AI 做语义匹配并给替代建议（需在系统管理页配置 AI 接口）">
+        <input type="checkbox" id="bom-use-ai" checked> AI 智能匹配
+      </label>
     </div>
     <div id="bom-preview"></div>
     <div id="bom-result"></div>
@@ -161,13 +165,22 @@ let checkResults = null;
 async function runCheck() {
   if (!bomRows.length) return;
   const items = bomRows.map(r => ({ code: r.code, name: r.name, quantity: r.quantity }));
-  const r = await api('/api/bom/check', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ items }),
-  });
-  checkResults = r;
-  const s = r.summary;
-  renderResultTable();
+  const useAi = document.getElementById('bom-use-ai').checked;
+  const btn = document.getElementById('btn-check');
+  /* AI 智能匹配要多等一轮 LLM，按钮给提示 */
+  btn.disabled = true;
+  btn.textContent = useAi ? '核对中（含AI匹配）…' : '核对中…';
+  try {
+    const r = await api('/api/bom/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items, use_ai: useAi }),
+    });
+    checkResults = r;
+    renderResultTable();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '开始核对';
+  }
 }
 function renderResultTable() {
   const r = checkResults;
@@ -207,10 +220,17 @@ function renderResultTable() {
       st = '充足'; stColor = 'var(--green)';
     }
     const mat = row.material;
+    /* AI 智能匹配命中：匹配列加 AI 徽标提示 */
+    const aiBadge = row.matched_by === 'ai'
+      ? ' <span class="badge-warn" style="background:var(--accent-soft);color:var(--accent)" title="由 AI 语义匹配，请人工复核">AI</span>' : '';
+    /* 替代建议：未找到的行展示 AI 推荐的相近物料 */
+    const alts = (row.alts || []).map(a =>
+      `<div style="font-size:12px;color:var(--ink-3)">可替代：${esc(a.code)} ${esc(a.name)}（库存${a.stock}）${a.reason ? ' — ' + esc(a.reason) : ''}</div>`
+    ).join('');
     html += `<tr>
       <td>${chk}</td>
-      <td>${esc(inp)}</td>
-      <td>${mat ? esc((mat.code || '') + ' ' + (mat.name || '')) + ' <small style="color:var(--ink-3)">#' + mat.id + '</small>' : '-'}</td>
+      <td>${esc(inp)}${alts}</td>
+      <td>${mat ? esc((mat.code || '') + ' ' + (mat.name || '')) + ' <small style="color:var(--ink-3)">#' + mat.id + '</small>' + aiBadge : '-'}</td>
       <td>${row.need ?? '-'}</td>
       <td>${mat ? (mat.quantity ?? 0) : '-'}</td>
       <td style="color:${stColor};font-weight:600">${st}</td>

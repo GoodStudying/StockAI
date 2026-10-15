@@ -364,17 +364,13 @@ d = r.get_json()
 check("8轮用尽后逼出总结文本", r.status_code == 200 and d["content"] == "已到上限的总结文本。"
       and d["actions"] == [], d.get("content", ""))
 
-# 场景f：非法 JSON 参数 → 模型收到 error 不 500
+# 场景f：工具参数错误 → 模型收到 error 自纠不 500（lcsc_search 空关键词仍报错）
 app_module._llm_chat = scripted_llm([
-    ("", [("search_materials", "不是对象")]) if False else None,  # 占位不用
+    ("", [("lcsc_search", {"keyword": ""})]),   # 空关键词 → 工具返回 error 给模型
+    "请提供搜索关键词。",
 ])
-# 直接构造非法 arguments：脚本的 arguments 是合法 JSON 字符串，这里测工具级参数错误
-app_module._llm_chat = scripted_llm([
-    ("", [("search_materials", {})]),          # q/code 全空 → 工具返回 error 给模型
-    "参数不足。",
-])
-r = c.post("/api/chat", json={"message": "随便搜"})
-check("工具参数错误不炸(模型自纠)", r.status_code == 200 and r.get_json()["content"] == "参数不足。")
+r = c.post("/api/chat", json={"message": "帮我搜立创"})
+check("工具参数错误不炸(模型自纠)", r.status_code == 200 and r.get_json()["content"] == "请提供搜索关键词。")
 
 # 场景g：AI 未配置 → 400
 c.post("/api/ai/config", json={"base_url": "https://api.fake/v1", "model": "m", "api_key": "!"})
@@ -417,6 +413,76 @@ r = c.put(f"/api/materials/{mid_fake}", json={"name": "自动抓取测试", "cod
                                               "quantity": 7, "lcsc_url": row["lcsc_url"]})
 check("编辑已补全物料成功", r.status_code == 200)
 check("全字段已填时跳过重复抓取", called["n"] == 0, f"fetch_detail called {called['n']}")
+
+# ---------- 15. AI 体验升级：全量查询 / 流水工具 / code直操作 / temperature降级 / BOM智能匹配 ----------
+print("[15] AI 体验升级")
+# a. search_materials 空参数 = 全量库存（"我现在有哪些库存"的合法路径）
+res, _ = app_module._run_tool("search_materials", {}, "admin")
+check("search_materials空参数=全部库存", res["count"] == res["total"] and res["total"] >= 4,
+      f"count={res['count']} total={res['total']}")
+r = c.get("/api/v1/materials", headers=H)
+check("/api/v1 无参数仍要求400(只放开AI入口)", r.status_code == 400)
+# b. stock_records 空关键词 = 最近流水
+res, _ = app_module._run_tool("stock_records", {}, "admin")
+check("stock_records空关键词=最近流水", res["count"] > 0 and "material_name" in res["records"][0])
+res2, _ = app_module._run_tool("stock_records", {"keyword": "C77343"}, "admin")
+check("stock_records按编码过滤", all(x["material_code"] == "C77343" for x in res2["records"]))
+# c. stock_in 直接给 code：C77343 唯一命中 → 出卡片且参数落 material_id
+res, action = app_module._run_tool("stock_in", {"code": "C77343", "quantity": 2}, "admin")
+check("code唯一命中直接出卡片", action is not None
+      and action["params"].get("material_id") == m2 and "code" not in action["params"],
+      str(action and action["params"]))
+# C123456 有两条同编码物料 → 多候选不出卡片
+res, action = app_module._run_tool("stock_in", {"code": "C123456", "quantity": 2}, "admin")
+check("code多候选返回候选列表(不出卡片)", action is None and len(res.get("candidates", [])) == 2)
+# d. temperature 降级：第一次 400 含 temperature，第二次 200
+class FakeResp:
+    def __init__(self, status, text="", payload=None):
+        self.status_code = status; self.text = text; self._p = payload
+    def json(self):
+        return self._p
+temp_calls = {"n": 0, "temps": []}
+def fake_post(url, headers=None, json=None, timeout=None):
+    temp_calls["n"] += 1
+    temp_calls["temps"].append(json.get("temperature", "ABSENT"))
+    if temp_calls["n"] == 1:
+        return FakeResp(400, '{"error":"temperature is not allowed for this model"}')
+    return FakeResp(200, payload={"choices": [{"message": {"content": "ok", "tool_calls": []}}]})
+real_post = app_module.http_req.post
+app_module.http_req.post = fake_post
+try:
+    tcontent, _ = app_module._llm_chat({"base_url": "https://x", "api_key": "k", "model": "m"},
+                                       [{"role": "user", "content": "hi"}], None)
+finally:
+    app_module.http_req.post = real_post
+check("temperature报错自动降级重试成功", tcontent == "ok" and temp_calls["n"] == 2)
+check("降级序列0.3→不带参数", temp_calls["temps"] == [0.3, "ABSENT"], str(temp_calls["temps"]))
+# e. BOM 智能匹配：AI 返回 1 条 match + 1 条 alternative
+c.post("/api/ai/config", json={"base_url": "https://api.fake/v1", "model": "fake",
+                               "api_key": "sk-fake"})   # 场景g 用 "!" 清过 key，这里配回
+orig_plain = app_module._llm_plain
+app_module._llm_plain = lambda cfg, messages: (
+    '{"matches":[{"index":0,"code":"C123456"}],"alternatives":[{"index":1,"code":"C77343","reason":"同主控系列"}]}')
+d = c.post("/api/bom/check", json={"items": [
+    {"name": "AI测试不存在物料甲", "quantity": 1},
+    {"name": "AI测试不存在物料乙", "quantity": 1},
+]}).get_json()
+row0, row1 = d["results"]
+check("AI匹配命中not_found行", row0.get("matched_by") == "ai"
+      and row0["status"] in ("ok", "shortage"), str(row0.get("status")))
+check("AI匹配后汇总重算(not_found 2→1)", d["summary"]["not_found"] == 1, str(d["summary"]))
+check("替代建议附在行上", row1["status"] == "not_found"
+      and row1.get("alts", [{}])[0].get("code") == "C77343", str(row1.get("alts")))
+# 坏 JSON → 静默降级为纯规则结果
+app_module._llm_plain = lambda cfg, messages: "这不是JSON"
+d = c.post("/api/bom/check", json={"items": [{"name": "AI测试不存在物料甲", "quantity": 1}]}).get_json()
+check("坏JSON静默降级为not_found", d["results"][0]["status"] == "not_found")
+app_module._llm_plain = orig_plain
+# f. AI 未配置 + use_ai=true → 不影响规则核对
+c.post("/api/ai/config", json={"base_url": "https://api.fake/v1", "model": "fake", "api_key": "!"})
+d = c.post("/api/bom/check", json={"items": [{"name": "AI测试不存在物料甲", "quantity": 1}],
+                                   "use_ai": True}).get_json()
+check("AI未配置时不影响规则核对", d["summary"]["not_found"] == 1)
 
 # ---------- 清理 ----------
 for suffix in ("", "-journal", "-wal", "-shm"):
