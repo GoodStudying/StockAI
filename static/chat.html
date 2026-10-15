@@ -147,7 +147,7 @@ function nowTime() {
 const TYPE_LABEL = {
   stock_in: '入库', stock_out: '出库',
   create_material: '新建物料', add_purchase_items: '导入采购',
-  create_warehouse: '新建仓库',
+  create_warehouse: '新建仓库', delete_material: '删除物料',
 };
 
 /* AI 回复 Markdown 轻渲染：先 esc 防注入，再支持 表格/代码块/行内代码/加粗/换行。
@@ -236,13 +236,26 @@ function renderCard(msgId, a) {
     </div>`;
   } else {
     const res = a.result || {};
-    const txt = a.status === 'executed'
-      ? ('✓ 已执行' + (res.quantity !== undefined ? `，现库存 ${res.quantity}` : '')
-        + (res.material_id !== undefined && res.quantity === undefined ? `，物料 #${res.material_id}` : '')
-        + (res.warehouse_id !== undefined ? `，仓库「${res.name || '#' + res.warehouse_id}」（${res.level} 级）` : '')
-        + (res.created !== undefined ? `，新建 ${res.created} 项 / 合并 ${res.merged} 项` : '')
-        + (res.note ? `（${res.note}）` : ''))
-      : a.status === 'cancelled' ? '已取消' : ('✗ 失败：' + (res.error || '未知错误'));
+    let txt;
+    if (a.status === 'executed') {
+      const parts = ['✓ 已执行'];
+      if (res.discarded_stock !== undefined) {
+        /* 删除物料：名称 + 清掉的库存 */
+        parts.push(`已删除「${res.name || '物料'}」` + (res.discarded_stock > 0 ? `，清空库存 ×${res.discarded_stock}` : ''));
+      } else {
+        if (res.name !== undefined && res.level !== undefined)
+          parts.push(`仓库「${res.name}」（${res.level} 级）`);   /* create_warehouse */
+        if (res.quantity !== undefined) parts.push(`现库存 ${res.quantity}`);
+        else if (res.material_id !== undefined) parts.push(`物料 #${res.material_id}`);
+        if (res.warehouse_id !== undefined && res.level === undefined)
+          parts.push(`已挂到仓库 #${res.warehouse_id}`);          /* stock_in 挂库 */
+        if (res.created !== undefined) parts.push(`新建 ${res.created} 项 / 合并 ${res.merged} 项`);
+      }
+      if (res.note) parts.push(`（${res.note}）`);
+      txt = parts.join('，');
+    } else {
+      txt = a.status === 'cancelled' ? '已取消' : ('✗ 失败：' + (res.error || '未知错误'));
+    }
     html += `<div class="a-ops"><span class="res">${esc(txt)}${a.executed_at ? ' · ' + esc(a.executed_at) : ''}</span></div>`;
   }
   card.innerHTML = html;

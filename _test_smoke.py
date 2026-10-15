@@ -553,6 +553,92 @@ check("html 不缓存", "no-cache" in r.headers.get("Cache-Control", ""),
 app_module._llm_chat = real_llm
 
 
+# ---------- 17. 删除物料 + 入库挂仓库（AI 卡片 / /api/v1） ----------
+print("[17] 删除物料 + 入库挂仓库")
+# 造一个带库存的物料（用 v1 入库挂数量，顺便给 v1 stock/in 留基础）
+r = c.post("/api/materials", json={"name": "待删电阻", "code": "DEL0001"})
+mid_del = r.get_json().get("id")
+c.post("/api/v1/stock/in", json={"material_id": mid_del, "quantity": 5}, headers=H)
+wid = dbm.query("SELECT id FROM warehouses WHERE name='AI原材料库'")[0]["id"]
+
+# AI 删除卡片：标题必须标注"库存将一并清空"
+app_module._llm_chat = scripted_llm([
+    ("", [("delete_material", {"material_id": mid_del})]),
+    "已生成删除卡片，请确认。",
+])
+r = c.post("/api/chat", json={"message": "把待删电阻删掉"})
+d = r.get_json()
+check("delete_material 生成1张卡片", len(d["actions"]) == 1, str(d["actions"]))
+a_del = d["actions"][0]
+check("删除卡片标题含清空库存警告",
+      "删除物料" in a_del["title"] and "待删电阻" in a_del["title"] and "×5" in a_del["title"],
+      a_del["title"])
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "action_id": a_del["id"]})
+res = r.get_json()["action"]["result"]
+check("确认删除成功且回报清掉的库存", r.status_code == 200 and res.get("discarded_stock") == 5, str(res))
+check("物料已删除", not dbm.query("SELECT id FROM materials WHERE id=?", (mid_del,)))
+
+# 删除不存在的物料：预校验拦截，不生成卡片
+app_module._llm_chat = scripted_llm([
+    ("", [("delete_material", {"material_id": 99999})]),
+    "物料不存在，已告知用户。",
+])
+r = c.post("/api/chat", json={"message": "删掉#99999"})
+check("删不存在物料不生成卡片", r.get_json()["actions"] == [])
+
+# 入库挂仓库：卡片标题带仓库名，执行后物料归属更新
+r = c.post("/api/materials", json={"name": "挂库电容", "code": "WH0001"})
+mid_wh = r.get_json()["id"]
+app_module._llm_chat = scripted_llm([
+    ("", [("stock_in", {"material_id": mid_wh, "quantity": 7, "warehouse_id": wid})]),
+    "已生成入库卡片，请确认。",
+])
+r = c.post("/api/chat", json={"message": "入库7个挂库电容到原材料库"})
+d = r.get_json()
+a_in = d["actions"][0]
+check("入库挂库卡片标题含仓库名", "挂到仓库「AI原材料库」" in a_in["title"], a_in["title"])
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "action_id": a_in["id"]})
+res = r.get_json()["action"]["result"]
+row = dbm.query("SELECT quantity, warehouse_id FROM materials WHERE id=?", (mid_wh,))[0]
+check("入库挂库执行成功", res.get("warehouse_id") == wid and row["quantity"] == 7
+      and row["warehouse_id"] == wid, str(res) + str(row))
+
+# 坏仓库/出库带仓库 → 预校验拦截，不生成卡片
+app_module._llm_chat = scripted_llm([
+    ("", [("stock_in", {"material_id": mid_wh, "quantity": 1, "warehouse_id": 9999})]),
+    "仓库不存在，已告知用户。",
+])
+r = c.post("/api/chat", json={"message": "入库1个到#9999库"})
+check("入库坏仓库不生成卡片", r.get_json()["actions"] == [])
+app_module._llm_chat = scripted_llm([
+    ("", [("stock_out", {"material_id": mid_wh, "quantity": 1, "warehouse_id": wid})]),
+    "出库不支持挂仓库，已告知用户。",
+])
+r = c.post("/api/chat", json={"message": "出库1个挂到原材料库"})
+check("出库带仓库不生成卡片", r.get_json()["actions"] == [])
+
+# /api/v1：删除物料 / 查仓库 / 入库挂库 / 出库带仓库拒绝
+r = c.delete(f"/api/v1/materials/{mid_wh}", headers=H)
+check("/api/v1 删除物料", r.status_code == 200 and r.get_json().get("discarded_stock") == 7,
+      r.get_data(as_text=True)[:120])
+r = c.delete(f"/api/v1/materials/{mid_wh}", headers=H)
+check("/api/v1 重复删除 404", r.status_code == 404)
+r = c.get("/api/v1/warehouses", headers=H)
+check("/api/v1 查仓库列表", r.status_code == 200 and r.get_json().get("count", 0) >= 1)
+r = c.post("/api/materials", json={"name": "v1挂库料", "code": "WH0002"})
+mid_v1 = r.get_json()["id"]
+r = c.post("/api/v1/stock/in", json={"material_id": mid_v1, "quantity": 3, "warehouse_id": wid}, headers=H)
+check("/api/v1 入库挂库", r.status_code == 200 and r.get_json().get("warehouse_id") == wid,
+      r.get_data(as_text=True)[:120])
+r = c.post("/api/v1/stock/out", json={"material_id": mid_v1, "quantity": 1, "warehouse_id": wid}, headers=H)
+check("/api/v1 出库带仓库 400", r.status_code == 400)
+r = c.post("/api/v1/stock/in", json={"material_id": mid_v1, "quantity": 1, "warehouse_id": 9999}, headers=H)
+check("/api/v1 入库坏仓库 400", r.status_code == 400)
+dbm.execute_write("DELETE FROM materials WHERE id=?", (mid_v1,))
+
+app_module._llm_chat = real_llm
+
+
 # ---------- 清理 ----------
 for suffix in ("", "-journal", "-wal", "-shm"):
     p = TEST_DB + suffix

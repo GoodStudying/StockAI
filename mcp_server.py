@@ -3,7 +3,16 @@
 个人ERP MCP 服务器（供 Cherry Studio 等 MCP 客户端以对话方式管理库存）
 
 作用：把本项目的 /api/v1 开放接口包装成 MCP 工具，AI 客户端连上后即可
-     用自然语言完成：查物料 / 出入库 / BOM 核对 / 重复物料核对。
+     用自然语言完成：查物料 / 出入库（可挂仓库）/ 查仓库 / 建仓库 /
+     删除物料 / BOM 核对 / 重复物料核对。
+
+配置完成后在对话里启用该 MCP 服务器，即可直接说：
+  「帮我查一下 0603 100nF 电容的库存」
+  「把 C621395 出库 5 个，备注：发样板」
+  「入库 100 个 C621395，挂到仓库 元器件盒1」
+  「建三个仓库：元器件盒1、元器件盒2、样品管盒」
+  「把 RS1ML 这个物料删掉」（会先复述库存征得确认）
+  「核对这份 BOM：STM32F103C8T6 x2、0603 10K 电阻 x20」
 
 前置条件：
   1. ERP 服务已启动（本地 python app.py，或 NAS Docker 部署）
@@ -17,11 +26,6 @@ Cherry Studio 配置（设置 → MCP 服务器 → 新建）：
   环境变量：
     ERP_API_BASE=http://127.0.0.1:5000    （NAS 部署则填 http://NAS_IP:端口；上云后填 https://你的域名）
     ERP_API_TOKEN=<与 ERP 服务端 .env 中 API_TOKEN 完全一致>
-
-配置完成后在对话里启用该 MCP 服务器，即可直接说：
-  「帮我查一下 0603 100nF 电容的库存」
-  「把 C621395 出库 5 个，备注：发样板」
-  「核对这份 BOM：STM32F103C8T6 x2、0603 10K 电阻 x20」
 """
 import json
 import os
@@ -75,13 +79,17 @@ def search_materials(keyword: str = "", code: str = "") -> str:
 
 
 @mcp.tool()
-def stock_in(material_id: int, quantity: int, remark: str = "") -> str:
+def stock_in(material_id: int, quantity: int, remark: str = "", warehouse_id: int = 0) -> str:
     """入库：给指定物料增加库存。material_id 来自 search_materials 的查询结果；
     quantity 必须为正整数；remark 为操作备注（如采购单号）。
+    warehouse_id 可选（0 或不传=不挂库）：入库同时把物料归属到该仓库
+    （id 用 list_warehouses 查询），实现"入到某个盒子/货架"。
     ⚠ 写操作：执行前应先向用户复述物料名称与数量，征得确认后再调用。返回入库后的最新库存。"""
-    return _d(_call("POST", "/api/v1/stock/in",
-                    body={"material_id": material_id, "quantity": quantity,
-                          "remark": remark or "Cherry Studio 对话入库"}))
+    body = {"material_id": material_id, "quantity": quantity,
+            "remark": remark or "Cherry Studio 对话入库"}
+    if warehouse_id:
+        body["warehouse_id"] = warehouse_id
+    return _d(_call("POST", "/api/v1/stock/in", body=body))
 
 
 @mcp.tool()
@@ -123,6 +131,13 @@ def find_duplicates() -> str:
 
 
 @mcp.tool()
+def list_warehouses() -> str:
+    """列出全部仓库（id/名称/层级/父库）。入库挂库(create_warehouse/stock_in 的 warehouse_id)、
+    建子库前先用它确认仓库 id。返回 count + warehouses 数组。"""
+    return _d(_call("GET", "/api/v1/warehouses"))
+
+
+@mcp.tool()
 def create_warehouse(name: str, parent_id: int = 0) -> str:
     """新建仓库节点。name=仓库名（必填）；parent_id=父仓库 id（0 或不传=建一级库）。
     仓库树最深 4 级。建子库前先确认父级 id（可通过对话让用户从仓库列表中选择）。
@@ -131,6 +146,15 @@ def create_warehouse(name: str, parent_id: int = 0) -> str:
     if parent_id:
         body["parent_id"] = parent_id
     return _d(_call("POST", "/api/v1/warehouses", body=body))
+
+
+@mcp.tool()
+def delete_material(material_id: int) -> str:
+    """删除指定物料。material_id 来自 search_materials 的查询结果。
+    ⚠️ 危险写操作：物料的现有库存会随删除一并清空（返回里的 discarded_stock 为清掉的数量），
+    执行前必须把物料名称和当前库存复述给用户，明确征得"确认删除"后再调用。
+    用户要清空全部物料时：先 search_materials 逐个列出，逐一经确认后删除。"""
+    return _d(_call("DELETE", f"/api/v1/materials/{material_id}"))
 
 
 if __name__ == "__main__":

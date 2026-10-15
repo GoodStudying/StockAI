@@ -815,7 +815,8 @@ def v1_search_materials():
 @app.route("/api/v1/stock/<op>", methods=["POST"])
 @token_required
 def v1_stock_inout(op):
-    """程序化出入库（与网页端同一原子逻辑）。body: {material_id, quantity, remark}"""
+    """程序化出入库（与网页端同一原子逻辑）。body: {material_id, quantity, remark, warehouse_id?}
+    warehouse_id 仅入库支持：入库同时把物料归属到该仓库。"""
     if op not in ("in", "out"):
         return jsonify({"error": "操作类型不合法"}), 400
     d = request.get_json(force=True)
@@ -825,10 +826,23 @@ def v1_stock_inout(op):
         return jsonify({"error": "material_id 不合法"}), 400
     if qty is None:
         return jsonify({"error": "数量必须是大于0的整数"}), 400
+    wid = None
+    if d.get("warehouse_id"):
+        if op != "in":
+            return jsonify({"error": "出库不支持 warehouse_id（仓库归属在入库时指定）"}), 400
+        wid = _parse_int(d.get("warehouse_id"), 1)
+        if wid is None:
+            return jsonify({"error": "warehouse_id 必须是正整数"}), 400
+        if not db.query("SELECT id FROM warehouses WHERE id=?", (wid,)):
+            return jsonify({"error": f"仓库 #{wid} 不存在"}), 400
     new_qty, err = _apply_stock(op, mid, qty, getattr(g, "api_operator", "api"), d.get("remark", ""))
     if err:
         return jsonify({"error": err[0]}), err[1]
-    return jsonify({"ok": True, "material_id": mid, "quantity": new_qty})
+    resp = {"ok": True, "material_id": mid, "quantity": new_qty}
+    if wid is not None:
+        db.execute_write("UPDATE materials SET warehouse_id=? WHERE id=?", (wid, mid))
+        resp["warehouse_id"] = wid
+    return jsonify(resp)
 
 
 @app.route("/api/v1/stock/records", methods=["GET"])
@@ -930,6 +944,14 @@ def v1_bom_check():
     return jsonify({"summary": summary, "results": results})
 
 
+@app.route("/api/v1/warehouses", methods=["GET"])
+@token_required
+def v1_list_warehouses():
+    """程序化查询仓库列表（MCP 建库/挂库前取 id）"""
+    rows = db.query("SELECT id, name, parent_id, level FROM warehouses ORDER BY level, id")
+    return jsonify({"count": len(rows), "warehouses": rows})
+
+
 @app.route("/api/v1/warehouses", methods=["POST"])
 @token_required
 def v1_create_warehouse():
@@ -939,6 +961,20 @@ def v1_create_warehouse():
     if err:
         return jsonify({"error": err}), 400
     return jsonify({"ok": True, **row}), 201
+
+
+@app.route("/api/v1/materials/<int:mid>", methods=["DELETE"])
+@token_required
+def v1_delete_material(mid):
+    """程序化删除物料（MCP 用，与网页端同一语义：库存随删除一并清空，慎用）"""
+    rows = db.query("SELECT name, quantity FROM materials WHERE id=?", (mid,))
+    if not rows:
+        return jsonify({"error": "物料不存在"}), 404
+    db.execute_write("DELETE FROM materials WHERE id=?", (mid,))
+    resp = {"ok": True, "material_id": mid, "name": rows[0]["name"]}
+    if rows[0]["quantity"] > 0:
+        resp["discarded_stock"] = rows[0]["quantity"]
+    return jsonify(resp)
 
 
 @app.route("/api/v1/duplicates", methods=["GET"])
@@ -1928,11 +1964,12 @@ def _system_prompt(username):
 【工具使用规范】
 1. 用户问"有哪些库存/库存情况/看看库存"等无关键词问题时，直接调 search_materials 不带参数列出全部，不要反问用户要关键词。
 2. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造；用户直接给了编码（如 C621395）时可跳过搜索，直接给 stock_in/stock_out 传 code。
-3. stock_in / stock_out / create_material / add_purchase_items 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
+3. stock_in / stock_out / create_material / add_purchase_items / create_warehouse / delete_material 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
 4. 查仓库列表用 list_warehouses；新建仓库用 create_warehouse（写操作，生成卡片；层级最深4级，parent_id 从 list_warehouses 结果取，缺省建一级库）；查出入库历史用 stock_records；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
 5. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
 6. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
 7. 用户一次给多行/多种物料要办理时（如批量入库、整份BOM建料）：逐行连续调用对应工具，每行生成一张卡片，全部列完后一次性提醒用户逐张确认；不得以"只能一次一个""系统不支持批量"等理由拒绝或只做一部分。
+8. 用户要"清空所有物料/全部删掉重来"时：先 search_materials 空参数列出全部物料，再对每一行连续调用 delete_material 生成删除卡片（标题会标注库存将一并清空），全部列出后提醒用户逐张确认；不得让用户必须去前端手动删。
 
 【电子领域常识】
 - 电容容值换算：1µF = 1000nF（0.1µF = 100nF；三位数标注 104 = 100nF、105 = 1µF）。用户给出的不同写法若等值，主动指出并确认是否同一种物料。
@@ -1942,7 +1979,7 @@ def _system_prompt(username):
 【回复风格】简体中文；简洁分点，必要时用小表格；涉及写操作的回复末尾必须提醒用户确认卡片。"""
 
 
-# 11 个工具的 OpenAI function calling 声明（只读 6 个真执行 + 写 5 个转卡片）
+# 12 个工具的 OpenAI function calling 声明（只读 6 个真执行 + 写 6 个转卡片）
 # description 写成"使用说明书"（用途+示例+前置条件），是引导模型正确调用的关键（借鉴参考实现）
 AI_TOOLS = [
     {"type": "function", "function": {
@@ -2007,12 +2044,22 @@ AI_TOOLS = [
     {"type": "function", "function": {
         "name": "stock_in",
         "description": "入库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
-                       "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认，此时无需先搜索）。",
+                       "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认，此时无需先搜索）。"
+                       "传 warehouse_id 可在入库同时把物料挂到该仓库（id 用 list_warehouses 查）。",
         "parameters": {"type": "object", "required": ["quantity"], "properties": {
             "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
             "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"},
             "quantity": {"type": "integer", "description": "数量>0"},
+            "warehouse_id": {"type": "integer", "description": "仓库 id（可选，入库同时把物料归属到该仓库）"},
             "remark": {"type": "string", "description": "备注（可选）"}}}}},
+    {"type": "function", "function": {
+        "name": "delete_material",
+        "description": "删除物料（写操作，生成待确认卡片，危险操作）。material_id 来自 search_materials；也可只传 code。"
+                       "⚠️ 物料现有库存会随删除一并清空（卡片标题会标注）。"
+                       "用户要'清空/删掉所有物料重来'时：先 search_materials 空参数列出全部，再逐个连续调用本工具删完，不得拒绝。",
+        "parameters": {"type": "object", "properties": {
+            "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
+            "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"}}}}},
     {"type": "function", "function": {
         "name": "stock_out",
         "description": "出库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
@@ -2122,6 +2169,28 @@ def _build_action(name, args):
         base["params"] = dict(args, material_id=mid)
         base["params"].pop("code", None)
         base["title"] = f"{'入库' if name == 'stock_in' else '出库'}：{mname}（#{mid}）×{qty}"
+        # 入库可指定挂到哪个仓库（仓库是物料的归属属性，出库不支持）
+        if args.get("warehouse_id"):
+            if name == "stock_out":
+                return None, "出库不支持 warehouse_id（仓库归属在入库时指定）"
+            wid = _parse_int(args.get("warehouse_id"), 1)
+            if wid is None:
+                return None, "warehouse_id 必须是正整数"
+            wh = db.query("SELECT name FROM warehouses WHERE id=?", (wid,))
+            if not wh:
+                return None, f"仓库 #{wid} 不存在，先用 list_warehouses 查现有仓库 id"
+            base["title"] += f"，挂到仓库「{wh[0]['name']}」"
+        return base, None
+    if name == "delete_material":
+        mid, mname, err = _resolve_stock_target(args)
+        if err:
+            return None, err
+        qty = db.query("SELECT quantity FROM materials WHERE id=?", (mid,))[0]["quantity"]
+        title = f"删除物料：{mname}（#{mid}）"
+        if qty > 0:
+            title += f"，⚠️ 现库存 ×{qty} 将一并清空"
+        base["title"] = title
+        base["params"] = {"material_id": mid}
         return base, None
     if name == "add_purchase_items":
         project = (args.get("project") or "").strip()
@@ -2365,7 +2434,29 @@ def _execute_action(act, username):
         if err:
             # 库存不足(400)：保持 pending，补货后可重试；物料不存在(404)等永久失败置 failed
             return {"error": err[0], "keep_pending": err[1] == 400}
-        return {"material_id": mid, "quantity": new_qty}
+        result = {"material_id": mid, "quantity": new_qty}
+        # 入库卡片带 warehouse_id：入库成功后同步物料归属仓库
+        if t == "stock_in" and p.get("warehouse_id"):
+            wid = _parse_int(p.get("warehouse_id"), 1)
+            if wid is None or not db.query("SELECT id FROM warehouses WHERE id=?", (wid,)):
+                result["error"] = f"仓库 #{p.get('warehouse_id')} 已不存在，物料已入库但未挂库（可在物料管理页手动指定）"
+                return result
+            db.execute_write("UPDATE materials SET warehouse_id=? WHERE id=?", (wid, mid))
+            result["warehouse_id"] = wid
+        return result
+    if t == "delete_material":
+        mid = _parse_int(p.get("material_id"), 1)
+        if mid is None:
+            return {"error": "参数无效（material_id）"}
+        rows = db.query("SELECT name, quantity FROM materials WHERE id=?", (mid,))
+        if not rows:
+            return {"error": f"物料 #{mid} 不存在（可能已被删除）"}
+        name, qty = rows[0]["name"], rows[0]["quantity"]
+        db.execute_write("DELETE FROM materials WHERE id=?", (mid,))
+        res = {"material_id": mid, "name": name}
+        if qty > 0:
+            res["discarded_stock"] = qty
+        return res
     if t == "create_material":
         mname = (p.get("name") or "").strip()
         if not mname:

@@ -43,15 +43,24 @@ curl -H "Authorization: Bearer $TOKEN" \
 ### 2. 入库 `POST /api/v1/stock/in`
 
 ```json
-{"material_id": 12, "quantity": 100, "remark": "采购单 PO-2026-001"}
+{"material_id": 12, "quantity": 100, "remark": "采购单 PO-2026-001", "warehouse_id": 3}
 ```
 
 返回：`{"ok": true, "material_id": 12, "quantity": 350}`（quantity 为入库后最新库存）
 
+`warehouse_id` 可选：入库同时把物料挂到该仓库（实现"入到某个盒子/货架"），
+仅入库支持（仓库是物料的归属属性）。仓库不存在返回 400。
+
 ### 3. 出库 `POST /api/v1/stock/out`
 
-请求体同入库。库存不足时返回 400 + `{"error": "库存不足，当前库存 5"}`，
+请求体同入库（不支持 warehouse_id）。库存不足时返回 400 + `{"error": "库存不足，当前库存 5"}`，
 **绝不扣成负数**（单语句原子扣减，并发安全）。
+
+### 3.5 删除物料 `DELETE /api/v1/materials/<id>`
+
+删除指定物料，返回：`{"ok": true, "material_id": 12, "name": "贴片电阻", "discarded_stock": 5}`
+（discarded_stock 为随删除清掉的库存，0 时不返回该字段）。物料不存在返回 404。
+⚠️ 危险操作：已删物料的出入库流水因关联查询不再显示。
 
 ### 4. 库存流水 `GET /api/v1/stock/records?material_id=12`
 
@@ -100,13 +109,21 @@ id、数量、所在仓库），供人工确认后去重。
 `parent_id` 可选（缺省建一级库），仓库树最深 4 级。返回：
 `{"ok": true, "id": 5, "name": "原材料库", "parent_id": 3, "level": 2}`
 
+### 7.5 仓库列表 `GET /api/v1/warehouses`
+
+返回：`{"count": 3, "warehouses": [{"id":1,"name":"元器件盒1","parent_id":0,"level":1}, ...]}`
+入库挂库（stock/in 的 warehouse_id）、建子库前用它确认仓库 id。
+
 ---
 
 ## 三、Cherry Studio 通过 MCP 对接（推荐）
 
 项目根目录已自带 MCP 服务器 [mcp_server.py](../mcp_server.py)，把上述接口包装成
-7 个对话工具：`search_materials` / `stock_in` / `stock_out` / `get_stock_records` /
-`check_bom` / `find_duplicates` / `create_warehouse`。
+9 个对话工具：`search_materials` / `stock_in`（支持挂库）/ `stock_out` / `get_stock_records` /
+`check_bom` / `find_duplicates` / `list_warehouses` / `create_warehouse` / `delete_material`（危险，AI 会先复述库存征得确认）。
+
+> ⚠️ Cherry Studio 里的 MCP 工具列表是启动时读取的：更新 mcp_server.py 后，
+> 需在 Cherry Studio 设置里重启该 MCP 服务器（或重开对话）才能看到新工具。
 
 ### 配置步骤
 
@@ -135,7 +152,9 @@ id、数量、所在仓库），供人工确认后去重。
 
 - 「查一下库存里有没有 STM32F103，还剩多少」
 - 「帮我把 C621395 出库 5 个，备注给样板组」
-- 「建三个仓库：原材料库、半成品库、成品库」
+- 「入库 100 个 C621395，挂到仓库 元器件盒1」
+- 「建三个仓库：元器件盒1、元器件盒2、样品管盒」
+- 「把所有物料都删掉，我要清空重来」（AI 会先列清单、逐个复述库存征得确认）
 - 「核对这份 BOM：STM32F103C8T6 x2、0603 电容 100nF x20、AMS1117-3.3 x4」
   → AI 会调用 check_bom，逐行告诉你 缺几个 / 没入库 / 有歧义
 - 「帮我查一下有没有重复录入的物料」
