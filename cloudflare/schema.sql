@@ -61,6 +61,6 @@ CREATE INDEX IF NOT EXISTS idx_materials_wh ON materials(warehouse_id);
 CREATE INDEX IF NOT EXISTS idx_wh_parent ON warehouses(parent_id);
 CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
 
--- 默认管理员 admin / admin123（与本地版相同的 pbkdf2:sha256 哈希算法，登录后请尽快改密）
+-- 默认管理员 admin / admin123（pbkdf2:sha256 + 10万次迭代：Workers WebCrypto 迭代上限即10万，登录后请尽快改密）
 INSERT OR IGNORE INTO users(username, password_hash, role)
-VALUES ('admin', 'pbkdf2:sha256:260000$OS9IuyXpjtblWUcm$7bc711af05fbb03665aa6e403a6ec5a436ed16bbaf57c464a26e867034c68d3a', 'admin');
+VALUES ('admin', 'pbkdf2:sha256:100000$7m5DxMTM0jyIfEnz$67263b8deecfbbb8286d2418502981f183f3df5545ebd4b9199bddd2b229a42f', 'admin');

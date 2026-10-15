@@ -122,7 +122,10 @@ def admin_required(f):
 def _hash_password(pw: str) -> str:
     # 显式指定 pbkdf2:sha256：新 Werkzeug 默认 scrypt，但 Cloudflare Workers 的
     # Web Crypto 不支持 scrypt——保持 pbkdf2 是为了将来上云可无缝校验存量密码
-    return generate_password_hash(pw, method="pbkdf2:sha256:260000")
+    # 迭代次数 100000：Cloudflare Workers 的 WebCrypto 硬性上限就是 10 万次
+    # （超限抛 "iteration counts above 100000 are not supported"），云端本地两端统一 10 万；
+    # werkzeug 格式自带迭代数，历史 26 万次的旧哈希在本地 Flask 端仍可正常校验登录
+    return generate_password_hash(pw, method="pbkdf2:sha256:100000")
 
 
 def _verify_password(stored: str, pw: str):

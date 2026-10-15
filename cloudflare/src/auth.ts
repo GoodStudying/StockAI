@@ -2,7 +2,9 @@
  * 认证模块：登录 / 登出 / 会话探测 / 密码哈希
  *
  * 密码兼容设计（与 Flask 版互通）：
- * - 存量格式一：werkzeug "pbkdf2:sha256:260000$salt$hexhash" —— Web Crypto 原生可复算
+ * - 存量格式一：werkzeug "pbkdf2:sha256:<iterations>$salt$hexhash" —— Web Crypto 原生可复算
+ *   ★ Workers 的 WebCrypto 硬性上限 10 万次迭代（超限直接抛错），两端生成哈希统一用 100000；
+ *   历史 260000 次的旧哈希只能本地 Flask 端验证，云端会提示需重置密码
  * - 存量格式二：旧版无盐 SHA-256（64位hex）—— 仅校验（建议登录后改密焕新为 pbkdf2）
  * 会话：JWT(HS256) 存 HttpOnly Cookie，密钥为环境变量 WORKER_SECRET。
  */
@@ -29,11 +31,12 @@ export async function verifyPassword(stored: string, pw: string): Promise<boolea
   if (/^[0-9a-f]{64}$/i.test(stored)) {
     return toHex(await crypto.subtle.digest("SHA-256", enc.encode(pw))) === stored.toLowerCase();
   }
-  // werkzeug pbkdf2 格式：pbkdf2:sha256:260000$salt$hexhash
+  // werkzeug pbkdf2 格式：pbkdf2:sha256:<iterations>$salt$hexhash
   const m = stored.match(/^pbkdf2:sha256:(\d+)\$(.+)\$([0-9a-fA-F]+)$/);
   if (!m) return false;
   const iterations = Number(m[1]);
-  if (!Number.isInteger(iterations) || iterations <= 0 || iterations > 2_000_000) return false;
+  // ★ Workers WebCrypto 上限 10 万次迭代（超限 deriveBits 会抛错），超限视为不可验证
+  if (!Number.isInteger(iterations) || iterations <= 0 || iterations > 100_000) return false;
   try {
     const key = await crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveBits"]);
     const bits = await crypto.subtle.deriveBits(
@@ -44,7 +47,10 @@ export async function verifyPassword(stored: string, pw: string): Promise<boolea
   }
 }
 
-/** 生成密码哈希：与 Flask 版同格式（pbkdf2:sha256:260000$...），两端数据可互迁 */
+/**
+ * 生成密码哈希：与 Flask 版同格式（pbkdf2:sha256:100000$...），两端数据可互迁。
+ * 迭代数必须是 100000——Workers WebCrypto 的硬性上限就是 10 万次。
+ */
 export async function hashPassword(pw: string): Promise<string> {
   // 16 位安全随机可见 ASCII 盐（字母数字，去掉易混淆字符）
   const ABC = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
@@ -52,8 +58,20 @@ export async function hashPassword(pw: string): Promise<string> {
   const salt = [...rnd].map((r) => ABC[r % ABC.length]).join("");
   const key = await crypto.subtle.importKey("raw", enc.encode(pw), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt: enc.encode(salt), iterations: 260000 }, key, 256);
-  return `pbkdf2:sha256:260000$${salt}$${toHex(bits)}`;
+    { name: "PBKDF2", hash: "SHA-256", salt: enc.encode(salt), iterations: 100000 }, key, 256);
+  return `pbkdf2:sha256:100000$${salt}$${toHex(bits)}`;
+}
+
+/**
+ * 检测存储哈希与本平台（Workers）的兼容性：pbkdf2 迭代超 10 万的旧哈希无法在云端验证。
+ * 返回提示语表示不兼容；返回 null 表示兼容（可正常走 verifyPassword）。
+ */
+export function hashCompatIssue(stored: string): string | null {
+  const m = stored.match(/^pbkdf2:sha256:(\d+)\$/);
+  if (m && Number(m[1]) > 100_000) {
+    return "该账户的密码哈希迭代次数超出云平台上限（10万），无法在云端验证；请用管理员账户重置该用户密码后使用";
+  }
+  return null;
 }
 
 /** 当前登录用户类型 */
@@ -118,37 +136,20 @@ auth.post("/api/login", async (c) => {
   const uname = String(d.username ?? "").trim();
   const row = await c.env.DB.prepare(
     "SELECT id, username, role, password_hash FROM users WHERE username=?").bind(uname).first<any>();
-  if (row && await verifyPassword(row.password_hash, String(d.password ?? ""))) {
-    const user = { id: row.id as number, username: row.username as string, role: row.role as string };
-    const jwt = await sign({ ...user, exp: Math.floor(Date.now() / 1000) + SESSION_HOURS }, c.env.WORKER_SECRET);
-    setCookie(c, COOKIE, jwt, {
-      httpOnly: true, secure: true, sameSite: "Lax", path: "/", maxAge: SESSION_HOURS,
-    });
-    return c.json({ ok: true, user });
-  }
-  // 临时诊断（定位线上登录 401 用，确认后移除）：对比存储盐值/哈希前缀与现场复算前缀。
-  // 前缀均为单向派生值与格式片段，不构成密码泄露；salt 明文本就是哈希串的一部分。
-  const diag: Record<string, unknown> = { user_found: !!row };
   if (row) {
-    const stored = row.password_hash as string;
-    diag.hash_head = stored.slice(0, 21);
-    const m = stored.match(/^pbkdf2:sha256:(\d+)\$(.+)\$([0-9a-fA-F]+)$/);
-    diag.fmt_ok = !!m;
-    if (m) {
-      diag.salt = m[2];
-      diag.stored_head = m[3].toLowerCase().slice(0, 12);
-      try {
-        const key = await crypto.subtle.importKey(
-          "raw", enc.encode(String(d.password ?? "")), "PBKDF2", false, ["deriveBits"]);
-        const bits = await crypto.subtle.deriveBits(
-          { name: "PBKDF2", hash: "SHA-256", salt: enc.encode(m[2]), iterations: Number(m[1]) }, key, 256);
-        diag.calc_head = toHex(bits).slice(0, 12);
-      } catch (e: unknown) {
-        diag.derive_err = String(e instanceof Error ? e.message : e);
-      }
+    // 前置兼容检测：超 10 万次迭代的旧哈希在 Workers 上无法验证，给出明确指引而非误导性的"密码错误"
+    const compat = hashCompatIssue(row.password_hash);
+    if (compat) return c.json({ error: compat }, 500);
+    if (await verifyPassword(row.password_hash, String(d.password ?? ""))) {
+      const user = { id: row.id as number, username: row.username as string, role: row.role as string };
+      const jwt = await sign({ ...user, exp: Math.floor(Date.now() / 1000) + SESSION_HOURS }, c.env.WORKER_SECRET);
+      setCookie(c, COOKIE, jwt, {
+        httpOnly: true, secure: true, sameSite: "Lax", path: "/", maxAge: SESSION_HOURS,
+      });
+      return c.json({ ok: true, user });
     }
   }
-  return c.json({ error: "用户名或密码错误", diag }, 401);
+  return c.json({ error: "用户名或密码错误" }, 401);
 });
 
 // ---------------- 登出 ----------------
@@ -180,7 +181,7 @@ auth.get("/api/debug/env", async (c) => {
 });
 
 // ---------------- 部署版本号（与登录页脚的版本标记同步更新，核对线上代码版本用） ----------------
-auth.get("/api/version", (c) => c.json({ version: "v261014.4" }));
+auth.get("/api/version", (c) => c.json({ version: "v261015.1" }));
 
 // ---------------- 用户表诊断（临时：从 Worker 视角查它绑定的 D1，绕开"Console操作的库对不对"的疑问） ----------------
 auth.get("/api/debug/users", async (c) => {

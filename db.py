@@ -190,12 +190,12 @@ CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
 
 def ensure_default_admin():
     """首次启动时创建默认管理员 admin / admin123（加盐 PBKDF2 哈希，非旧版无盐 SHA-256）
-    哈希算法与 app.py 的 _hash_password 保持一致：pbkdf2:sha256（Cloudflare Workers
-    的 Web Crypto 不支持 scrypt，统一 pbkdf2 便于将来上云无缝校验存量密码）"""
+    哈希算法与 app.py 的 _hash_password 保持一致：pbkdf2:sha256 + 10 万次迭代
+    （Cloudflare Workers 的 WebCrypto 不支持 scrypt 且迭代上限 10 万，统一口径便于上云无缝校验）"""
     from werkzeug.security import generate_password_hash
     if not query("SELECT id FROM users WHERE username='admin'"):
         execute_write("INSERT INTO users(username, password_hash, role) VALUES ('admin', ?, 'admin')",
-                      (generate_password_hash("admin123", method="pbkdf2:sha256:260000"),))
+                      (generate_password_hash("admin123", method="pbkdf2:sha256:100000"),))
 
 
 def run_migrations():

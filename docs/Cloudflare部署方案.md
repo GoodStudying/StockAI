@@ -105,13 +105,18 @@ D1 新表字段：`image_r2_key TEXT`、`file_r2_key TEXT`（替代 image_blob/f
 
 ### 3.3 用户密码（可无缝兼容）
 
-现版已用 werkzeug 的 `pbkdf2:sha256:260000$salt$hash` 格式存哈希。
+密码哈希为 werkzeug 的 `pbkdf2:sha256:100000$salt$hash` 格式（10 万次迭代）。
 Worker 端用 Web Crypto 原生能力即可校验，**用户无需改密码**：
 
 ```ts
-// 解析 "pbkdf2:sha256:260000$<salt_b64>$<hash_b64>"，
-// crypto.subtle.deriveBits(PBKDF2-SHA256, 密码, salt, 260000*8) 与存量 hash 比对
+// 解析 "pbkdf2:sha256:100000$<salt>$<hash_b64>"，
+// crypto.subtle.deriveBits(PBKDF2-SHA256, 密码, salt, 100000) 与存量 hash 比对
 ```
+
+> ★ 历史踩坑记录（2026-10 线上实测）：Workers 的 WebCrypto **硬性上限 10 万次迭代**，
+> 26 万次的旧哈希会抛 `iteration counts above 100000 are not supported` 且被 try/catch
+> 吞成"密码错误"。因此两端统一 10 万次；旧的 26 万次哈希只能在本地 Flask 端验证
+> （werkzeug 格式自带迭代数，本地不受影响），若导入云端需先重置密码。
 
 ---
 
