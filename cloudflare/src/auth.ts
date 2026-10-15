@@ -161,8 +161,21 @@ auth.post("/api/logout", (c) => {
 // ---------------- 当前用户 ----------------
 auth.get("/api/me", async (c) => {
   const u = await currentUser(c);
-  // 诊断辅助字段：区分"浏览器没存/没带Cookie"(has_cookie=false)与"带了但校验失败"(true但user=null)
-  return c.json({ user: u, has_cookie: !!getCookie(c, COOKIE) });
+  // 诊断辅助：区分"浏览器没存/没带Cookie"与"带了但校验失败"，并报出校验失败的具体原因
+  const raw = getCookie(c, COOKIE) ?? "";
+  let verify_err: string | null = null;
+  if (raw && !u) {
+    try { await verify(raw, c.env.WORKER_SECRET); } catch (e) {
+      verify_err = String(e instanceof Error ? e.message : e);
+    }
+  }
+  return c.json({
+    user: u,
+    has_cookie: !!raw,
+    cookie_len: raw.length,
+    cookie_head: raw.slice(0, 8),
+    verify_err,
+  });
 });
 
 // ---------------- 默认密码探测（登录页提醒用） ----------------
@@ -183,7 +196,7 @@ auth.get("/api/debug/env", async (c) => {
 });
 
 // ---------------- 部署版本号（与登录页脚的版本标记同步更新，核对线上代码版本用） ----------------
-auth.get("/api/version", (c) => c.json({ version: "v261015.2" }));
+auth.get("/api/version", (c) => c.json({ version: "v261015.3" }));
 
 // ---------------- 用户表诊断（临时：从 Worker 视角查它绑定的 D1，绕开"Console操作的库对不对"的疑问） ----------------
 auth.get("/api/debug/users", async (c) => {
