@@ -952,7 +952,10 @@ chat.post("/api/chat/execute", requireLogin, async (c) => {
   const d = await getJson(c);
   const msgId = parseIntSafe(d.message_id, 1);
   const actionId = String(d.action_id ?? "").trim();
-  if (msgId === null || !actionId) return c.json({ error: "message_id / action_id 不能为空" }, 400);
+  // all=true 为批量模式（一键确认/取消本消息全部 pending 卡片），无需 action_id
+  if (msgId === null || (!actionId && !d.all)) {
+    return c.json({ error: "message_id / action_id 不能为空" }, 400);
+  }
   const u = c.get("user")!;
   const rows = await q<{ user_id: number; actions_json: string | null }>(
     c.env.DB, "SELECT user_id, actions_json FROM chat_messages WHERE id=?", msgId);
@@ -961,12 +964,41 @@ chat.post("/api/chat/execute", requireLogin, async (c) => {
   }
   let acts: any[] = [];
   try { acts = rows[0].actions_json ? JSON.parse(rows[0].actions_json) : []; } catch { acts = []; }
+  const now = nowStrLocal();
+
+  // ---------- 批量模式：一键确认/取消本消息全部 pending 卡片（与 Flask 端同构） ----------
+  if (d.all) {
+    const pendings = acts.filter((a) => a?.status === "pending");
+    if (!pendings.length) return c.json({ error: "该消息没有待确认的卡片" }, 409);
+    let okN = 0, holdN = 0, failN = 0;
+    for (const act of pendings) {
+      if (d.cancel) {   // 批量取消：全部直接置 cancelled
+        act.status = "cancelled";
+        act.executed_at = now;
+        continue;
+      }
+      const result = await executeAction(c.env.DB, act, u.username);
+      act.result = result;
+      if (result?.error && result?.keep_pending) {
+        // 库存不足等可恢复失败：保持 pending 可重试，计入 held
+        holdN++;
+        continue;
+      }
+      act.status = result?.error ? "failed" : "executed";
+      act.executed_at = now;
+      if (result?.error) failN++; else okN++;
+    }
+    await c.env.DB.prepare("UPDATE chat_messages SET actions_json=? WHERE id=?")
+      .bind(JSON.stringify(acts), msgId).run();
+    if (d.cancel) return c.json({ ok: true, actions: acts, summary: { cancelled: pendings.length } });
+    return c.json({ ok: true, actions: acts, summary: { executed: okN, held: holdN, failed: failN } });
+  }
+
   const act = acts.find((a) => a?.id === actionId);
   if (!act) return c.json({ error: "操作卡片不存在" }, 404);
   if (act.status !== "pending") {
     return c.json({ error: `该卡片已处理（状态：${act.status}），不可重复操作` }, 409);
   }
-  const now = nowStrLocal();
 
   if (d.cancel) {
     act.status = "cancelled";

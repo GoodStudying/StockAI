@@ -199,7 +199,7 @@ auth.get("/api/debug/env", async (c) => {
 });
 
 // ---------------- 部署版本号（与登录页脚的版本标记同步更新，核对线上代码版本用） ----------------
-auth.get("/api/version", (c) => c.json({ version: "v261016.1" }));
+auth.get("/api/version", (c) => c.json({ version: "v261016.2" }));
 
 // ---------------- 用户表诊断（临时：从 Worker 视角查它绑定的 D1，绕开"Console操作的库对不对"的疑问） ----------------
 auth.get("/api/debug/users", async (c) => {

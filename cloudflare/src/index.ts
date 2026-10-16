@@ -36,6 +36,8 @@ app.route("/", apiRoutes);
 app.route("/", v1Routes);
 app.route("/", chatRoutes);
 
+// favicon 无需 Worker 路由：assets 托管 ../static 且按根路径直出（/favicon.ico 直接命中同名文件）
+
 // 全局兜底：任何未捕获异常一律返回 JSON（与 Flask 版错误格式一致），避免默认 HTML 错误页
 app.onError((err, c) => {
   console.error("unhandled:", err);

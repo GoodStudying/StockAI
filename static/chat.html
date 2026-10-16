@@ -9,6 +9,9 @@
 /* 尽早应用主题，防止刷新时闪回默认配色 */
 (function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
 </script>
+<link rel="icon" type="image/x-icon" href="/favicon.ico">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
 <link rel="stylesheet" href="/style.css">
 <style>
 /* ===== 对话式布局：头像 + 左右分侧 + 状态 ===== */
@@ -50,6 +53,9 @@
 .bubble code { font-family: Consolas, monospace; font-size: .92em;
   background: rgba(128,128,128,.12); padding: 0 4px; border-radius: 4px; }
 .bubble pre code { background: none; padding: 0; }
+
+/* 批量确认条：同一消息 pending 卡片 ≥2 张时出现（一次性入库50种不用点50次） */
+.batch-ops { display: flex; gap: 8px; align-items: center; padding: 2px 0; }
 </style>
 </head>
 <body>
@@ -210,6 +216,9 @@ function renderMsg(m, where = 'append') {
   main.appendChild(b);
 
   (m.actions || []).forEach(a => main.appendChild(renderCard(m.id, a)));
+  /* 同一消息 pending 卡片 ≥2 张时附批量确认条（一键全部确认/取消） */
+  const pendN = (m.actions || []).filter(a => a.status === 'pending').length;
+  if (pendN >= 2) main.appendChild(batchBar(m.id, pendN));
 
   const meta = document.createElement('div');
   meta.className = 'm-meta';
@@ -281,9 +290,74 @@ async function execAction(msgId, actionId, cancel) {
       body: JSON.stringify({ message_id: msgId, action_id: actionId, cancel }),
     });
     if (card) card.replaceWith(renderCard(msgId, r.action));
+    refreshBatchBar(msgId);   /* pending 数量变化，同步批量条 */
   } catch (e) {
     /* 失败信息已 alert；按钮恢复（库存不足保持 pending 可重试） */
     if (card) card.querySelectorAll('button').forEach(b => b.disabled = false);
+  }
+}
+
+/* ---------- 批量确认/取消（同一条消息的全部 pending 卡片） ---------- */
+/* 批量确认条：数量由调用方显式传入（首屏来自消息数据，刷新来自 DOM，批量来自响应） */
+function batchBar(msgId, n) {
+  const bar = document.createElement('div');
+  bar.className = 'batch-ops';
+  bar.innerHTML =
+    `<button class="btn" style="background:var(--green);color:#fff;border:none" ` +
+    `onclick="execBatch(${msgId},false)">✓ 全部确认（${n} 张）</button>` +
+    `<button class="btn" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)" ` +
+    `onclick="execBatch(${msgId},true)">全部取消</button>`;
+  return bar;
+}
+
+/* 按当前 pending 数量重画/移除批量条（单卡确认后调用） */
+function refreshBatchBar(msgId) {
+  const row = document.querySelector(`.msg-row[data-id="${msgId}"]`);
+  if (!row) return;
+  row.querySelectorAll('.batch-ops').forEach(el => el.remove());
+  const n = row.querySelectorAll('.action-card.pending').length;
+  if (n >= 2) {
+    const main = row.querySelector('.msg-main');
+    main.insertBefore(batchBar(msgId, n), main.querySelector('.m-meta'));
+  }
+}
+
+/* 批量执行：{message_id, all: true, cancel?}；服务端逐张执行返回整组卡片 + summary */
+async function execBatch(msgId, cancel) {
+  if (!cancel) {
+    const n = document.querySelectorAll(`.msg-row[data-id="${msgId}"] .action-card.pending`).length;
+    if (!confirm(`确认一次性执行本消息全部 ${n} 张待确认卡片？\n（单张失败不影响其他卡片）`)) return;
+  }
+  const row = document.querySelector(`.msg-row[data-id="${msgId}"]`);
+  if (row) row.querySelectorAll('.batch-ops button, .action-card.pending button')
+    .forEach(b => b.disabled = true);
+  try {
+    const r = await api('/api/chat/execute', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: msgId, all: true, cancel }),
+    });
+    /* 服务端返回该消息全部卡片最新状态：整组重画（卡片 + 批量条） */
+    const main = row.querySelector('.msg-main');
+    main.querySelectorAll('.action-card, .batch-ops').forEach(el => el.remove());
+    const frag = document.createDocumentFragment();
+    r.actions.forEach(a => frag.appendChild(renderCard(msgId, a)));
+    const pendN2 = r.actions.filter(a => a.status === 'pending').length;
+    if (pendN2 >= 2) frag.appendChild(batchBar(msgId, pendN2));
+    main.insertBefore(frag, main.querySelector('.m-meta'));
+    /* 结果摘要：全部成功悄悄带过；有保留/失败才弹窗提醒 */
+    const s = r.summary || {};
+    if (cancel) { setStatus('done', `已批量取消 ${s.cancelled || 0} 张`); return; }
+    if (s.held || s.failed) {
+      alert(`批量执行完成：成功 ${s.executed || 0} 张` +
+        (s.held ? `，保留待确认 ${s.held} 张（库存不足等，可处理后重试）` : '') +
+        (s.failed ? `，失败 ${s.failed} 张（详见卡片）` : ''));
+    } else {
+      setStatus('done', `批量执行 ${s.executed || 0} 张全部成功`);
+    }
+  } catch (e) {
+    /* 失败已 alert；按钮恢复 */
+    if (row) row.querySelectorAll('.batch-ops button, .action-card.pending button')
+      .forEach(b => b.disabled = false);
   }
 }
 

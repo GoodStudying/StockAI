@@ -48,7 +48,7 @@ function renderNav(active) {
   const cur = localStorage.getItem('theme') || 'classic';
   return `
   <aside class="nav">
-    <div class="brand">个人ERP<small>INVENTORY</small></div>
+    <div class="brand"><img class="brand-logo" src="/logo-64.png" alt="logo"><span class="brand-txt">个人ERP<small>INVENTORY</small></span></div>
     ${pages.map(([href, label, ico]) =>
       `<a href="${href}" class="${href === active ? 'active' : ''}"><span class="ico">${ico}</span>${label}</a>`).join('')}
     <span class="spacer"></span>

@@ -409,6 +409,14 @@ def index():
     return send_from_directory("static", "index.html")
 
 
+@app.route("/favicon.ico")
+def favicon():
+    """根路径 favicon：浏览器地址栏/书签栏会直接请求 /favicon.ico（不走 <link> 标签），
+    必须单独提供根路由，否则日志里每次访问都记一条 404。"""
+    return send_from_directory("static", "favicon.ico", mimetype="image/x-icon",
+                               max_age=86400)   # 图标基本不变，缓存 1 天
+
+
 @app.after_request
 def _cache_headers(resp):
     """静态资源缓存策略：css/js 短缓存（60s），侧栏切换不再每次回源发条件请求
@@ -2762,13 +2770,16 @@ def _execute_action(act, username):
 @login_required
 def chat_execute():
     """
-    确认/取消 AI 生成的操作卡片。body: {message_id, action_id, cancel?}
+    确认/取消 AI 生成的操作卡片。body: {message_id, action_id, cancel?}；
+    或批量模式 {message_id, all: true, cancel?} —— 一键确认/取消本消息全部 pending 卡片
+    （逐张执行，单张失败不影响其他；库存不足等可恢复失败保持 pending）。
     幂等状态机：pending → executed / cancelled / failed；非 pending 一律 409（防双击重放）。
     """
     d = request.get_json(force=True)
     msg_id = _parse_int(d.get("message_id"), 1)
     action_id = (d.get("action_id") or "").strip()
-    if not msg_id or not action_id:
+    # all=true 为批量模式（一键确认/取消本消息全部 pending 卡片），无需 action_id
+    if not msg_id or (not action_id and not d.get("all")):
         return jsonify({"error": "message_id / action_id 不能为空"}), 400
     uid = session["user"]["id"]
     rows = db.query("SELECT user_id, actions_json FROM chat_messages WHERE id=?", (msg_id,))
@@ -2778,6 +2789,39 @@ def chat_execute():
         acts = json.loads(rows[0]["actions_json"] or "[]")
     except (ValueError, TypeError):
         acts = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # ---------- 批量模式：一键确认/取消本消息全部 pending 卡片 ----------
+    # （AI 批量建料/入库时一条消息可能带几十张卡片，逐张点确认不现实）
+    if d.get("all"):
+        pendings = [a for a in acts if a.get("status") == "pending"]
+        if not pendings:
+            return jsonify({"error": "该消息没有待确认的卡片"}), 409
+        ok_n, hold_n, fail_n = 0, 0, 0
+        for act in pendings:
+            if d.get("cancel"):
+                act.update(status="cancelled", executed_at=now)
+                continue
+            result = _execute_action(act, session["user"]["username"])
+            act["result"] = result
+            if result.get("error") and result.get("keep_pending"):
+                # 库存不足等可恢复失败：保持 pending（其余卡片照常执行）
+                hold_n += 1
+                continue
+            act["status"] = "failed" if result.get("error") else "executed"
+            act["executed_at"] = now
+            if result.get("error"):
+                fail_n += 1
+            else:
+                ok_n += 1
+        db.execute_write("UPDATE chat_messages SET actions_json=? WHERE id=?",
+                         (json.dumps(acts, ensure_ascii=False, default=str), msg_id))
+        if d.get("cancel"):
+            return jsonify({"ok": True, "actions": acts,
+                            "summary": {"cancelled": len(pendings)}})
+        return jsonify({"ok": True, "actions": acts,
+                        "summary": {"executed": ok_n, "held": hold_n, "failed": fail_n}})
+
     act = next((a for a in acts if a.get("id") == action_id), None)
     if not act:
         return jsonify({"error": "操作卡片不存在"}), 404

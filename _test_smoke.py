@@ -350,6 +350,63 @@ hist = c.get("/api/chat/history?limit=5").get_json()
 last_acts = [m for m in hist["messages"] if m["actions"]][-1]["actions"]
 check("库存不足卡片保持pending(可补货后重试)", last_acts[0]["status"] == "pending", last_acts[0]["status"])
 
+# 场景c2：批量确认 —— 一条消息多张卡片一键执行（50 种材料入库不用点 50 次）
+m1_before_batch = dbm.query("SELECT quantity FROM materials WHERE id=?", (m1,))[0]["quantity"]
+app_module._llm_chat = scripted_llm([
+    ("", [("stock", {"op": "in", "material_id": m1, "quantity": 5, "remark": "批量A"}),
+          ("stock", {"op": "in", "material_id": m1, "quantity": 3, "remark": "批量B"})]),
+    "已生成2张入库卡片，请批量确认。",
+])
+r = c.post("/api/chat", json={"message": "入库5个再入库3个"})
+d = r.get_json()
+check("一条消息生成2张pending卡片", len(d["actions"]) == 2
+      and all(a["status"] == "pending" for a in d["actions"]), str(len(d.get("actions", []))))
+check("批量确认前库存未变", dbm.query("SELECT quantity FROM materials WHERE id=?", (m1,))[0]["quantity"]
+      == m1_before_batch)
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "all": True})
+jd = r.get_json()
+check("批量执行成功", r.status_code == 200 and jd.get("ok") is True)
+check("批量summary=成功2张", jd.get("summary") == {"executed": 2, "held": 0, "failed": 0}, str(jd.get("summary")))
+check("两张卡片均executed", all(a["status"] == "executed" for a in jd["actions"]))
+check("批量执行后库存累计+8", dbm.query("SELECT quantity FROM materials WHERE id=?", (m1,))[0]["quantity"]
+      == m1_before_batch + 8, f"{m1_before_batch}+8")
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "all": True})
+check("无待确认卡片时批量返回409", r.status_code == 409)
+
+# 场景c3：批量混入库存不足 —— 可执行的照常执行，不足的保持 pending 计入 held
+m1_before_hold = dbm.query("SELECT quantity FROM materials WHERE id=?", (m1,))[0]["quantity"]
+app_module._llm_chat = scripted_llm([
+    ("", [("stock", {"op": "out", "material_id": m1, "quantity": 1}),
+          ("stock", {"op": "out", "material_id": m1, "quantity": 999999})]),
+    "已生成2张出库卡片。",
+])
+r = c.post("/api/chat", json={"message": "出1个再出一大堆"})
+d = r.get_json()
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "all": True})
+jd = r.get_json()
+check("批量混不足summary=成功1保留1", jd.get("summary") == {"executed": 1, "held": 1, "failed": 0},
+      str(jd.get("summary")))
+st = {a["params"].get("remark") or a["params"].get("quantity"): a["status"] for a in jd["actions"]}
+check("正常出库executed/超额保持pending", "executed" in st.values() and "pending" in st.values())
+check("批量中可执行卡片已生效(-1)", dbm.query("SELECT quantity FROM materials WHERE id=?", (m1,))[0]["quantity"]
+      == m1_before_hold - 1)
+
+# 场景c4：批量取消 —— 全部 pending 一键取消
+app_module._llm_chat = scripted_llm([
+    ("", [("stock", {"op": "in", "material_id": m1, "quantity": 7}),
+          ("stock", {"op": "in", "material_id": m1, "quantity": 9})]),
+    "已生成2张卡片。",
+])
+r = c.post("/api/chat", json={"message": "再入库两种"})
+d = r.get_json()
+m1_before_cancel = dbm.query("SELECT quantity FROM materials WHERE id=?", (m1,))[0]["quantity"]
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "all": True, "cancel": True})
+jd = r.get_json()
+check("批量取消成功", r.status_code == 200 and jd["summary"] == {"cancelled": 2}, str(jd.get("summary")))
+check("两张卡片均cancelled", all(a["status"] == "cancelled" for a in jd["actions"]))
+check("批量取消库存不变", dbm.query("SELECT quantity FROM materials WHERE id=?", (m1,))[0]["quantity"]
+      == m1_before_cancel)
+
 # 场景d：非本人卡片 403（先清登录限流：[9]段按IP记录，同IP的u2会被连坐429）
 c.post("/api/users", json={"username": "u2", "password": "u2pass123", "role": "user"})
 app_module._LOGIN_ATTEMPTS.clear()
@@ -565,6 +622,16 @@ check("js 带60s缓存头", "max-age=60" in r.headers.get("Cache-Control", ""),
 r = c.get("/chat.html")
 check("html 不缓存", "no-cache" in r.headers.get("Cache-Control", ""),
       r.headers.get("Cache-Control"))
+
+# logo/favicon：根路径兜底路由 + 静态图标文件
+r = c.get("/favicon.ico")
+check("根路径favicon.ico返回图标", r.status_code == 200
+      and r.headers.get("Content-Type") == "image/x-icon" and len(r.data) > 1000)
+r = c.get("/favicon-32.png")
+check("favicon-32.png 可访问", r.status_code == 200
+      and r.headers.get("Content-Type") == "image/png")
+r = c.get("/logo-64.png")
+check("侧栏logo图片可访问", r.status_code == 200)
 
 app_module._llm_chat = real_llm
 
