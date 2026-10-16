@@ -9,10 +9,12 @@ CREATE INDEX IF NOT EXISTS idx_materials_wh ON materials(warehouse_id);
 CREATE INDEX IF NOT EXISTS idx_wh_parent ON warehouses(parent_id);
 CREATE INDEX IF NOT EXISTS idx_records_mat ON stock_records(material_id);
 CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL, actions_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS chat_messages (id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, role TEXT NOT NULL CHECK(role IN ('user','assistant')), content TEXT NOT NULL, actions_json TEXT, usage_json TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS purchase_items (id INTEGER PRIMARY KEY, project TEXT NOT NULL, material_id INTEGER REFERENCES materials(id) ON DELETE SET NULL, name TEXT NOT NULL, code TEXT DEFAULT '', model TEXT DEFAULT '', need_qty INTEGER NOT NULL CHECK(need_qty > 0), unit TEXT DEFAULT '个', remark TEXT DEFAULT '', created_by TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS purchase_batches (id INTEGER PRIMARY KEY, purchase_item_id INTEGER NOT NULL REFERENCES purchase_items(id) ON DELETE CASCADE, qty INTEGER NOT NULL CHECK(qty > 0), remark TEXT DEFAULT '', created_by TEXT, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE INDEX IF NOT EXISTS idx_chat_user ON chat_messages(user_id, id);
 CREATE INDEX IF NOT EXISTS idx_pitem_project ON purchase_items(project);
 CREATE INDEX IF NOT EXISTS idx_pbatch_item ON purchase_batches(purchase_item_id);
 INSERT OR IGNORE INTO users(username, password_hash, role) VALUES ('admin', 'pbkdf2:sha256:100000$7m5DxMTM0jyIfEnz$67263b8deecfbbb8286d2418502981f183f3df5545ebd4b9199bddd2b229a42f', 'admin');
+-- 老库升级补列（若报 duplicate column name 说明已有，忽略即可）
+ALTER TABLE chat_messages ADD COLUMN usage_json TEXT;

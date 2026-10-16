@@ -17,7 +17,7 @@ import { llmPlain } from "./ai";
 
 const api = new Hono<AppEnv>();
 
-const MAX_WAREHOUSE_LEVEL = 4;
+export const MAX_WAREHOUSE_LEVEL = 4;
 
 /** 手动上传文件类功能仍需 R2（阶段2），保留占位提示 */
 const NOT_SUPPORTED = { error: "云端版暂不支持手动上传文件（待 R2 阶段开放）；立创自动抓取手册/图片已支持（存外链）" };
@@ -25,7 +25,7 @@ const NOT_SUPPORTED = { error: "云端版暂不支持手动上传文件（待 R2
 // ---------------- 仓库管理 ----------------
 
 /** 内存递归收集仓库及全部子孙库 id（数据量小，比递归 CTE 直观且两端行为一致） */
-function descendantIds(rows: { id: number; parent_id: number | null }[], wid: number): number[] {
+export function descendantIds(rows: { id: number; parent_id: number | null }[], wid: number): number[] {
   const ids = [wid];
   for (const r of rows) {
     if (r.parent_id === wid) ids.push(...descendantIds(rows, r.id));

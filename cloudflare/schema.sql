@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     role TEXT NOT NULL CHECK(role IN ('user','assistant')),
     content TEXT NOT NULL,
     actions_json TEXT,
+    usage_json TEXT,
     created_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 

@@ -281,8 +281,9 @@ print("[13] AI 对话")
 
 
 def scripted_llm(seq):
-    """monkeypatch _llm_chat：按脚本序列返回 (文本, 工具调用列表)。
-    seq 元素 = "纯文本" 或 ("中间文本", [("工具名", {参数}), ...])"""
+    """monkeypatch _llm_chat：按脚本序列返回 (文本, 工具调用列表, usage)。
+    seq 元素 = "纯文本" 或 ("中间文本", [("工具名", {参数}), ...])。
+    每次调用附带假 usage（prompt 10 / completion 5），供 token 用量累加断言。"""
     it = iter(seq)
     def fake(cfg, messages, tools=None):
         item = next(it)
@@ -290,29 +291,32 @@ def scripted_llm(seq):
         tcs = [{"id": f"call_{i}", "type": "function",
                 "function": {"name": n, "arguments": json.dumps(a, ensure_ascii=False)}}
                for i, (n, a) in enumerate(calls)]
-        return content, tcs
+        return content, tcs, {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
     return fake
 
 
 real_llm = app_module._llm_chat
 
-# 场景a：只读工具真执行（search_materials）
+# 场景a：只读工具真执行（query：v261016.1 起一切查询走只读 SQL）
 app_module._llm_chat = scripted_llm([
-    ("先搜索", [("search_materials", {"q": "电容"})]),
+    ("先搜索", [("query", {"sql": "SELECT * FROM materials WHERE name LIKE '%电容%'"})]),
     "找到 3 条物料，请告诉我数量。",
 ])
 r = c.post("/api/chat", json={"message": "有没有电容"})
 d = r.get_json()
 check("只读对话正常返回文本", r.status_code == 200 and d["content"] == "找到 3 条物料，请告诉我数量。")
 check("只读对话无卡片", d["actions"] == [])
+check("token用量返回并落库(2轮×15=30)",
+      d["usage"]["total_tokens"] == 30 and d["usage"]["prompt_tokens"] == 20, str(d.get("usage")))
 hist = c.get("/api/chat/history").get_json()
 check("对话双方消息落库", hist["messages"][-2]["role"] == "user"
       and hist["messages"][-1]["role"] == "assistant")
+check("历史消息带usage", hist["messages"][-1].get("usage", {}).get("total_tokens") == 30)
 
 # 场景b：写工具拦截转卡片 → 确认执行 → 重复 409
 m1_qty_before = dbm.query("SELECT quantity FROM materials WHERE code='C123456' ORDER BY id")[0]["quantity"]
 app_module._llm_chat = scripted_llm([
-    ("", [("stock_in", {"material_id": m1, "quantity": 5, "remark": "AI测试入库"})]),
+    ("", [("stock", {"op": "in", "material_id": m1, "quantity": 5, "remark": "AI测试入库"})]),
     "已生成入库卡片，请确认。",
 ])
 r = c.post("/api/chat", json={"message": "入库5个电容"})
@@ -335,7 +339,7 @@ check("重复确认返回409(幂等)", r.status_code == 409)
 
 # 场景c：出库库存不足 → 卡片保持 pending 可重试
 app_module._llm_chat = scripted_llm([
-    ("", [("stock_out", {"material_id": m1, "quantity": 999999})]),
+    ("", [("stock", {"op": "out", "material_id": m1, "quantity": 999999})]),
     "已生成出库卡片。",
 ])
 r = c.post("/api/chat", json={"message": "出库一大堆"})
@@ -358,7 +362,7 @@ check("非admin读AI配置返回403", r.status_code == 403)
 
 # 场景e：轮次用尽 → 追加无 tools 请求逼出文本
 app_module._llm_chat = scripted_llm(
-    [("继续", [("search_materials", {"q": f"轮{i}"})]) for i in range(8)] + ["已到上限的总结文本。"])
+    [("继续", [("query", {"sql": f"SELECT {i}"})]) for i in range(8)] + ["已到上限的总结文本。"])
 r = c.post("/api/chat", json={"message": "疯狂搜索"})
 d = r.get_json()
 check("8轮用尽后逼出总结文本", r.status_code == 200 and d["content"] == "已到上限的总结文本。"
@@ -415,26 +419,38 @@ check("编辑已补全物料成功", r.status_code == 200)
 check("全字段已填时跳过重复抓取", called["n"] == 0, f"fetch_detail called {called['n']}")
 
 # ---------- 15. AI 体验升级：全量查询 / 流水工具 / code直操作 / temperature降级 / BOM智能匹配 ----------
-print("[15] AI 体验升级")
-# a. search_materials 空参数 = 全量库存（"我现在有哪些库存"的合法路径）
-res, _ = app_module._run_tool("search_materials", {}, "admin")
-check("search_materials空参数=全部库存", res["count"] == res["total"] and res["total"] >= 4,
-      f"count={res['count']} total={res['total']}")
+print("[15] AI 体验升级 + 工具整合（query 只读SQL）")
+# a. query 无关键词全量（"我现在有哪些库存"的合法路径）
+res, _ = app_module._run_tool("query", {"sql": "SELECT * FROM materials ORDER BY id DESC"}, "admin")
+check("query查全部库存", res["count"] >= 4 and "name" in res["rows"][0], f"count={res['count']}")
+# query 防线：非 SELECT / 分号多语句 / 白名单外表 / 自动 LIMIT
+res, _ = app_module._run_tool("query", {"sql": "DELETE FROM materials"}, "admin")
+check("query拒绝写操作", "只允许 SELECT" in res["error"])
+res, _ = app_module._run_tool("query", {"sql": "SELECT * FROM materials; DROP TABLE materials"}, "admin")
+check("query拒绝多语句(分号)", "分号" in res["error"])
+res, _ = app_module._run_tool("query", {"sql": "SELECT * FROM users"}, "admin")
+check("query表白名单拦截(users)", "不在允许范围" in res["error"])
+res, _ = app_module._run_tool("query",
+                              {"sql": "SELECT COUNT(*) AS n FROM materials GROUP BY warehouse_id"}, "admin")
+check("query联表统计可用(GROUP BY)", res["count"] >= 1 and "n" in res["rows"][0])
 r = c.get("/api/v1/materials", headers=H)
 check("/api/v1 无参数仍要求400(只放开AI入口)", r.status_code == 400)
-# b. stock_records 空关键词 = 最近流水
-res, _ = app_module._run_tool("stock_records", {}, "admin")
-check("stock_records空关键词=最近流水", res["count"] > 0 and "material_name" in res["records"][0])
-res2, _ = app_module._run_tool("stock_records", {"keyword": "C77343"}, "admin")
-check("stock_records按编码过滤", all(x["material_code"] == "C77343" for x in res2["records"]))
-# c. stock_in 直接给 code：C77343 唯一命中 → 出卡片且参数落 material_id
-res, action = app_module._run_tool("stock_in", {"code": "C77343", "quantity": 2}, "admin")
-check("code唯一命中直接出卡片", action is not None
+# b. query 查流水（替代原 stock_records 工具）
+res, _ = app_module._run_tool("query", {"sql":
+    "SELECT r.type, r.quantity, m.name AS material_name FROM stock_records r "
+    "JOIN materials m ON m.id = r.material_id ORDER BY r.id DESC"}, "admin")
+check("query查流水(联表)", res["count"] > 0 and "material_name" in res["rows"][0])
+# c. stock 直接给 code：C77343 唯一命中 → 出卡片且参数落 material_id
+res, action = app_module._run_tool("stock", {"op": "in", "code": "C77343", "quantity": 2}, "admin")
+check("code唯一命中直接出卡片", action is not None and action["type"] == "stock_in"
       and action["params"].get("material_id") == m2 and "code" not in action["params"],
       str(action and action["params"]))
 # C123456 有两条同编码物料 → 多候选不出卡片
-res, action = app_module._run_tool("stock_in", {"code": "C123456", "quantity": 2}, "admin")
+res, action = app_module._run_tool("stock", {"op": "in", "code": "C123456", "quantity": 2}, "admin")
 check("code多候选返回候选列表(不出卡片)", action is None and len(res.get("candidates", [])) == 2)
+# stock 缺 op → 自纠错误
+res, action = app_module._run_tool("stock", {"code": "C77343", "quantity": 2}, "admin")
+check("stock缺op被拒", action is None and "op" in res["error"])
 # d. temperature 降级：第一次 400 含 temperature，第二次 200
 class FakeResp:
     def __init__(self, status, text="", payload=None):
@@ -451,8 +467,8 @@ def fake_post(url, headers=None, json=None, timeout=None):
 real_post = app_module.http_req.post
 app_module.http_req.post = fake_post
 try:
-    tcontent, _ = app_module._llm_chat({"base_url": "https://x", "api_key": "k", "model": "m"},
-                                       [{"role": "user", "content": "hi"}], None)
+    tcontent, _, _u = app_module._llm_chat({"base_url": "https://x", "api_key": "k", "model": "m"},
+                                           [{"role": "user", "content": "hi"}], None)
 finally:
     app_module.http_req.post = real_post
 check("temperature报错自动降级重试成功", tcontent == "ok" and temp_calls["n"] == 2)
@@ -490,12 +506,12 @@ print("[16] 新建仓库（AI 工具 + 开放接口）")
 c.post("/api/ai/config", json={"base_url": "https://api.fake/v1", "model": "fake",
                                "api_key": "sk-fake"})
 app_module._llm_chat = scripted_llm([
-    ("", [("create_warehouse", {"name": "AI原材料库"})]),
+    ("", [("warehouse", {"action": "create", "name": "AI原材料库"})]),
     "已生成仓库卡片，请确认。",
 ])
 r = c.post("/api/chat", json={"message": "建个原材料库"})
 d = r.get_json()
-check("create_warehouse 生成1张卡片", len(d["actions"]) == 1, str(d["actions"]))
+check("warehouse create 生成1张卡片", len(d["actions"]) == 1, str(d["actions"]))
 a_ok = d["actions"][0]
 check("一级库卡片标题", "AI原材料库" in a_ok["title"] and "1 级" in a_ok["title"], a_ok["title"])
 r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "action_id": a_ok["id"]})
@@ -505,14 +521,14 @@ check("仓库已落库(1级)", len(row) == 1 and row[0]["level"] == 1, str(row))
 
 # 卡片构建阶段预校验：父级不存在 → 不生成卡片，模型收到 error 自纠
 app_module._llm_chat = scripted_llm([
-    ("", [("create_warehouse", {"name": "AI子库", "parent_id": 9999})]),
+    ("", [("warehouse", {"action": "create", "name": "AI子库", "parent_id": 9999})]),
     "父级库不存在，已告知用户。",
 ])
 r = c.post("/api/chat", json={"message": "建个子库"})
 check("坏父级不生成卡片", r.get_json()["actions"] == [])
 # 但是 execute 阶段失败路径也要覆盖：直接构造 pending 卡片执行（模拟旧卡片/并发边界）
 app_module._llm_chat = scripted_llm([
-    ("", [("create_warehouse", {"name": "AI孤儿库", "parent_id": 9999})]),
+    ("", [("warehouse", {"action": "create", "name": "AI孤儿库", "parent_id": 9999})]),
     "已生成卡片。",
 ])
 r = c.post("/api/chat", json={"message": "再建个子库"})
@@ -563,12 +579,12 @@ wid = dbm.query("SELECT id FROM warehouses WHERE name='AI原材料库'")[0]["id"
 
 # AI 删除卡片：标题必须标注"库存将一并清空"
 app_module._llm_chat = scripted_llm([
-    ("", [("delete_material", {"material_id": mid_del})]),
+    ("", [("material", {"action": "delete", "material_id": mid_del})]),
     "已生成删除卡片，请确认。",
 ])
 r = c.post("/api/chat", json={"message": "把待删电阻删掉"})
 d = r.get_json()
-check("delete_material 生成1张卡片", len(d["actions"]) == 1, str(d["actions"]))
+check("material delete 生成1张卡片", len(d["actions"]) == 1, str(d["actions"]))
 a_del = d["actions"][0]
 check("删除卡片标题含清空库存警告",
       "删除物料" in a_del["title"] and "待删电阻" in a_del["title"] and "×5" in a_del["title"],
@@ -580,7 +596,7 @@ check("物料已删除", not dbm.query("SELECT id FROM materials WHERE id=?", (m
 
 # 删除不存在的物料：预校验拦截，不生成卡片
 app_module._llm_chat = scripted_llm([
-    ("", [("delete_material", {"material_id": 99999})]),
+    ("", [("material", {"action": "delete", "material_id": 99999})]),
     "物料不存在，已告知用户。",
 ])
 r = c.post("/api/chat", json={"message": "删掉#99999"})
@@ -590,7 +606,7 @@ check("删不存在物料不生成卡片", r.get_json()["actions"] == [])
 r = c.post("/api/materials", json={"name": "挂库电容", "code": "WH0001"})
 mid_wh = r.get_json()["id"]
 app_module._llm_chat = scripted_llm([
-    ("", [("stock_in", {"material_id": mid_wh, "quantity": 7, "warehouse_id": wid})]),
+    ("", [("stock", {"op": "in", "material_id": mid_wh, "quantity": 7, "warehouse_id": wid})]),
     "已生成入库卡片，请确认。",
 ])
 r = c.post("/api/chat", json={"message": "入库7个挂库电容到原材料库"})
@@ -605,13 +621,13 @@ check("入库挂库执行成功", res.get("warehouse_id") == wid and row["quanti
 
 # 坏仓库/出库带仓库 → 预校验拦截，不生成卡片
 app_module._llm_chat = scripted_llm([
-    ("", [("stock_in", {"material_id": mid_wh, "quantity": 1, "warehouse_id": 9999})]),
+    ("", [("stock", {"op": "in", "material_id": mid_wh, "quantity": 1, "warehouse_id": 9999})]),
     "仓库不存在，已告知用户。",
 ])
 r = c.post("/api/chat", json={"message": "入库1个到#9999库"})
 check("入库坏仓库不生成卡片", r.get_json()["actions"] == [])
 app_module._llm_chat = scripted_llm([
-    ("", [("stock_out", {"material_id": mid_wh, "quantity": 1, "warehouse_id": wid})]),
+    ("", [("stock", {"op": "out", "material_id": mid_wh, "quantity": 1, "warehouse_id": wid})]),
     "出库不支持挂仓库，已告知用户。",
 ])
 r = c.post("/api/chat", json={"message": "出库1个挂到原材料库"})
@@ -637,6 +653,84 @@ check("/api/v1 入库坏仓库 400", r.status_code == 400)
 dbm.execute_write("DELETE FROM materials WHERE id=?", (mid_v1,))
 
 app_module._llm_chat = real_llm
+
+
+# ---------- 18. 工具整合新能力：material update / warehouse update+delete / purchase 批次 ----------
+print("[18] 整合新能力（改物料/改删仓库/采购批次）")
+# AI 配置在 [17] 仍有效（sk-fake），直接用 _run_tool + _build_action 测建卡与执行核心
+
+# --- material update：改名 + 编码（确认执行后生效），数量字段被拦截 ---
+res, action = app_module._run_tool("material",
+                                   {"action": "update", "code": "C77343", "name": "主控芯片Pro"}, "admin")
+check("material update 出卡片", action is not None and action["type"] == "update_material"
+      and action["params"]["material_id"] == m2, str(action and action.get("params")))
+res_exec = app_module._execute_action(action, "admin")
+row = dbm.query("SELECT name FROM materials WHERE id=?", (m2,))[0]
+check("update_material 执行后改名生效", row["name"] == "主控芯片Pro", row["name"])
+res, action = app_module._run_tool("material",
+                                   {"action": "update", "material_id": m2, "quantity": 99}, "admin")
+check("update 改数量被拒(引导走stock)", action is None and "stock" in res["error"])
+dbm.execute_write("UPDATE materials SET name='主控芯片' WHERE id=?", (m2,))  # 还原，防影响后续断言
+
+# --- warehouse update 改名 / delete 非空库拦截 ---
+wid_ai = dbm.query("SELECT id FROM warehouses WHERE name='AI原材料库'")[0]["id"]
+res, action = app_module._run_tool("warehouse",
+                                   {"action": "update", "id": wid_ai, "name": "AI原料库"}, "admin")
+check("warehouse update 出卡片", action is not None and action["type"] == "update_warehouse")
+app_module._execute_action(action, "admin")
+check("update_warehouse 改名生效",
+      dbm.query("SELECT name FROM warehouses WHERE id=?", (wid_ai,))[0]["name"] == "AI原料库")
+# 非空库删除：w3 下有物料且无子库（w4 在[4]段已删）→ 建卡阶段拦截
+res, action = app_module._run_tool("warehouse", {"action": "delete", "id": w3}, "admin")
+check("删非空库建卡被拦(有物料)", action is None and "物料" in res["error"], str(res.get("error")))
+res, action = app_module._run_tool("warehouse", {"action": "delete", "id": w1}, "admin")
+check("删有子库的库被拦", action is None and "子库" in res["error"])
+# 空库（[16] 的 API直建库）可以删：出卡片 → 执行
+wid_api = dbm.query("SELECT id FROM warehouses WHERE name='API直建库'")[0]["id"]
+res, action = app_module._run_tool("warehouse", {"action": "delete", "id": wid_api}, "admin")
+check("空库删除出卡片", action is not None and action["type"] == "delete_warehouse")
+app_module._execute_action(action, "admin")
+check("delete_warehouse 执行后库已删", not dbm.query("SELECT id FROM warehouses WHERE id=?", (wid_api,)))
+
+# --- purchase：add_batch 登记 → 状态 partial；del_batch 回退；update 改需求量 ---
+pid_row = dbm.query("SELECT id FROM purchase_items WHERE project='测试项目A' AND code='C111'")
+item_id = pid_row[0]["id"]
+res, action = app_module._run_tool("purchase",
+                                   {"action": "add_batch", "item_id": item_id, "qty": 10,
+                                    "remark": "AI登记"}, "admin")
+check("purchase add_batch 出卡片", action is not None and "登记采购" in action["title"])
+app_module._execute_action(action, "admin")
+row = dbm.query("SELECT COALESCE(SUM(qty),0) AS s FROM purchase_batches WHERE purchase_item_id=?",
+                (item_id,))[0]
+check("add_batch 执行后已购+10", row["s"] == 90, str(row["s"]))  # [11]段已登记 80
+res, action = app_module._run_tool("purchase",
+                                   {"action": "update", "item_id": item_id, "need_qty": 200}, "admin")
+check("purchase update 出卡片", action is not None and action["type"] == "update_purchase_item")
+app_module._execute_action(action, "admin")
+check("update_purchase_item 生效",
+      dbm.query("SELECT need_qty FROM purchase_items WHERE id=?", (item_id,))[0]["need_qty"] == 200)
+bid = dbm.query("SELECT id FROM purchase_batches WHERE purchase_item_id=? ORDER BY id DESC",
+                (item_id,))[0]["id"]
+res, action = app_module._run_tool("purchase", {"action": "del_batch", "batch_id": bid}, "admin")
+check("purchase del_batch 出卡片", action is not None and "删除采购批次" in action["title"])
+app_module._execute_action(action, "admin")
+row = dbm.query("SELECT COALESCE(SUM(qty),0) AS s FROM purchase_batches WHERE purchase_item_id=?",
+                (item_id,))[0]
+check("del_batch 执行后已购回退80", row["s"] == 80, str(row["s"]))
+
+# --- 历史兼容：手工构造旧 type=stock_in 的 pending 卡片 → execute 正常执行 ---
+m2_before = dbm.query("SELECT quantity FROM materials WHERE id=?", (m2,))[0]["quantity"]
+legacy = [{"id": "legacy01", "type": "stock_in",
+           "params": {"material_id": m2, "quantity": 3, "remark": "旧卡"},
+           "title": "入库：主控芯片 ×3", "status": "pending", "result": None, "executed_at": None}]
+aid_legacy, _ = dbm.execute_write(
+    "INSERT INTO chat_messages(user_id, role, content, actions_json) VALUES (?,?,?,?)",
+    (1, "assistant", "旧格式卡片", json.dumps(legacy, ensure_ascii=False)))
+r = c.post("/api/chat/execute", json={"message_id": aid_legacy, "action_id": "legacy01"})
+check("旧type(stock_in)卡片仍可执行", r.status_code == 200
+      and r.get_json()["action"]["status"] == "executed", r.get_data(as_text=True)[:150])
+m2_after = dbm.query("SELECT quantity FROM materials WHERE id=?", (m2,))[0]["quantity"]
+check("旧卡片执行库存+3", m2_after == m2_before + 3, f"{m2_before}->{m2_after}")
 
 
 # ---------- 清理 ----------

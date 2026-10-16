@@ -143,11 +143,13 @@ function nowTime() {
   return p(d.getHours()) + ':' + p(d.getMinutes());
 }
 
-/* 卡片类型中文标签 */
+/* 卡片类型中文标签（含 v261016.1 新增；旧 type 保留映射，历史卡片照常渲染） */
 const TYPE_LABEL = {
   stock_in: '入库', stock_out: '出库',
-  create_material: '新建物料', add_purchase_items: '导入采购',
-  create_warehouse: '新建仓库', delete_material: '删除物料',
+  create_material: '新建物料', update_material: '修改物料', delete_material: '删除物料',
+  create_warehouse: '新建仓库', update_warehouse: '修改仓库', delete_warehouse: '删除仓库',
+  add_purchase_items: '导入采购', update_purchase_item: '修改采购项', delete_purchase_item: '删除采购项',
+  add_purchase_batch: '登记采购', del_purchase_batch: '删除采购批次',
 };
 
 /* AI 回复 Markdown 轻渲染：先 esc 防注入，再支持 表格/代码块/行内代码/加粗/换行。
@@ -211,7 +213,13 @@ function renderMsg(m, where = 'append') {
 
   const meta = document.createElement('div');
   meta.className = 'm-meta';
-  meta.textContent = (m.role === 'user' ? '我' : 'AI') + ' · ' + (m.created_at ? fmtTime(m.created_at) : '');
+  let metaTxt = (m.role === 'user' ? '我' : 'AI') + ' · ' + (m.created_at ? fmtTime(m.created_at) : '');
+  /* token 用量：仅 assistant 消息有（服务端按整条对话 tool loop 全程累加） */
+  if (m.usage && m.usage.total_tokens) {
+    metaTxt += ` · ${m.usage.total_tokens.toLocaleString()} tokens` +
+      `（入 ${m.usage.prompt_tokens.toLocaleString()} / 出 ${m.usage.completion_tokens.toLocaleString()}）`;
+  }
+  meta.textContent = metaTxt;
   main.appendChild(meta);
 
   row.appendChild(avatar);
@@ -325,7 +333,7 @@ async function send() {
       signal: abortCtrl.signal,
     });
     renderMsg({ id: r.message_id, role: 'assistant', content: r.content,
-                created_at: nowTime(), actions: r.actions });
+                created_at: nowTime(), actions: r.actions, usage: r.usage });
     setStatus('done', ((Date.now() - t0) / 1000).toFixed(1) + 's');
   } catch (e) {
     if (e && e.name === 'AbortError') {
@@ -357,7 +365,9 @@ scrollEl.addEventListener('scroll', async () => {
   const prevH = scrollEl.scrollHeight;
   try {
     const r = await api(`/api/chat/history?before_id=${oldestId}&limit=30`);
-    r.messages.forEach(m => renderMsg(m, 'prepend'));
+    /* ★ 逆序 prepend：接口返回旧→新，逐条插到顶部会颠倒批内顺序，
+       必须从最新往最旧插，批内才能保持 旧在上·新在下 */
+    for (let i = r.messages.length - 1; i >= 0; i--) renderMsg(r.messages[i], 'prepend');
     if (!r.has_more) oldestId = 0;
     /* 保持视口贴在原内容位置（不被顶走） */
     scrollEl.scrollTop = scrollEl.scrollHeight - prevH;
@@ -383,7 +393,8 @@ async function clearHistory() {
   } catch (e) {}
   try {
     const r = await api('/api/chat/history?limit=30');
-    r.messages.forEach(m => renderMsg(m, 'prepend'));
+    /* ★ 首屏用 append 顺序渲染（旧→新）；此前误用 prepend 导致重开页面时顺序整个颠倒 */
+    r.messages.forEach(m => renderMsg(m, 'append'));
     if (r.messages.length) oldestId = r.messages[0].id;
     if (!r.has_more) oldestId = 0;
     scrollToBottom();

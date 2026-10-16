@@ -1908,7 +1908,7 @@ MAX_TOOL_CALLS = 12
 def _llm_chat(cfg, messages, tools=None):
     """
     OpenAI 兼容 /chat/completions 单一收敛调用点（Kimi/DeepSeek/GLM 等）。
-    返回 (content, tool_calls)。所有 LLM 交互都走这里——冒烟测试 monkeypatch 本函数
+    返回 (content, tool_calls, usage)。所有 LLM 交互都走这里——冒烟测试 monkeypatch 本函数
     即可脚本化整个对话流程，无需真实 API key。
     鲁棒性（借鉴参考实现）：
     - temperature 三档降级 0.3 → 不带 → 1（部分模型如 Kimi 思考模型限制取值）
@@ -1928,7 +1928,8 @@ def _llm_chat(cfg, messages, tools=None):
         r = http_req.post(url, headers=headers, json=payload, timeout=(10, 180))
         if r.status_code == 200:
             msg = r.json()["choices"][0]["message"]
-            return msg.get("content") or "", msg.get("tool_calls") or []
+            usage = r.json().get("usage") or {}   # token 用量（部分服务可能不返回，兜底空 dict）
+            return msg.get("content") or "", msg.get("tool_calls") or [], usage
         err_txt = (r.text or "")[:300]
         if r.status_code == 429 and rate_retries < 2:
             # 限速：等一个 RPM 窗口后重试
@@ -1944,13 +1945,13 @@ def _llm_chat(cfg, messages, tools=None):
 def _llm_plain(cfg, messages):
     """纯文本对话（不带工具），供 BOM 智能匹配等确定性任务用。
     复用 _llm_chat 的降级/限速逻辑；返回回复文本，失败抛 RuntimeError。"""
-    content, _ = _llm_chat(cfg, messages, None)
+    content, _, _usage = _llm_chat(cfg, messages, None)
     return content
 
 
 def _system_prompt(username):
-    """系统提示词：角色 + 实时仓库/物料概况 + 工具规范 + 安全模式说明 + 电子领域常识 + 回复风格。
-    仓库列表与物料总数每次请求现查注入（参考实现的做法），让 AI 建料/答问时有实时依据。"""
+    """系统提示词：角色 + 实时仓库/物料概况 + 表结构 + 工具规范 + 安全模式说明 + 电子常识 + 回复风格。
+    仓库列表与物料总数每次请求现查注入；表结构清单让 query 工具开箱可用。"""
     today = datetime.now().strftime("%Y-%m-%d")
     whs = db.query("SELECT name, level FROM warehouses ORDER BY level, id LIMIT 30")
     wh_str = "、".join(("　" * (w["level"] - 1)) + w["name"] for w in whs) or "（暂无仓库）"
@@ -1961,15 +1962,22 @@ def _system_prompt(username):
 
 【职责】帮助用户查询物料库存、办理出入库、核对 BOM、管理采购清单。
 
+【数据库表结构】（query 工具只能查这些表）
+- materials(id, name 名称, code 编码/立创C编号, model 型号, category 分类, package 封装, brand 品牌, quantity 库存数量, unit 单位, warehouse_id 所属仓库id, description 描述, created_at)
+- warehouses(id, name, parent_id 父库id, level 层级1-4)
+- stock_records(id, material_id, type 类型in入库/out出库, quantity, operator 操作人, remark 备注, created_at) —— 出入库流水
+- purchase_items(id, project 项目, material_id, name, code, model, need_qty 需求数量, unit, remark, created_at) —— 采购条目（已购量=其 purchase_batches 的 qty 合计）
+- purchase_batches(id, purchase_item_id, qty 数量, remark, created_at) —— 采购批次
+- material_documents(id, material_id, doc_type, file_name, created_at) —— 物料手册
+
 【工具使用规范】
-1. 用户问"有哪些库存/库存情况/看看库存"等无关键词问题时，直接调 search_materials 不带参数列出全部，不要反问用户要关键词。
-2. 出入库前必须先用 search_materials 找到物料，material_id 只能来自搜索结果，禁止编造；用户直接给了编码（如 C621395）时可跳过搜索，直接给 stock_in/stock_out 传 code。
-3. stock_in / stock_out / create_material / add_purchase_items / create_warehouse / delete_material 是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
-4. 查仓库列表用 list_warehouses；新建仓库用 create_warehouse（写操作，生成卡片；层级最深4级，parent_id 从 list_warehouses 结果取，缺省建一级库）；查出入库历史用 stock_records；信息不足（数量/仓库/编码）时先问清再动手，禁止猜测执行。
-5. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 create_material 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需办理入库。
-6. BOM 核对用 check_bom；用户想采购缺料时用 add_purchase_items（问清项目名，BOM 缺料可批量导入）。
-7. 用户一次给多行/多种物料要办理时（如批量入库、整份BOM建料）：逐行连续调用对应工具，每行生成一张卡片，全部列完后一次性提醒用户逐张确认；不得以"只能一次一个""系统不支持批量"等理由拒绝或只做一部分。
-8. 用户要"清空所有物料/全部删掉重来"时：先 search_materials 空参数列出全部物料，再对每一行连续调用 delete_material 生成删除卡片（标题会标注库存将一并清空），全部列出后提醒用户逐张确认；不得让用户必须去前端手动删。
+1. 一切查询（库存/流水/仓库/采购/统计）都用 query：用户问"有哪些库存/库存情况"直接 SELECT * FROM materials，不要反问用户要关键词。LIKE 模糊匹配记得带 %；默认加 LIMIT 50 以内。
+2. stock（出入库）/ material（物料增改删）/ warehouse（仓库增改删）/ purchase（采购管理）是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
+3. 出入库/修改/删除物料前必须先定位物料：material_id 只能来自 query 结果，禁止编造；用户直接给了编码（如 C621395）时可跳过查询，直接给工具传 code。多候选时把候选列给用户选，不要猜。
+4. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 material 的 create 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需用 stock 入库。
+5. BOM 核对用 check_bom；用户想采购缺料时用 purchase 的 add（问清项目名，BOM 缺料可批量导入）；登记一次采购到货用 add_batch。
+6. 用户一次给多行/多种物料要办理时（如批量入库、整份BOM建料）：逐行连续调用对应工具，每行生成一张卡片，全部列完后一次性提醒用户逐张确认；不得以"只能一次一个""系统不支持批量"等理由拒绝或只做一部分。
+7. 用户要"清空所有物料/全部删掉重来"时：先 query 列出全部物料，再对每一行连续调用 material 的 delete 生成删除卡片（标题会标注库存将一并清空），全部列出后提醒用户逐张确认。
 
 【电子领域常识】
 - 电容容值换算：1µF = 1000nF（0.1µF = 100nF；三位数标注 104 = 100nF、105 = 1µF）。用户给出的不同写法若等值，主动指出并确认是否同一种物料。
@@ -1979,40 +1987,25 @@ def _system_prompt(username):
 【回复风格】简体中文；简洁分点，必要时用小表格；涉及写操作的回复末尾必须提醒用户确认卡片。"""
 
 
-# 12 个工具的 OpenAI function calling 声明（只读 6 个真执行 + 写 6 个转卡片）
-# description 写成"使用说明书"（用途+示例+前置条件），是引导模型正确调用的关键（借鉴参考实现）
+# 7 个工具的 OpenAI function calling 声明（v261016.1 整合：12 → 7）
+# 只读 3 个真执行（query 只读SQL / lcsc_search / check_bom）+ 写 4 个按资源合并转卡片
+# （stock 出入库 / material 物料增改删 / warehouse 仓库增改删 / purchase 采购管理）。
+# description 写成"使用说明书"（用途+示例+前置条件），是引导模型正确调用的关键。
 AI_TOOLS = [
     {"type": "function", "function": {
-        "name": "search_materials",
-        "description": "查询库存物料。不带任何参数 = 列出全部库存（用户问'有哪些库存/库存情况'时用）；"
-                       "q 模糊匹配名称/编码/型号（如 '电容'、'10k'、'0603'）；code 精确匹配编码（如立创C编号 C621395）。"
-                       "出入库/BOM 核对前先用它拿到 material_id。",
-        "parameters": {"type": "object", "properties": {
-            "q": {"type": "string", "description": "模糊关键词（匹配名称/编码/型号），留空=全部"},
-            "code": {"type": "string", "description": "物料编码精确匹配（如立创C编号 C621395）"}}}}},
-    {"type": "function", "function": {
-        "name": "stock_records",
-        "description": "查询出入库流水记录。不带参数 = 最近 10 条（用户问'最近谁动了库存/出入库记录'时用）；"
-                       "keyword 按物料名称/编码模糊过滤（如 'C25804'、'电容'）。",
-        "parameters": {"type": "object", "properties": {
-            "keyword": {"type": "string", "description": "物料名称/编码关键词，留空=最近记录"},
-            "limit": {"type": "integer", "description": "返回条数，默认10，上限30"}}}}},
-    {"type": "function", "function": {
-        "name": "list_warehouses",
-        "description": "列出全部仓库（id/名称/层级/父库），入库前用它确认仓库 id。",
-        "parameters": {"type": "object", "properties": {}}}},
-    {"type": "function", "function": {
-        "name": "create_warehouse",
-        "description": "新建仓库（写操作，生成待确认卡片）。仓库树最深4级；"
-                       "parent_id 填父仓库 id（用 list_warehouses 查），不填建一级库。"
-                       "用户说'建几个仓库/加个子库'时用。",
-        "parameters": {"type": "object", "properties": {
-            "name": {"type": "string", "description": "仓库名称（必填）"},
-            "parent_id": {"type": "integer", "description": "父仓库 id（可选，缺省=一级库）"}},
-            "required": ["name"]}}},
+        "name": "query",
+        "description": "只读 SQL 查询（仅 SELECT，自动限量）。查库存/流水/仓库/采购/统计都用它："
+                       "查全部库存 SELECT * FROM materials ORDER BY id DESC；"
+                       "模糊查 SELECT * FROM materials WHERE name LIKE '%电容%'；"
+                       "查流水 SELECT r.*,m.name,m.code FROM stock_records r JOIN materials m ON m.id=r.material_id ORDER BY r.id DESC；"
+                       "统计 SELECT warehouse_id,COUNT(*),SUM(quantity) FROM materials GROUP BY warehouse_id。"
+                       "可查表与字段见系统提示词；禁止 UPDATE/DELETE/INSERT。",
+        "parameters": {"type": "object", "required": ["sql"], "properties": {
+            "sql": {"type": "string", "description": "SELECT 语句（单条，不带分号）"},
+            "params": {"type": "array", "description": "可选，? 占位符参数数组"}}}}},
     {"type": "function", "function": {
         "name": "lcsc_search",
-        "description": "搜索立创商城（库存没有的物料来这里找候选），返回立创C编号/型号/品牌/封装/库存/价格。用户选定 C 编号后可用 create_material 建料并自动补全参数。",
+        "description": "搜索立创商城（库存没有的物料来这里找候选），返回立创C编号/型号/品牌/封装/库存/价格。用户选定 C 编号后用 material 工具 create 建料并自动补全参数。",
         "parameters": {"type": "object", "properties": {
             "keyword": {"type": "string", "description": "搜索关键词，如 '100nF 0603 电容'"}},
             "required": ["keyword"]}}},
@@ -2025,61 +2018,62 @@ AI_TOOLS = [
                 "name": {"type": "string"},
                 "quantity": {"type": "integer", "description": "需求数量，默认1"}}}}}}}},
     {"type": "function", "function": {
-        "name": "query_purchase",
-        "description": "查询采购清单（可按项目过滤），返回每条的需求量/已购量/状态（open未采/partial部分/done完成）。",
-        "parameters": {"type": "object", "properties": {
-            "project": {"type": "string", "description": "项目名（空=查全部）"}}}}},
+        "name": "stock",
+        "description": "出入库（写操作，生成待确认卡片）。material_id 来自 query 结果；用户直接给了编码时也可只传 code"
+                       "（精确匹配编码或型号，多候选会返回列表让你请用户确认，此时无需先查询）。"
+                       "入库可传 warehouse_id 同时把物料挂到该仓库（id 用 query 查 warehouses 表）。",
+        "parameters": {"type": "object", "required": ["op", "quantity"], "properties": {
+            "op": {"type": "string", "enum": ["in", "out"], "description": "in=入库 out=出库"},
+            "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
+            "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"},
+            "quantity": {"type": "integer", "description": "数量>0"},
+            "warehouse_id": {"type": "integer", "description": "仓库 id（可选，仅入库：同时把物料归属到该仓库）"},
+            "remark": {"type": "string", "description": "备注（可选）"}}}}},
     {"type": "function", "function": {
-        "name": "create_material",
-        "description": "新建物料（写操作，生成待确认卡片）。填了立创C编号会自动抓取图片/数据手册/参数。",
-        "parameters": {"type": "object", "required": ["name"], "properties": {
-            "name": {"type": "string", "description": "物料名称"},
-            "code": {"type": "string", "description": "立创C编号（强烈建议填，自动补全参数）"},
-            "model": {"type": "string", "description": "型号"},
-            "category": {"type": "string"}, "package": {"type": "string"},
-            "brand": {"type": "string"}, "unit": {"type": "string"},
-            "warehouse_id": {"type": "integer", "description": "仓库 id（list_warehouses 查）"},
-            "quantity": {"type": "integer", "description": "初始库存，默认0"},
+        "name": "material",
+        "description": "物料管理（写操作，生成待确认卡片）。action=create 新建（填立创C编号自动抓图片/手册/参数）；"
+                       "update 修改资料字段（改名称/编码/型号/分类/封装/品牌/单位/仓库/描述；⚠️改库存数量必须用 stock 工具）；"
+                       "delete 删除（现库存一并清空，标题会标注）。update/delete 用 material_id 或 code 定位。",
+        "parameters": {"type": "object", "required": ["action"], "properties": {
+            "action": {"type": "string", "enum": ["create", "update", "delete"]},
+            "material_id": {"type": "integer", "description": "物料 id（update/delete 用，与 code 二选一）"},
+            "code": {"type": "string", "description": "立创C编号（create 建议填自动补全；update/delete 可用于定位）"},
+            "name": {"type": "string", "description": "物料名称（create 必填）"},
+            "model": {"type": "string"}, "category": {"type": "string"},
+            "package": {"type": "string"}, "brand": {"type": "string"}, "unit": {"type": "string"},
+            "warehouse_id": {"type": "integer", "description": "仓库 id（query 查 warehouses 表）"},
+            "quantity": {"type": "integer", "description": "仅 create：初始库存，默认0"},
             "description": {"type": "string"}}}}},
     {"type": "function", "function": {
-        "name": "stock_in",
-        "description": "入库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
-                       "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认，此时无需先搜索）。"
-                       "传 warehouse_id 可在入库同时把物料挂到该仓库（id 用 list_warehouses 查）。",
-        "parameters": {"type": "object", "required": ["quantity"], "properties": {
-            "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
-            "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"},
-            "quantity": {"type": "integer", "description": "数量>0"},
-            "warehouse_id": {"type": "integer", "description": "仓库 id（可选，入库同时把物料归属到该仓库）"},
-            "remark": {"type": "string", "description": "备注（可选）"}}}}},
+        "name": "warehouse",
+        "description": "仓库管理（写操作，生成待确认卡片）。action=create 新建（最深4级，parent_id 填父库 id 缺省=一级库）；"
+                       "update 改名或换父级（需 id）；delete 删除（需 id，仅空库可删——有物料或有子库会被拒）。",
+        "parameters": {"type": "object", "required": ["action"], "properties": {
+            "action": {"type": "string", "enum": ["create", "update", "delete"]},
+            "id": {"type": "integer", "description": "仓库 id（update/delete 必填，query 查 warehouses 表）"},
+            "name": {"type": "string", "description": "仓库名称（create 必填；update 改名用）"},
+            "parent_id": {"type": "integer", "description": "父仓库 id（create/update 可选，0=一级库）"}}}}},
     {"type": "function", "function": {
-        "name": "delete_material",
-        "description": "删除物料（写操作，生成待确认卡片，危险操作）。material_id 来自 search_materials；也可只传 code。"
-                       "⚠️ 物料现有库存会随删除一并清空（卡片标题会标注）。"
-                       "用户要'清空/删掉所有物料重来'时：先 search_materials 空参数列出全部，再逐个连续调用本工具删完，不得拒绝。",
-        "parameters": {"type": "object", "properties": {
-            "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
-            "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"}}}}},
-    {"type": "function", "function": {
-        "name": "stock_out",
-        "description": "出库（写操作，生成待确认卡片）。material_id 来自 search_materials 结果；"
-                       "用户直接给了编码时也可只传 code（精确匹配编码或型号，多候选会返回列表让你请用户确认）。出库前确认库存充足。",
-        "parameters": {"type": "object", "required": ["quantity"], "properties": {
-            "material_id": {"type": "integer", "description": "物料 id（与 code 二选一）"},
-            "code": {"type": "string", "description": "物料编码/型号（与 material_id 二选一）"},
-            "quantity": {"type": "integer", "description": "数量>0"},
-            "remark": {"type": "string", "description": "备注（可选）"}}}}},
-    {"type": "function", "function": {
-        "name": "add_purchase_items",
-        "description": "向采购清单批量添加条目（写操作，生成待确认卡片）。同项目同物料自动合并累加需求量。BOM 缺料批量采购用这个工具。",
-        "parameters": {"type": "object", "required": ["project", "items"], "properties": {
-            "project": {"type": "string", "description": "项目名（归档用）"},
-            "items": {"type": "array", "items": {"type": "object", "required": ["name", "need_qty"], "properties": {
+        "name": "purchase",
+        "description": "采购清单管理（写操作，生成待确认卡片）。action=add 批量添加条目（同项目同物料自动合并；BOM 缺料批量采购用这个）；"
+                       "update 改条目（需 item_id）；delete 删条目（需 item_id）；add_batch 登记一笔采购（需 item_id+qty）；"
+                       "del_batch 删除一笔采购批次（需 batch_id）。条目 id 用 query 查 purchase_items 表。",
+        "parameters": {"type": "object", "required": ["action"], "properties": {
+            "action": {"type": "string", "enum": ["add", "update", "delete", "add_batch", "del_batch"]},
+            "project": {"type": "string", "description": "add 用：项目名（归档用）"},
+            "items": {"type": "array", "description": "add 用：条目数组", "items": {"type": "object",
+                "required": ["name", "need_qty"], "properties": {
                 "material_id": {"type": "integer", "description": "库存物料 id（有则填）"},
                 "name": {"type": "string"}, "code": {"type": "string"},
                 "model": {"type": "string"},
                 "need_qty": {"type": "integer", "description": "需求数量>0"},
-                "unit": {"type": "string"}, "remark": {"type": "string"}}}}}}}},
+                "unit": {"type": "string"}, "remark": {"type": "string"}}}},
+            "item_id": {"type": "integer", "description": "update/delete/add_batch 用：采购条目 id"},
+            "batch_id": {"type": "integer", "description": "del_batch 用：批次 id"},
+            "qty": {"type": "integer", "description": "add_batch 用：本次采购数量>0"},
+            "name": {"type": "string"}, "code": {"type": "string"}, "model": {"type": "string"},
+            "need_qty": {"type": "integer", "description": "update 用：需求量>0"},
+            "unit": {"type": "string"}, "remark": {"type": "string"}}}}},
 ]
 
 # 写工具的固定回话：驱动模型产出面向用户的确认文案，而不是继续调工具
@@ -2119,46 +2113,18 @@ def _resolve_stock_target(args):
 def _build_action(name, args):
     """
     写工具 → 待确认操作卡片。卡片 title 由服务端从参数生成（不信任 AI 的展示文案）。
+    入参 name 是合并后的资源工具名（stock/material/warehouse/purchase），
+    卡片 type 落库为细分动作（stock_in/update_material/...），执行端按 type 分发。
     返回 (action, err)：err 是给模型自纠的错误说明（str 或带 candidates 的 dict）。
     """
-    base = {"id": secrets.token_hex(4), "type": name, "params": args,
+    base = {"id": secrets.token_hex(4), "type": None, "params": args,
             "status": "pending", "result": None, "executed_at": None}
-    if name == "create_material":
-        mname = (args.get("name") or "").strip()
-        if not mname:
-            return None, "name 不能为空"
-        qty = _parse_int(args.get("quantity") or 0, 0)
-        if qty is None:
-            return None, "quantity 必须是不小于0的整数"
-        title = f"新建物料：{mname}"
-        code = (args.get("code") or "").strip()
-        if code:
-            title += f"（{code}）"
-        if qty > 0:
-            title += f"，初始库存 ×{qty}"
-        base["title"] = title
-        return base, None
-    if name == "create_warehouse":
-        wname = (args.get("name") or "").strip()
-        if not wname:
-            return None, "name（仓库名）不能为空"
-        parent_id = _parse_int(args.get("parent_id") or 0, 1)
-        if args.get("parent_id") and parent_id is None:
-            return None, "parent_id 必须是正整数"
-        # 预校验父级/层级（复用核心逻辑），让卡片生成前就发现明显错误
-        if parent_id:
-            rows = db.query("SELECT level, name FROM warehouses WHERE id=?", (parent_id,))
-            if not rows:
-                return None, f"父级库 #{parent_id} 不存在，先用 list_warehouses 查现有仓库 id"
-            lvl = rows[0]["level"] + 1
-            if lvl > MAX_WAREHOUSE_LEVEL:
-                return None, f"父级「{rows[0]['name']}」已是 {MAX_WAREHOUSE_LEVEL} 级（最深），不能再建子库"
-            base["title"] = f"新建仓库：{wname}（{lvl} 级，父级「{rows[0]['name']}」）"
-        else:
-            base["title"] = f"新建仓库：{wname}（1 级）"
-        base["params"] = {"name": wname, "parent_id": parent_id}
-        return base, None
-    if name in ("stock_in", "stock_out"):
+
+    # ---------------- 出入库 ----------------
+    if name == "stock":
+        op = (args.get("op") or "").strip()
+        if op not in ("in", "out"):
+            return None, "op 必须是 in（入库）或 out（出库）"
         qty = _parse_int(args.get("quantity"), 1)
         if qty is None:
             return None, "quantity 必须是大于0的整数"
@@ -2166,81 +2132,269 @@ def _build_action(name, args):
         if err:
             return None, err
         # 卡片参数落库为解析后的 material_id（执行时不再依赖 code 二次解析）
+        base["type"] = "stock_in" if op == "in" else "stock_out"
         base["params"] = dict(args, material_id=mid)
         base["params"].pop("code", None)
-        base["title"] = f"{'入库' if name == 'stock_in' else '出库'}：{mname}（#{mid}）×{qty}"
+        base["params"].pop("op", None)
+        base["title"] = f"{'入库' if op == 'in' else '出库'}：{mname}（#{mid}）×{qty}"
         # 入库可指定挂到哪个仓库（仓库是物料的归属属性，出库不支持）
         if args.get("warehouse_id"):
-            if name == "stock_out":
+            if op == "out":
                 return None, "出库不支持 warehouse_id（仓库归属在入库时指定）"
             wid = _parse_int(args.get("warehouse_id"), 1)
             if wid is None:
                 return None, "warehouse_id 必须是正整数"
             wh = db.query("SELECT name FROM warehouses WHERE id=?", (wid,))
             if not wh:
-                return None, f"仓库 #{wid} 不存在，先用 list_warehouses 查现有仓库 id"
+                return None, f"仓库 #{wid} 不存在，先用 query 查 warehouses 表确认现有仓库 id"
             base["title"] += f"，挂到仓库「{wh[0]['name']}」"
         return base, None
-    if name == "delete_material":
-        mid, mname, err = _resolve_stock_target(args)
-        if err:
-            return None, err
-        qty = db.query("SELECT quantity FROM materials WHERE id=?", (mid,))[0]["quantity"]
-        title = f"删除物料：{mname}（#{mid}）"
-        if qty > 0:
-            title += f"，⚠️ 现库存 ×{qty} 将一并清空"
-        base["title"] = title
-        base["params"] = {"material_id": mid}
-        return base, None
-    if name == "add_purchase_items":
-        project = (args.get("project") or "").strip()
-        items = args.get("items")
-        if not project:
-            return None, "project（项目名）不能为空"
-        if not isinstance(items, list) or not items:
-            return None, "items 必须是非空数组"
-        base["title"] = f"导入采购清单：项目「{project}」{len(items)} 项"
-        return base, None
+
+    # ---------------- 物料 ----------------
+    if name == "material":
+        act = (args.get("action") or "").strip()
+        if act == "create":
+            mname = (args.get("name") or "").strip()
+            if not mname:
+                return None, "create 时 name 不能为空"
+            qty = _parse_int(args.get("quantity") or 0, 0)
+            if qty is None:
+                return None, "quantity 必须是不小于0的整数"
+            title = f"新建物料：{mname}"
+            code = (args.get("code") or "").strip()
+            if code:
+                title += f"（{code}）"
+            if qty > 0:
+                title += f"，初始库存 ×{qty}"
+            base.update(type="create_material", title=title)
+            return base, None
+        if act == "update":
+            # 仅改资料字段；数量必须走 stock 工具（保证流水留痕）
+            if args.get("quantity") is not None:
+                return None, "update 不能改 quantity（库存数量请用 stock 工具出入库，保证流水留痕）"
+            mid, mname, err = _resolve_stock_target(args)
+            if err:
+                return None, err
+            fields = {k: (args.get(k) or "").strip() for k in
+                      ("name", "code", "model", "category", "package", "brand", "unit", "description")
+                      if args.get(k) is not None}
+            if args.get("warehouse_id") is not None:
+                wid = _parse_int(args.get("warehouse_id"), 1)
+                if wid is None:
+                    return None, "warehouse_id 必须是正整数"
+                if not db.query("SELECT id FROM warehouses WHERE id=?", (wid,)):
+                    return None, f"仓库 #{wid} 不存在，先用 query 查 warehouses 表确认"
+                fields["warehouse_id"] = wid
+            if not fields:
+                return None, "update 至少给一个要修改的字段（name/code/model/.../warehouse_id）"
+            base["type"] = "update_material"
+            base["params"] = dict(fields, material_id=mid)
+            base["title"] = f"修改物料：{mname}（#{mid}）——{('、'.join(fields.keys()))}"
+            return base, None
+        if act == "delete":
+            mid, mname, err = _resolve_stock_target(args)
+            if err:
+                return None, err
+            qty = db.query("SELECT quantity FROM materials WHERE id=?", (mid,))[0]["quantity"]
+            title = f"删除物料：{mname}（#{mid}）"
+            if qty > 0:
+                title += f"，⚠️ 现库存 ×{qty} 将一并清空"
+            base.update(type="delete_material", title=title, params={"material_id": mid})
+            return base, None
+        return None, "action 必须是 create / update / delete"
+
+    # ---------------- 仓库 ----------------
+    if name == "warehouse":
+        act = (args.get("action") or "").strip()
+        if act == "create":
+            wname = (args.get("name") or "").strip()
+            if not wname:
+                return None, "create 时 name（仓库名）不能为空"
+            parent_id = _parse_int(args.get("parent_id") or 0, 1)
+            if args.get("parent_id") and parent_id is None:
+                return None, "parent_id 必须是正整数"
+            # 预校验父级/层级（复用核心逻辑），让卡片生成前就发现明显错误
+            if parent_id:
+                rows = db.query("SELECT level, name FROM warehouses WHERE id=?", (parent_id,))
+                if not rows:
+                    return None, f"父级库 #{parent_id} 不存在，先用 query 查 warehouses 表确认现有仓库 id"
+                lvl = rows[0]["level"] + 1
+                if lvl > MAX_WAREHOUSE_LEVEL:
+                    return None, f"父级「{rows[0]['name']}」已是 {MAX_WAREHOUSE_LEVEL} 级（最深），不能再建子库"
+                base["title"] = f"新建仓库：{wname}（{lvl} 级，父级「{rows[0]['name']}」）"
+            else:
+                base["title"] = f"新建仓库：{wname}（1 级）"
+            base.update(type="create_warehouse", params={"name": wname, "parent_id": parent_id})
+            return base, None
+        wid = _parse_int(args.get("id"), 1)
+        if wid is None:
+            return None, f"{act} 需要 id（仓库 id，用 query 查 warehouses 表）"
+        rows = db.query("SELECT name, parent_id, level FROM warehouses WHERE id=?", (wid,))
+        if not rows:
+            return None, f"仓库 #{wid} 不存在，先用 query 查 warehouses 表确认"
+        cur = rows[0]
+        if act == "update":
+            new_name = (args.get("name") or "").strip()
+            has_parent = args.get("parent_id") is not None
+            if not new_name and not has_parent:
+                return None, "update 至少给一个修改项（name 改名 / parent_id 换父级）"
+            params = {"id": wid}
+            title = f"修改仓库：{cur['name']}（#{wid}）"
+            if new_name:
+                params["name"] = new_name
+                title += f" 改名为「{new_name}」"
+            if has_parent:
+                pid = _parse_int(args.get("parent_id") or 0, 1)
+                if args.get("parent_id") and pid is None:
+                    return None, "parent_id 必须是正整数（0=提升为一级库）"
+                if pid == wid:
+                    return None, "不能把仓库挂到自己下面"
+                if pid:
+                    # 防环+层级预检：父级不能是自己的子孙；新层级=父级+1，且子树最深不超上限
+                    desc_ids = _descendant_ids(wid)
+                    if pid in desc_ids:
+                        return None, "不能把仓库挂到它自己的子库下面"
+                    prows = db.query("SELECT level, name FROM warehouses WHERE id=?", (pid,))
+                    if not prows:
+                        return None, f"父级库 #{pid} 不存在"
+                    ph = ",".join("?" * len(desc_ids))
+                    max_lv = db.query(f"SELECT MAX(level) AS m FROM warehouses WHERE id IN ({ph})",
+                                      tuple(desc_ids))[0]["m"]
+                    depth = (max_lv or cur["level"]) - cur["level"]  # 子树相对深度
+                    if prows[0]["level"] + 1 + depth > MAX_WAREHOUSE_LEVEL:
+                        return None, f"移动后子树将超过 {MAX_WAREHOUSE_LEVEL} 级上限"
+                params["parent_id"] = pid or None
+                title += "，换父级"
+            base.update(type="update_warehouse", params=params, title=title)
+            return base, None
+        if act == "delete":
+            # 预校验（与网页端同防御）：库（含子库）有物料或有子库时拒绝
+            ids = _descendant_ids(wid)
+            if len(ids) > 1:
+                return None, f"「{cur['name']}」下还有 {len(ids)-1} 个子库，请先删除子库"
+            cnt = db.query("SELECT COUNT(*) AS c FROM materials WHERE warehouse_id=?", (wid,))[0]["c"]
+            if cnt:
+                return None, f"「{cur['name']}」下还有 {cnt} 件物料，请先移出或删除物料"
+            base.update(type="delete_warehouse", params={"id": wid},
+                        title=f"删除仓库：{cur['name']}（#{wid}，{cur['level']} 级）")
+            return base, None
+        return None, "action 必须是 create / update / delete"
+
+    # ---------------- 采购清单 ----------------
+    if name == "purchase":
+        act = (args.get("action") or "").strip()
+        if act == "add":
+            project = (args.get("project") or "").strip()
+            items = args.get("items")
+            if not project:
+                return None, "add 时 project（项目名）不能为空"
+            if not isinstance(items, list) or not items:
+                return None, "add 时 items 必须是非空数组"
+            base.update(type="add_purchase_items",
+                        title=f"导入采购清单：项目「{project}」{len(items)} 项")
+            return base, None
+        if act in ("update", "delete", "add_batch"):
+            iid = _parse_int(args.get("item_id"), 1)
+            if iid is None:
+                return None, f"{act} 需要 item_id（用 query 查 purchase_items 表）"
+            rows = db.query("SELECT project, name, need_qty FROM purchase_items WHERE id=?", (iid,))
+            if not rows:
+                return None, f"采购条目 #{iid} 不存在，先用 query 查 purchase_items 表确认"
+            item = rows[0]
+            if act == "update":
+                fields = {}
+                for k in ("name", "code", "model", "unit", "remark"):
+                    if args.get(k) is not None:
+                        fields[k] = (args.get(k) or "").strip()
+                if args.get("need_qty") is not None:
+                    nq = _parse_int(args.get("need_qty"), 1)
+                    if nq is None:
+                        return None, "need_qty 必须是大于0的整数"
+                    fields["need_qty"] = nq
+                if not fields:
+                    return None, "update 至少给一个要修改的字段（name/code/model/need_qty/unit/remark）"
+                base.update(type="update_purchase_item", params=dict(fields, item_id=iid),
+                            title=f"修改采购项：{item['name']}（#{iid}，项目「{item['project']}」）")
+                return base, None
+            if act == "delete":
+                base.update(type="delete_purchase_item", params={"item_id": iid},
+                            title=f"删除采购项：{item['name']}（#{iid}，项目「{item['project']}」，需求 ×{item['need_qty']}）")
+                return base, None
+            # add_batch
+            qty = _parse_int(args.get("qty"), 1)
+            if qty is None:
+                return None, "add_batch 时 qty（采购数量）必须是大于0的整数"
+            base.update(type="add_purchase_batch",
+                        params={"item_id": iid, "qty": qty,
+                                "remark": (args.get("remark") or "").strip()},
+                        title=f"登记采购：{item['name']}（项目「{item['project']}」）+{qty}")
+            return base, None
+        if act == "del_batch":
+            bid = _parse_int(args.get("batch_id"), 1)
+            if bid is None:
+                return None, "del_batch 需要 batch_id（用 query 查 purchase_batches 表）"
+            rows = db.query(
+                """SELECT b.qty, p.name, p.project FROM purchase_batches b
+                   JOIN purchase_items p ON p.id = b.purchase_item_id WHERE b.id=?""", (bid,))
+            if not rows:
+                return None, f"采购批次 #{bid} 不存在，先用 query 查 purchase_batches 表确认"
+            base.update(type="del_purchase_batch", params={"batch_id": bid},
+                        title=f"删除采购批次：#{bid}（{rows[0]['name']} +{rows[0]['qty']}，项目「{rows[0]['project']}」）")
+            return base, None
+        return None, "action 必须是 add / update / delete / add_batch / del_batch"
     return None, f"未知工具 {name}"
+
+
+# AI 只读查询允许的表（白名单）：只读 + 无敏感字段的业务表（users/app_settings/chat_messages 不给）
+_QUERY_TABLES = ("materials", "warehouses", "stock_records",
+                 "purchase_items", "purchase_batches", "material_documents")
+
+
+def _run_query(sql, params=None):
+    """
+    AI 只读查询防线（v261016.1：query 工具合并全部只读查询场景）：
+    - 仅允许 SELECT / WITH 开头的单条语句（禁分号）
+    - FROM/JOIN 后的表名必须在白名单内
+    - 无 LIMIT 自动补 100；有 LIMIT 封顶 200
+    """
+    sql = (sql or "").strip()
+    low = sql.lower()
+    if not (low.startswith("select") or low.startswith("with")):
+        return {"error": "query 只允许 SELECT 只读查询（写操作请用 stock/material/warehouse/purchase 工具）"}
+    if ";" in sql:
+        return {"error": "只支持单条语句（不要带分号）"}
+    tables = re.findall(r"(?:from|join)\s+([a-zA-Z_][\w]*)", low)
+    if not tables:
+        return {"error": "查询必须包含 FROM 子句"}
+    bad = [t for t in tables if t not in _QUERY_TABLES]
+    if bad:
+        return {"error": f"表 {bad[0]} 不在允许范围（可查：{'、'.join(_QUERY_TABLES)}）"}
+    if params is not None and not isinstance(params, list):
+        return {"error": "params 必须是数组（? 占位符对应的值）"}
+    m = re.search(r"\blimit\s+(\d+)", sql, re.I)
+    if m:
+        if int(m.group(1)) > 200:
+            sql = sql[:m.start()] + "LIMIT 200" + sql[m.end():]
+    else:
+        sql += " LIMIT 100"
+    try:
+        rows = db.query(sql, tuple(params or []))
+    except Exception as e:
+        return {"error": f"SQL 执行失败：{type(e).__name__}: {e}"}
+    result = {"count": len(rows), "rows": rows}
+    if len(rows) >= 100:
+        result["note"] = "结果已达上限被截断，请加 WHERE/LIMIT 缩小范围"
+    return result
 
 
 def _run_tool(name, args, username):
     """
     执行一次 AI 工具调用。返回 (给模型的结果 dict, 待确认卡片 dict 或 None)。
-    只读工具（搜索/列表/BOM/采购查询）真执行返回数据；
-    写工具一律拦截转卡片，绝不直接落库。参数问题返回 {"error":...} 供模型自纠。
+    只读工具（query/lcsc_search/check_bom）真执行返回数据；
+    写工具（stock/material/warehouse/purchase）一律拦截转卡片，绝不直接落库。
     """
-    if name == "search_materials":
-        # 空参数合法（=列出全部库存）：用户问"有哪些库存"时 AI 有合法路径可走
-        rows = _search_core(args.get("q"), args.get("code"), limit=30, allow_all=True)
-        total = db.query("SELECT COUNT(*) AS n FROM materials")[0]["n"]
-        result = {"total": total, "count": len(rows), "materials": rows}
-        if len(rows) < total:
-            result["note"] = f"共 {total} 种物料，已列出最新 {len(rows)} 条，可用 q 关键词缩小范围"
-        return result, None
-    if name == "stock_records":
-        # 出入库流水：空关键词=最近记录；有关键词按物料名称/编码模糊过滤
-        kw = (args.get("keyword") or "").strip()
-        limit = _parse_int(args.get("limit") or 10, 1) or 10
-        limit = min(limit, 30)
-        if kw:
-            like = f"%{kw}%"
-            rows = db.query(
-                """SELECT r.created_at, r.type, r.quantity, r.operator, r.remark,
-                          m.name AS material_name, m.code AS material_code
-                   FROM stock_records r JOIN materials m ON m.id = r.material_id
-                   WHERE m.name LIKE ? OR m.code LIKE ?
-                   ORDER BY r.id DESC LIMIT ?""", (like, like, limit))
-        else:
-            rows = db.query(
-                """SELECT r.created_at, r.type, r.quantity, r.operator, r.remark,
-                          m.name AS material_name, m.code AS material_code
-                   FROM stock_records r JOIN materials m ON m.id = r.material_id
-                   ORDER BY r.id DESC LIMIT ?""", (limit,))
-        return {"count": len(rows), "records": rows}, None
-    if name == "list_warehouses":
-        rows = db.query("SELECT id, name, parent_id, level FROM warehouses ORDER BY level, id")
-        return {"count": len(rows), "warehouses": rows}, None
+    if name == "query":
+        return _run_query(args.get("sql"), args.get("params")), None
     if name == "lcsc_search":
         kw = (args.get("keyword") or "").strip()
         if not kw:
@@ -2264,11 +2418,6 @@ def _run_tool(name, args, username):
             return {"summary": summary, "results": bad,
                     "note": f"共 {summary['total']} 行，超出 30 行仅返回非 ok 行（{len(bad)} 条）"}, None
         return {"summary": summary, "results": results}, None
-    if name == "query_purchase":
-        rows = _purchase_list_core((args.get("project") or "").strip() or None, None)
-        slim = [{k: r.get(k) for k in ("id", "project", "name", "code", "model",
-                                       "need_qty", "purchased", "unit", "status")} for r in rows]
-        return {"count": len(slim), "items": slim}, None
     # ---------- 写操作：拦截转"待确认卡片" ----------
     action, err = _build_action(name, args)
     if err:
@@ -2329,9 +2478,10 @@ def chat_send():
     actions = []
     tool_count = 0
     content = ""
+    usage_total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}  # 全程 token 用量累加
     for _ in range(MAX_LLM_ROUNDS):
         try:
-            content, tool_calls = _llm_chat(cfg, msgs, AI_TOOLS)
+            content, tool_calls, usage = _llm_chat(cfg, msgs, AI_TOOLS)
         except Exception as e:
             # LLM 失败也落一条 assistant 消息，保证历史连续可追溯
             db.execute_write("INSERT INTO chat_messages(user_id, role, content) VALUES (?,?,?)",
@@ -2340,6 +2490,8 @@ def chat_send():
             app.logger.warning("AI chat 失败: model=%s base=%s err=%s: %s",
                                cfg["model"], cfg["base_url"], type(e).__name__, e)
             return jsonify({"error": f"AI 调用失败：{type(e).__name__}: {e}"}), 502
+        for k in usage_total:           # 每轮用量累加（服务不返回时视为 0）
+            usage_total[k] += usage.get(k) or 0
         if not tool_calls:
             break                       # 模型给出最终文本，正常出口
         msgs.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
@@ -2370,16 +2522,20 @@ def chat_send():
     else:
         # 8 轮用尽模型仍在要工具：追加一次不带 tools 的请求逼出文本总结
         try:
-            content, _ = _llm_chat(cfg, msgs, None)
+            content, _, usage = _llm_chat(cfg, msgs, None)
+            for k in usage_total:
+                usage_total[k] += usage.get(k) or 0
         except Exception:
             content = content or "（本轮工具调用已达上限，未生成总结。请换种问法或缩小范围后重试。）"
 
-    # 4) 落库 assistant 消息 + 待确认卡片
+    # 4) 落库 assistant 消息 + 待确认卡片 + token 用量
     actions_json = json.dumps(actions, ensure_ascii=False, default=str) if actions else None
+    usage_json = json.dumps(usage_total) if usage_total["total_tokens"] > 0 else None
     aid, _ = db.execute_write(
-        "INSERT INTO chat_messages(user_id, role, content, actions_json) VALUES (?,?,?,?)",
-        (uid, "assistant", content or "", actions_json))
-    return jsonify({"message_id": aid, "content": content or "", "actions": actions})
+        "INSERT INTO chat_messages(user_id, role, content, actions_json, usage_json) VALUES (?,?,?,?,?)",
+        (uid, "assistant", content or "", actions_json, usage_json))
+    return jsonify({"message_id": aid, "content": content or "", "actions": actions,
+                    "usage": usage_total if usage_json else None})
 
 
 @app.route("/api/chat/history", methods=["GET"])
@@ -2391,10 +2547,10 @@ def chat_history():
     limit = _parse_int(request.args.get("limit") or 30, 1) or 30
     limit = min(limit, 100)
     if before:
-        rows = db.query("SELECT id, role, content, actions_json, created_at FROM chat_messages "
+        rows = db.query("SELECT id, role, content, actions_json, usage_json, created_at FROM chat_messages "
                         "WHERE user_id=? AND id<? ORDER BY id DESC LIMIT ?", (uid, before, limit))
     else:
-        rows = db.query("SELECT id, role, content, actions_json, created_at FROM chat_messages "
+        rows = db.query("SELECT id, role, content, actions_json, usage_json, created_at FROM chat_messages "
                         "WHERE user_id=? ORDER BY id DESC LIMIT ?", (uid, limit))
     out = []
     for r in reversed(rows):            # 反转成 旧→新，前端按序渲染
@@ -2404,6 +2560,10 @@ def chat_history():
             item["actions"] = json.loads(r["actions_json"]) if r["actions_json"] else []
         except (ValueError, TypeError):
             item["actions"] = []
+        try:
+            item["usage"] = json.loads(r["usage_json"]) if r.get("usage_json") else None
+        except (ValueError, TypeError, AttributeError):
+            item["usage"] = None
         out.append(item)
     return jsonify({"messages": out, "has_more": len(rows) == limit})
 
@@ -2488,6 +2648,113 @@ def _execute_action(act, username):
         if err:
             return {"error": err}
         return {"warehouse_id": row["id"], "name": row["name"], "level": row["level"]}
+    # ---------------- v261016.1 新增卡片类型 ----------------
+    if t == "update_material":
+        mid = _parse_int(p.get("material_id"), 1)
+        if mid is None:
+            return {"error": "参数无效（material_id）"}
+        if not db.query("SELECT id FROM materials WHERE id=?", (mid,)):
+            return {"error": f"物料 #{mid} 不存在（可能已被删除）"}
+        # 白名单字段动态拼 SET（quantity 在建卡阶段已被拦截，这里再兜底）
+        allowed = ("name", "code", "model", "category", "package", "brand",
+                   "unit", "description", "warehouse_id")
+        sets, vals = [], []
+        for k in allowed:
+            if k in p:
+                sets.append(f"{k}=?")
+                vals.append(p[k])
+        if not sets:
+            return {"error": "没有要修改的字段"}
+        sets.append("updated_at=?")
+        vals.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        vals.append(mid)
+        db.execute_write(f"UPDATE materials SET {', '.join(sets)} WHERE id=?", tuple(vals))
+        note = _auto_fetch_material(mid)   # 补了 C 编号时自动抓图/手册/参数（幂等，失败静默）
+        res = {"material_id": mid, "updated": [k for k in allowed if k in p]}
+        if note:
+            res["note"] = note
+        return res
+    if t == "update_warehouse":
+        wid = _parse_int(p.get("id"), 1)
+        rows = db.query("SELECT level FROM warehouses WHERE id=?", (wid,)) if wid else []
+        if not rows:
+            return {"error": f"仓库 #{p.get('id')} 不存在（可能已被删除）"}
+        if p.get("name"):
+            db.execute_write("UPDATE warehouses SET name=? WHERE id=?",
+                             ((p["name"] or "").strip(), wid))
+        if "parent_id" in p:
+            pid = p.get("parent_id")
+            new_level = 1
+            if pid:
+                prows = db.query("SELECT level FROM warehouses WHERE id=?", (pid,))
+                if not prows:
+                    return {"error": f"父级库 #{pid} 已不存在，改名部分已生效" if p.get("name")
+                            else f"父级库 #{pid} 已不存在"}
+                new_level = prows[0]["level"] + 1
+            # 移动本节点并同步所有子孙的 level（相对深度不变）
+            delta = new_level - rows[0]["level"]
+            ids = _descendant_ids(wid)
+            ph = ",".join("?" * len(ids))
+            db.execute_write(f"UPDATE warehouses SET level=level+? WHERE id IN ({ph})",
+                             tuple([delta] + ids))
+            db.execute_write("UPDATE warehouses SET parent_id=? WHERE id=?", (pid, wid))
+        return {"warehouse_id": wid}
+    if t == "delete_warehouse":
+        wid = _parse_int(p.get("id"), 1)
+        rows = db.query("SELECT name FROM warehouses WHERE id=?", (wid,)) if wid else []
+        if not rows:
+            return {"error": f"仓库 #{p.get('id')} 不存在（可能已被删除）"}
+        # 执行时再校验一次（卡片生成后库里可能又进了物料/子库）
+        ids = _descendant_ids(wid)
+        if len(ids) > 1:
+            return {"error": f"「{rows[0]['name']}」下已有子库，请先删除子库", "keep_pending": True}
+        cnt = db.query("SELECT COUNT(*) AS c FROM materials WHERE warehouse_id=?", (wid,))[0]["c"]
+        if cnt:
+            return {"error": f"「{rows[0]['name']}」下还有 {cnt} 件物料，请先移出或删除物料",
+                    "keep_pending": True}
+        db.execute_write("DELETE FROM warehouses WHERE id=?", (wid,))
+        return {"warehouse_id": wid, "name": rows[0]["name"]}
+    if t == "update_purchase_item":
+        iid = _parse_int(p.get("item_id"), 1)
+        rows = db.query("SELECT id FROM purchase_items WHERE id=?", (iid,)) if iid else []
+        if not rows:
+            return {"error": f"采购条目 #{p.get('item_id')} 不存在（可能已被删除）"}
+        allowed = ("name", "code", "model", "need_qty", "unit", "remark")
+        sets, vals = [], []
+        for k in allowed:
+            if k in p:
+                sets.append(f"{k}=?")
+                vals.append(p[k])
+        if not sets:
+            return {"error": "没有要修改的字段"}
+        vals.append(iid)
+        db.execute_write(f"UPDATE purchase_items SET {', '.join(sets)} WHERE id=?", tuple(vals))
+        return {"item_id": iid, "updated": [k for k in allowed if k in p]}
+    if t == "delete_purchase_item":
+        iid = _parse_int(p.get("item_id"), 1)
+        if iid is None or not db.query("SELECT id FROM purchase_items WHERE id=?", (iid,)):
+            return {"error": f"采购条目 #{p.get('item_id')} 不存在（可能已被删除）"}
+        # 先删批次再删条目（不依赖外键级联，三种库行为一致）
+        db.execute_write("DELETE FROM purchase_batches WHERE purchase_item_id=?", (iid,))
+        db.execute_write("DELETE FROM purchase_items WHERE id=?", (iid,))
+        return {"item_id": iid}
+    if t == "add_purchase_batch":
+        iid = _parse_int(p.get("item_id"), 1)
+        qty = _parse_int(p.get("qty"), 1)
+        if iid is None or qty is None:
+            return {"error": "参数无效（item_id / qty）"}
+        if not db.query("SELECT id FROM purchase_items WHERE id=?", (iid,)):
+            return {"error": f"采购条目 #{iid} 不存在（可能已被删除）"}
+        bid, _ = db.execute_write(
+            "INSERT INTO purchase_batches(purchase_item_id, qty, remark, created_by) VALUES (?,?,?,?)",
+            (iid, qty, (p.get("remark") or "").strip(), operator))
+        return {"batch_id": bid, "item_id": iid, "qty": qty}
+    if t == "del_purchase_batch":
+        bid = _parse_int(p.get("batch_id"), 1)
+        _, n = db.execute_write("DELETE FROM purchase_batches WHERE id=?", (bid,)) if bid else (0, 0)
+        if not n:
+            return {"error": f"采购批次 #{p.get('batch_id')} 不存在（可能已被删除）"}
+        return {"batch_id": bid}
     return {"error": f"未知操作类型 {t}"}
 
 

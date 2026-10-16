@@ -197,12 +197,14 @@ CREATE TABLE IF NOT EXISTS app_settings (
 
 -- AI 对话记录：actions_json 存 AI 生成的"待确认操作卡片"数组
 -- （结构：[{id,type,title,params,status,result,executed_at}]，人确认后服务端原地改状态）
+-- usage_json 存本条 assistant 消息的 LLM token 用量（{"prompt_tokens":N,"completion_tokens":N,"total_tokens":N}，多轮累加）
 CREATE TABLE IF NOT EXISTS chat_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     role TEXT NOT NULL CHECK(role IN ('user','assistant')),
     content TEXT NOT NULL,
     actions_json TEXT,
+    usage_json TEXT,
     created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 
@@ -265,6 +267,11 @@ def run_migrations():
     doc_cols = {r["name"] for r in query("PRAGMA table_info(material_documents)")}
     if "file_blob" not in doc_cols:
         execute_write("ALTER TABLE material_documents ADD COLUMN file_blob BLOB")
+
+    # v261016.1：chat_messages 加 usage_json（AI 回复的 token 用量）
+    chat_cols = {r["name"] for r in query("PRAGMA table_info(chat_messages)")}
+    if "usage_json" not in chat_cols:
+        execute_write("ALTER TABLE chat_messages ADD COLUMN usage_json TEXT")
 
     _migrate_files_to_blob()
 
@@ -372,6 +379,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
     role TEXT NOT NULL CHECK(role IN ('user','assistant')),
     content TEXT NOT NULL,
     actions_json TEXT,
+    usage_json TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -433,6 +441,10 @@ def init_schema():
             docs = _pg_columns("material_documents")
             if "file_blob" not in docs:
                 cur.execute("ALTER TABLE material_documents ADD COLUMN file_blob BYTEA")
+                conn.commit()
+            # v261016.1：chat_messages 加 usage_json（AI 回复的 token 用量）
+            if "usage_json" not in _pg_columns("chat_messages"):
+                cur.execute("ALTER TABLE chat_messages ADD COLUMN usage_json TEXT")
                 conn.commit()
     finally:
         conn.close()
