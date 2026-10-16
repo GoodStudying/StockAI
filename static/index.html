@@ -25,18 +25,42 @@
   <div class="panel">
     <h3 class="pt">物料清单</h3>
     <div class="toolbar">
-      <input id="search-input" placeholder="按名称 / 编码 / 型号搜索" style="width:240px"
+      <input id="search-input" placeholder="按名称 / 编码 / 型号搜索" style="width:220px"
              onkeydown="if(event.key==='Enter')loadMaterials()">
       <select id="filter-warehouse" onchange="loadMaterials()"><option value="">全部仓库</option></select>
       <button onclick="loadMaterials()">查询</button>
+      <!-- Excel 式视图工具：分组下拉 + 多条件排序 + 列筛选（全部前端计算，不动后端） -->
+      <select id="group-by" onchange="setGroup(this.value)" title="分组条件">
+        <option value="">不分组</option>
+        <option value="warehouse_name">按所在库分组</option>
+        <option value="category">按分类分组</option>
+        <option value="brand">按品牌分组</option>
+        <option value="package">按封装分组</option>
+        <option value="unit">按单位分组</option>
+      </select>
+      <button class="gray" onclick="openSortModal()">排序…</button>
+      <button class="gray" onclick="openFilterModal()">筛选…</button>
+      <span id="mat-stats" class="mat-stats"></span>
+      <span style="flex:1"></span>
       <button onclick="openMaterialModal()">新建物料</button>
       <button class="gray" onclick="openLcscModal()">从立创商城新建</button>
     </div>
+    <!-- 已启用筛选条件 chips（可单删 / 一键清空） -->
+    <div class="filter-chips" id="filter-chips"></div>
     <div class="table-wrap">
     <table>
       <thead><tr>
-        <th>序号</th><th>图片</th><th>名称</th><th>编码</th><th>型号</th><th>封装</th><th>品牌</th>
-        <th>库存</th><th>所在库</th><th>新增日期</th><th>手册</th><th>操作</th>
+        <th>序号</th><th>图片</th>
+        <th class="sortable" onclick="onSortClick('name')">名称<span class="sort-arrow" data-f="name"></span></th>
+        <th class="sortable" onclick="onSortClick('code')">编码<span class="sort-arrow" data-f="code"></span></th>
+        <th class="sortable" onclick="onSortClick('model')">型号<span class="sort-arrow" data-f="model"></span></th>
+        <th class="sortable" onclick="onSortClick('category')">分类<span class="sort-arrow" data-f="category"></span></th>
+        <th class="sortable" onclick="onSortClick('package')">封装<span class="sort-arrow" data-f="package"></span></th>
+        <th class="sortable" onclick="onSortClick('brand')">品牌<span class="sort-arrow" data-f="brand"></span></th>
+        <th class="sortable" onclick="onSortClick('quantity')">库存<span class="sort-arrow" data-f="quantity"></span></th>
+        <th class="sortable" onclick="onSortClick('warehouse_name')">所在库<span class="sort-arrow" data-f="warehouse_name"></span></th>
+        <th class="sortable" onclick="onSortClick('created_at')">新增日期<span class="sort-arrow" data-f="created_at"></span></th>
+        <th>手册</th><th>操作</th>
         <th class="col-sticky">出入库</th>
       </tr></thead>
       <tbody id="mat-body"></tbody>
@@ -124,15 +148,113 @@
   </div>
 </div>
 
+<!-- 多条件排序弹窗（Excel「自定义排序」：主/次/第三关键字，逐级生效） -->
+<div class="modal-mask" id="sort-modal">
+  <div class="modal" style="width:420px">
+    <h3>多条件排序</h3>
+    <p class="modal-tip">表头点击=单条件三态（升序→降序→还原）；这里可叠加多列，逐级依次比较。</p>
+    <div class="form-row"><label>主关键字</label><select id="sort-f1"></select></div>
+    <div class="form-row"><label></label>
+      <label style="width:auto;margin-right:16px"><input type="radio" name="sort-d1" value="asc" checked> 升序 ▲</label>
+      <label style="width:auto"><input type="radio" name="sort-d1" value="desc"> 降序 ▼</label></div>
+    <div class="form-row"><label>次要关键字</label><select id="sort-f2"></select></div>
+    <div class="form-row"><label></label>
+      <label style="width:auto;margin-right:16px"><input type="radio" name="sort-d2" value="asc" checked> 升序 ▲</label>
+      <label style="width:auto"><input type="radio" name="sort-d2" value="desc"> 降序 ▼</label></div>
+    <div class="form-row"><label>第三关键字</label><select id="sort-f3"></select></div>
+    <div class="form-row"><label></label>
+      <label style="width:auto;margin-right:16px"><input type="radio" name="sort-d3" value="asc" checked> 升序 ▲</label>
+      <label style="width:auto"><input type="radio" name="sort-d3" value="desc"> 降序 ▼</label></div>
+    <div class="modal-footer">
+      <button class="gray" onclick="clearSort()">清除排序</button>
+      <button class="gray" onclick="closeModal('sort-modal')">取消</button>
+      <button onclick="applySortModal()">应用</button>
+    </div>
+  </div>
+</div>
+
+<!-- 列筛选弹窗（分类/品牌/封装/单位 多选带计数 + 库存区间 + 图片/手册有无） -->
+<div class="modal-mask" id="filter-modal">
+  <div class="modal" style="width:520px">
+    <h3>筛选</h3>
+    <p class="modal-tip">以下条件取「且」关系；同类多选取「或」。条件显示在工具栏下方，可单独移除。</p>
+    <div class="form-row"><label>库存区间</label>
+      <input id="flt-qmin" type="number" placeholder="最小" style="width:90px">
+      <span style="color:var(--ink-3)">~</span>
+      <input id="flt-qmax" type="number" placeholder="最大" style="width:90px">
+      <span class="modal-tip">（0~0 = 零库存）</span></div>
+    <div class="form-row"><label>图片</label>
+      <label style="width:auto;margin-right:14px"><input type="radio" name="flt-img" value="" checked> 全部</label>
+      <label style="width:auto;margin-right:14px"><input type="radio" name="flt-img" value="1"> 有</label>
+      <label style="width:auto"><input type="radio" name="flt-img" value="0"> 无</label></div>
+    <div class="form-row"><label>手册</label>
+      <label style="width:auto;margin-right:14px"><input type="radio" name="flt-doc" value="" checked> 全部</label>
+      <label style="width:auto;margin-right:14px"><input type="radio" name="flt-doc" value="1"> 有</label>
+      <label style="width:auto"><input type="radio" name="flt-doc" value="0"> 无</label></div>
+    <!-- 打开时按当前数据动态生成（去重 + 计数） -->
+    <div class="form-row"><label>分类</label><div class="flt-checks" id="flt-category"></div></div>
+    <div class="form-row"><label>品牌</label><div class="flt-checks" id="flt-brand"></div></div>
+    <div class="form-row"><label>封装</label><div class="flt-checks" id="flt-package"></div></div>
+    <div class="form-row"><label>单位</label><div class="flt-checks" id="flt-unit"></div></div>
+    <div class="modal-footer">
+      <button class="gray" onclick="clearFilters()">清空全部</button>
+      <button class="gray" onclick="closeModal('filter-modal')">取消</button>
+      <button onclick="applyFilterModal()">应用</button>
+    </div>
+  </div>
+</div>
+
 <script src="/common.js"></script>
 <script>
 let warehouses = [];
+let allRows = [];   // 接口原始数据缓存：排序/分组/筛选全部在前端对它计算
+
+/* ---------- Excel 式视图状态（持久化 localStorage，重开页面保持） ---------- */
+const VIEW_KEY = 'matView';
+const SORTABLE_FIELDS = [
+  ['name','名称'],['code','编码'],['model','型号'],['category','分类'],['package','封装'],
+  ['brand','品牌'],['quantity','库存'],['warehouse_name','所在库'],['created_at','新增日期'],
+];
+const FIELD_LABEL = Object.fromEntries(SORTABLE_FIELDS);
+/* colFilters: 数组类=多选（空数组=不筛）；qtyMin/qtyMax=库存区间（null=不限）；
+   hasImage/hasDoc=null 不限 / 1 有 / 0 无 */
+let sortRules = [];            // [{field, dir:'asc'|'desc'}]
+let groupField = '';           // 分组字段，'' = 不分组
+let colFilters = { category: [], brand: [], package: [], unit: [],
+                   qtyMin: null, qtyMax: null, hasImage: null, hasDoc: null };
+let collapsedGroups = new Set();   // 折叠中的组键（仅当前会话记，不持久化——易过期）
+
+/* 视图状态持久化：排序/分组/筛选 三样（折叠状态不存） */
+function saveView() {
+  try {
+    localStorage.setItem(VIEW_KEY, JSON.stringify({ sortRules, groupField, colFilters }));
+  } catch (e) {}
+}
+function loadView() {
+  try {
+    const v = JSON.parse(localStorage.getItem(VIEW_KEY) || '{}');
+    if (Array.isArray(v.sortRules)) sortRules = v.sortRules.filter(r => FIELD_LABEL[r.field]);
+    if (typeof v.groupField === 'string' && ['','warehouse_name','category','brand','package','unit']
+        .includes(v.groupField)) groupField = v.groupField;
+    if (v.colFilters && typeof v.colFilters === 'object') {
+      ['category','brand','package','unit'].forEach(k => {
+        if (Array.isArray(v.colFilters[k])) colFilters[k] = v.colFilters[k];
+      });
+      ['qtyMin','qtyMax','hasImage','hasDoc'].forEach(k => {
+        if (v.colFilters[k] !== undefined && v.colFilters[k] !== null) colFilters[k] = v.colFilters[k];
+      });
+    }
+  } catch (e) {}
+  const sel = document.getElementById('group-by');
+  if (sel) sel.value = groupField;
+}
 
 async function init() {
   const user = await checkLogin();
   if (!user) return;
   warehouses = await api('/api/warehouses');
   fillWarehouseSelects();
+  loadView();          // 恢复上次视图（排序/分组/筛选）
   loadMaterials();
 }
 function fillWarehouseSelects() {
@@ -149,20 +271,269 @@ function fillWarehouseSelects() {
 }
 
 // ---------- 物料 ----------
+/* 拉数据（关键字/仓库走后端）→ 缓存 → 前端视图管线 */
 async function loadMaterials() {
   const q = document.getElementById('search-input').value.trim();
   const wid = document.getElementById('filter-warehouse').value;
   let url = '/api/materials?';
   if (q) url += `q=${encodeURIComponent(q)}&`;
   if (wid) url += `warehouse_id=${wid}`;
-  const list = await api(url);
-  document.getElementById('mat-body').innerHTML = list.map((m, i) => `<tr>
+  allRows = await api(url);
+  applyView();
+}
+
+/* ========== 视图管线：筛选 → 排序 → 分组 → 渲染 ========== */
+function applyView() {
+  const rows = sortRows(filterRows(allRows));
+  refreshSortArrows();
+  renderChips();
+  renderStats(rows);
+  renderTable(rows);
+}
+
+/* ---- 前端筛选：多选字段取「或」，条件间取「且」 ---- */
+function filterRows(rows) {
+  const f = colFilters;
+  return rows.filter(m => {
+    if (f.category.length && !f.category.includes(m.category || '')) return false;
+    if (f.brand.length && !f.brand.includes(m.brand || '')) return false;
+    if (f.package.length && !f.package.includes(m.package || '')) return false;
+    if (f.unit.length && !f.unit.includes(m.unit || '')) return false;
+    if (f.qtyMin !== null && (m.quantity ?? 0) < f.qtyMin) return false;
+    if (f.qtyMax !== null && (m.quantity ?? 0) > f.qtyMax) return false;
+    if (f.hasImage !== null && (m.image_path || m.has_image ? 1 : 0) !== f.hasImage) return false;
+    if (f.hasDoc !== null && (m.documents && m.documents.length ? 1 : 0) !== f.hasDoc) return false;
+    return true;
+  });
+}
+
+/* ---- 多级排序：按 rules 逐级比较（JS sort 稳定，空值永远垫底） ---- */
+function cmpOne(a, b, field, dir) {
+  let va = a[field], vb = b[field];
+  const ea = va === null || va === undefined || va === '';
+  const eb = vb === null || vb === undefined || vb === '';
+  if (ea || eb) {   /* 空值垫底（与 Excel 一致），不受升/降影响 */
+    if (ea && eb) return 0;
+    return ea ? 1 : -1;
+  }
+  let c;
+  if (field === 'quantity') c = (+va) - (+vb);                    // 库存数值比较
+  else c = String(va).localeCompare(String(vb), 'zh');            // 文本按中文排序；created_at 字典序=时间序
+  return dir === 'desc' ? -c : c;
+}
+function cmpRows(a, b) {
+  for (const r of sortRules) {
+    const c = cmpOne(a, b, r.field, r.dir);
+    if (c) return c;
+  }
+  return (b.id - a.id);   // 兜底：默认新料在前（与后端 ORDER BY id DESC 一致）
+}
+function sortRows(rows) { return rows.slice().sort(cmpRows); }
+
+/* ---- 表头点击：三态循环 未排序→升序→降序→还原默认 ---- */
+function onSortClick(field) {
+  const cur = sortRules.find(r => r.field === field);
+  if (!cur) sortRules = [{ field, dir: 'asc' }];
+  else if (cur.dir === 'asc') sortRules = [{ field, dir: 'desc' }];
+  else sortRules = [];                      // 再点一次还原默认（id 倒序）
+  saveView();
+  applyView();
+}
+function refreshSortArrows() {
+  document.querySelectorAll('.sort-arrow').forEach(sp => {
+    const f = sp.dataset.f;
+    const r = sortRules.find(x => x.field === f);
+    sp.textContent = r ? (r.dir === 'asc' ? ' ▲' : ' ▼') : ' ↕';
+    sp.className = 'sort-arrow' + (r ? ' on' : '');
+  });
+}
+
+/* ---- 多条件排序弹窗 ---- */
+function openSortModal() {
+  /* 字段下拉：第一级必选（默认 id 倒序可不选=默认），二/三级可空 */
+  const mkOpts = (sel, allowEmpty) => {
+    const cur = sel.value;
+    sel.innerHTML = (allowEmpty ? '<option value="">（不选）</option>' : '') +
+      SORTABLE_FIELDS.map(([f, label]) => `<option value="${f}">${label}</option>`).join('');
+    sel.value = cur || (allowEmpty ? '' : 'name');
+  };
+  ['sort-f1','sort-f2','sort-f3'].forEach((id, i) => mkOpts(document.getElementById(id), i > 0));
+  /* 回填当前规则 */
+  ['f1','f2','f3'].forEach((n, i) => {
+    const r = sortRules[i];
+    if (r) {
+      document.getElementById('sort-' + n).value = r.field;
+      document.querySelector(`input[name="sort-d${i+1}"][value="${r.dir}"]`).checked = true;
+    }
+  });
+  openModal('sort-modal');
+}
+function applySortModal() {
+  const rules = [];
+  ['1','2','3'].forEach(i => {
+    const f = document.getElementById('sort-f' + i).value;
+    if (f) rules.push({ field: f, dir: document.querySelector(`input[name="sort-d${i}"]:checked`).value });
+  });
+  sortRules = rules;   // 弹窗整体替换（表头点击=单条件，弹窗=多条件）
+  saveView();
+  closeModal('sort-modal');
+  applyView();
+}
+function clearSort() {
+  sortRules = [];
+  saveView();
+  closeModal('sort-modal');
+  applyView();
+}
+
+/* ---- 分组 ---- */
+function setGroup(f) {
+  groupField = f;
+  collapsedGroups.clear();   // 换分组维度时折叠状态重置
+  saveView();
+  applyView();
+}
+function toggleGroup(key) {
+  if (collapsedGroups.has(key)) collapsedGroups.delete(key);
+  else collapsedGroups.add(key);
+  applyView();
+}
+
+/* ---- 筛选弹窗：打开时按当前数据动态生成多选组（去重 + 计数） ---- */
+function fillCheckGroup(elId, field) {
+  const box = document.getElementById(elId);
+  const cnt = {};   // 值 → 行数（空值归入「（未填）」显示）
+  allRows.forEach(m => {
+    const v = m[field] || '';
+    cnt[v] = (cnt[v] || 0) + 1;
+  });
+  const keys = Object.keys(cnt).sort((a, b) => a.localeCompare(b, 'zh'));
+  box.innerHTML = keys.map(v =>
+    `<label class="flt-item"><input type="checkbox" value="${esc(v)}"` +
+    `${colFilters[field].includes(v) ? ' checked' : ''}> ${esc(v) || '（未填）'} (${cnt[v]})</label>`
+  ).join('') || '<span class="modal-tip">（无数据）</span>';
+}
+function openFilterModal() {
+  document.getElementById('flt-qmin').value = colFilters.qtyMin ?? '';
+  document.getElementById('flt-qmax').value = colFilters.qtyMax ?? '';
+  document.querySelector(`input[name="flt-img"][value="${colFilters.hasImage ?? ''}"]`).checked = true;
+  document.querySelector(`input[name="flt-doc"][value="${colFilters.hasDoc ?? ''}"]`).checked = true;
+  fillCheckGroup('flt-category', 'category');
+  fillCheckGroup('flt-brand', 'brand');
+  fillCheckGroup('flt-package', 'package');
+  fillCheckGroup('flt-unit', 'unit');
+  openModal('filter-modal');
+}
+function applyFilterModal() {
+  const num = id => {
+    const v = document.getElementById(id).value;
+    if (v === '') return null;
+    const n = parseFloat(v);
+    return isNaN(n) ? null : n;
+  };
+  colFilters.qtyMin = num('flt-qmin');
+  colFilters.qtyMax = num('flt-qmax');
+  const radio = name => {
+    const v = document.querySelector(`input[name="${name}"]:checked`).value;
+    return v === '' ? null : +v;
+  };
+  colFilters.hasImage = radio('flt-img');
+  colFilters.hasDoc = radio('flt-doc');
+  ['category','brand','package','unit'].forEach(f => {
+    colFilters[f] = [...document.querySelectorAll(`#flt-${f} input:checked`)].map(i => i.value);
+  });
+  saveView();
+  closeModal('filter-modal');
+  applyView();
+}
+function clearFilters() {
+  colFilters = { category: [], brand: [], package: [], unit: [],
+                 qtyMin: null, qtyMax: null, hasImage: null, hasDoc: null };
+  saveView();
+  closeModal('filter-modal');
+  applyView();
+}
+/* 移除单个条件（chips 的 × 点击），按 chip 类型分发 */
+function removeFilter(key, val) {
+  if (['category','brand','package','unit'].includes(key))
+    colFilters[key] = colFilters[key].filter(v => v !== val);
+  else if (key === 'qty') { colFilters.qtyMin = null; colFilters.qtyMax = null; }
+  else colFilters[key] = null;   // hasImage / hasDoc
+  saveView();
+  applyView();
+}
+
+/* ---- 筛选 chips 行（工具栏下方）：每个启用条件一枚，可单删 ---- */
+function renderChips() {
+  const f = colFilters;
+  const chips = [];
+  ['category','brand','package','unit'].forEach(k => {
+    f[k].forEach(v => chips.push(
+      `<span class="chip-x">${FIELD_LABEL[k]||k}: ${esc(v)||'（未填）'}<b onclick="removeFilter('${k}','${esc(v)}')">×</b></span>`));
+  });
+  if (f.qtyMin !== null || f.qtyMax !== null)
+    chips.push(`<span class="chip-x">库存 ${f.qtyMin ?? '不限'} ~ ${f.qtyMax ?? '不限'}<b onclick="removeFilter('qty')">×</b></span>`);
+  if (f.hasImage !== null)
+    chips.push(`<span class="chip-x">图片: ${f.hasImage ? '有' : '无'}<b onclick="removeFilter('hasImage')">×</b></span>`);
+  if (f.hasDoc !== null)
+    chips.push(`<span class="chip-x">手册: ${f.hasDoc ? '有' : '无'}<b onclick="removeFilter('hasDoc')">×</b></span>`);
+  const box = document.getElementById('filter-chips');
+  box.innerHTML = chips.length
+    ? chips.join('') + `<span class="chip-x clear-all" onclick="clearFilters()">清除筛选</span>`
+    : '';
+  box.style.display = chips.length ? 'flex' : 'none';
+}
+
+/* ---- 统计条：条数 + 库存合计（单位不统一时仅提示条数）；达到接口 500 上限时告警 ---- */
+function renderStats(rows) {
+  const el = document.getElementById('mat-stats');
+  let txt = `共 ${rows.length} 项`;
+  const units = new Set(rows.map(m => m.unit || ''));
+  if (units.size <= 1) {   // 单位统一才合计（个/件混算无意义）
+    const total = rows.reduce((s, m) => s + (m.quantity || 0), 0);
+    txt += ` · 库存合计 ${total}${units.size === 1 && units.has('') ? '' : ' ' + [...units][0] || ''}`;
+  }
+  if (allRows.length >= 500) txt += ' · 已达接口上限 500 条';
+  el.textContent = txt;
+}
+
+/* ---- 渲染：分组时插组头行（含计数/合计/折叠），否则平铺 ---- */
+function renderTable(rows) {
+  const body = document.getElementById('mat-body');
+  if (!groupField) {
+    body.innerHTML = rows.map((m, i) => rowHtml(m, i)).join('');
+    return;
+  }
+  /* 分组：按组键聚类，组间组键升序（中文按拼音），组内保持当前排序 */
+  const groups = new Map();
+  rows.forEach(m => {
+    const k = m[groupField] || '（未填）';
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(m);
+  });
+  const keys = [...groups.keys()].sort((a, b) => a.localeCompare(b, 'zh'));
+  const colspan = 15;   // 表格列数（含 sticky 出入库列）
+  body.innerHTML = keys.map(k => {
+    const g = groups.get(k);
+    const total = g.reduce((s, m) => s + (m.quantity || 0), 0);
+    const open = !collapsedGroups.has(k);
+    const head = `<tr class="group-row" onclick="toggleGroup('${esc(k).replace(/'/g, "\\'")}')">
+      <td colspan="${colspan}"><span class="toggle">${open ? '▾' : '▸'}</span>
+        ${esc(k)} <span class="group-meta">${g.length} 项 · 库存合计 ${total}</span></td></tr>`;
+    return head + (open ? g.map((m, i) => rowHtml(m, i)).join('') : '');
+  }).join('');
+}
+
+/* 单行 HTML（与原渲染逐列一致；新增「分类」列 td） */
+function rowHtml(m, i) {
+  return `<tr>
     <td>${i + 1}</td>
     <td>${(m.image_path || m.has_image) ? `<img src="/api/materials/${m.id}/image" referrerpolicy="no-referrer" style="width:44px;height:44px;object-fit:contain;cursor:zoom-in"
          title="点击查看大图" onclick="window.open('/api/materials/${m.id}/image')"
          onerror="this.replaceWith(document.createTextNode('—'))">` : '—'}</td>
     <td>${esc(m.name)}</td><td>${esc(m.code||'')}</td>
-    <td>${esc(m.model||'')}</td><td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
+    <td>${esc(m.model||'')}</td><td>${esc(m.category||'')}</td>
+    <td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
     <td style="white-space:nowrap">${(m.created_at||'').slice(0,10)}</td>
     <td style="white-space:nowrap">${m.documents && m.documents.length ? m.documents.map(d =>
@@ -181,7 +552,7 @@ async function loadMaterials() {
     <td class="col-sticky" style="white-space:nowrap">
       <button class="mini-btn in" onclick="openStockModal(${m.id}, '${esc(m.name).replace(/'/g, "\\'")}', ${m.quantity}, 'in')">入库</button>
       <button class="mini-btn out" onclick="openStockModal(${m.id}, '${esc(m.name).replace(/'/g, "\\'")}', ${m.quantity}, 'out')">出库</button>
-    </td></tr>`).join('');
+    </td></tr>`;
 }
 
 /* ==================== 就地出入库（sticky 列按钮） ==================== */

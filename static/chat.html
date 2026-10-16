@@ -24,7 +24,8 @@
 .msg-main { max-width: min(80%, 840px); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .msg-row.user .msg-main { align-items: flex-end; }
 .msg-row.assistant .msg-main { align-items: flex-start; }
-.msg-main .bubble { align-self: auto; }
+/* 气泡自身收缩到内容宽度（inline 级别），避免用户消息被 max-width 撑满整行后提前折行 */
+.msg-main .bubble { align-self: auto; width: fit-content; max-width: 100%; }
 .msg-main .action-card { align-self: stretch; width: auto; }
 .m-meta { font-size: 11px; color: var(--ink-3); white-space: nowrap; padding: 0 4px; }
 
