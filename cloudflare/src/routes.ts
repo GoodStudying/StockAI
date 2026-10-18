@@ -96,15 +96,15 @@ api.get("/api/materials", requireLogin, async (c) => {
   const widRaw = c.req.query("warehouse_id");
   const includeChildren = (c.req.query("include_children") ?? "1") !== "0"; // 默认含子库
   let sql = `SELECT m.id, m.name, m.code, m.model, m.category, m.package, m.brand,
-                    m.description, m.quantity, m.unit, m.warehouse_id, m.lcsc_url,
+                    m.description, m.quantity, m.unit, m.warehouse_id, m.location_code, m.lcsc_url,
                     CASE WHEN m.image_path IS NOT NULL AND m.image_path != '' THEN 1 ELSE 0 END AS has_image,
                     m.image_path, m.created_at, m.updated_at, w.name AS warehouse_name
              FROM materials m LEFT JOIN warehouses w ON m.warehouse_id = w.id`;
   const conds: string[] = [];
   const params: unknown[] = [];
   if (kw) {
-    conds.push("(m.name LIKE ? OR m.code LIKE ? OR m.model LIKE ?)");
-    params.push(`%${kw}%`, `%${kw}%`, `%${kw}%`);
+    conds.push("(m.name LIKE ? OR m.code LIKE ? OR m.model LIKE ? OR m.location_code LIKE ?)");
+    params.push(`%${kw}%`, `%${kw}%`, `%${kw}%`, `%${kw}%`);
   }
   if (widRaw) {
     const wid = parseIntSafe(widRaw, 1);
@@ -204,11 +204,12 @@ api.post("/api/materials", requireLogin, async (c) => {
   if (qty === null) return c.json({ error: "数量必须是不小于0的整数" }, 400);
   const r = await c.env.DB.prepare(
     `INSERT INTO materials(name, code, model, category, package, brand,
-                           description, quantity, unit, warehouse_id, lcsc_url)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+                           description, quantity, unit, warehouse_id, location_code, lcsc_url)
+     VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
     .bind(name, String(d.code ?? ""), String(d.model ?? ""), String(d.category ?? ""),
           String(d.package ?? ""), String(d.brand ?? ""), String(d.description ?? ""),
-          qty, String(d.unit ?? "个"), d.warehouse_id || null, String(d.lcsc_url ?? ""))
+          qty, String(d.unit ?? "个"), d.warehouse_id || null,
+          String(d.location_code ?? "").trim(), String(d.lcsc_url ?? ""))
     .run();
   // 立创C编号自动补全：图片/手册外链 + 参数填空（失败静默不阻塞建料）
   const note = await autoFetchMaterial(c.env.DB, r.meta.last_row_id);
@@ -226,10 +227,11 @@ api.put("/api/materials/:id", requireLogin, async (c) => {
   if (qty === null) return c.json({ error: "数量必须是不小于0的整数" }, 400);
   const r = await c.env.DB.prepare(
     `UPDATE materials SET name=?, code=?, model=?, category=?, package=?,
-        brand=?, description=?, quantity=?, unit=?, warehouse_id=?, lcsc_url=?, updated_at=? WHERE id=?`)
+        brand=?, description=?, quantity=?, unit=?, warehouse_id=?, location_code=?, lcsc_url=?, updated_at=? WHERE id=?`)
     .bind(name, String(d.code ?? ""), String(d.model ?? ""), String(d.category ?? ""),
           String(d.package ?? ""), String(d.brand ?? ""), String(d.description ?? ""),
-          qty, String(d.unit ?? "个"), d.warehouse_id || null, String(d.lcsc_url ?? ""),
+          qty, String(d.unit ?? "个"), d.warehouse_id || null,
+          String(d.location_code ?? "").trim(), String(d.lcsc_url ?? ""),
           nowStr(), mid)
     .run();
   if ((r.meta.changes ?? 0) === 0) return c.json({ error: "物料不存在" }, 404);

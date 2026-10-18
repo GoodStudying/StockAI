@@ -59,6 +59,7 @@
         <th class="sortable" onclick="onSortClick('brand')">品牌<span class="sort-arrow" data-f="brand"></span></th>
         <th class="sortable" onclick="onSortClick('quantity')">库存<span class="sort-arrow" data-f="quantity"></span></th>
         <th class="sortable" onclick="onSortClick('warehouse_name')">所在库<span class="sort-arrow" data-f="warehouse_name"></span></th>
+        <th class="sortable" onclick="onSortClick('location_code')">位号<span class="sort-arrow" data-f="location_code"></span></th>
         <th class="sortable" onclick="onSortClick('created_at')">新增日期<span class="sort-arrow" data-f="created_at"></span></th>
         <th>手册</th><th>操作</th>
         <th class="col-sticky">出入库</th>
@@ -84,6 +85,7 @@
     <div class="form-row"><label>数量</label><input id="m-quantity" type="number" value="0"></div>
     <div class="form-row"><label>单位</label><input id="m-unit" value="个"></div>
     <div class="form-row"><label>所在库</label><select id="m-warehouse"></select></div>
+    <div class="form-row"><label>位号</label><input id="m-location" placeholder="如 A1-03（选填）"></div>
     <div class="form-row"><label>立创链接</label><input id="m-lcsc"></div>
     <div class="form-row"><label>描述</label><textarea id="m-desc" rows="2"></textarea></div>
     <div class="modal-footer">
@@ -213,7 +215,7 @@ let allRows = [];   // 接口原始数据缓存：排序/分组/筛选全部在�
 const VIEW_KEY = 'matView';
 const SORTABLE_FIELDS = [
   ['name','名称'],['code','编码'],['model','型号'],['category','分类'],['package','封装'],
-  ['brand','品牌'],['quantity','库存'],['warehouse_name','所在库'],['created_at','新增日期'],
+  ['brand','品牌'],['quantity','库存'],['warehouse_name','所在库'],['location_code','位号'],['created_at','新增日期'],
 ];
 const FIELD_LABEL = Object.fromEntries(SORTABLE_FIELDS);
 /* colFilters: 数组类=多选（空数组=不筛）；qtyMin/qtyMax=库存区间（null=不限）；
@@ -512,7 +514,7 @@ function renderTable(rows) {
     groups.get(k).push(m);
   });
   const keys = [...groups.keys()].sort((a, b) => a.localeCompare(b, 'zh'));
-  const colspan = 15;   // 表格列数（含 sticky 出入库列）
+  const colspan = 16;   // 表格列数（含 sticky 出入库列）
   body.innerHTML = keys.map(k => {
     const g = groups.get(k);
     const total = g.reduce((s, m) => s + (m.quantity || 0), 0);
@@ -535,6 +537,7 @@ function rowHtml(m, i) {
     <td>${esc(m.model||'')}</td><td>${esc(m.category||'')}</td>
     <td>${esc(m.package||'')}</td><td>${esc(m.brand||'')}</td>
     <td>${m.quantity} ${esc(m.unit||'')}</td><td>${esc(m.warehouse_name||'')}</td>
+    <td>${esc(m.location_code||'')}</td>
     <td style="white-space:nowrap">${(m.created_at||'').slice(0,10)}</td>
     <td style="white-space:nowrap">${m.documents && m.documents.length ? m.documents.map(d =>
       `<span class="badge">${d.doc_type === 'datasheet' ? '数据手册' : d.doc_type === 'user_manual' ? '用户手册' : '其他文档'}</span>
@@ -579,7 +582,7 @@ async function submitStock() {
 }
 function openMaterialModal() {
   document.getElementById('mat-modal-title').textContent = '新建物料';
-  ['m-id','m-name','m-code','m-model','m-category','m-package','m-brand','m-lcsc','m-desc']
+  ['m-id','m-name','m-code','m-model','m-category','m-package','m-brand','m-location','m-lcsc','m-desc']
     .forEach(id => document.getElementById(id).value = '');
   document.getElementById('m-quantity').value = 0;
   document.getElementById('m-unit').value = '个';
@@ -597,6 +600,7 @@ function editMaterial(m) {
   document.getElementById('m-quantity').value = m.quantity || 0;
   document.getElementById('m-unit').value = m.unit || '个';
   document.getElementById('m-warehouse').value = m.warehouse_id || '';
+  document.getElementById('m-location').value = m.location_code || '';
   document.getElementById('m-lcsc').value = m.lcsc_url || '';
   document.getElementById('m-desc').value = m.description || '';
   openModal('mat-modal');
@@ -613,6 +617,7 @@ async function saveMaterial() {
     quantity: +document.getElementById('m-quantity').value || 0,
     unit: document.getElementById('m-unit').value.trim() || '个',
     warehouse_id: document.getElementById('m-warehouse').value || null,
+    location_code: document.getElementById('m-location').value.trim(),
     lcsc_url: document.getElementById('m-lcsc').value.trim(),
     description: document.getElementById('m-desc').value.trim(),
     image_url: window.__lcsc_image || '',

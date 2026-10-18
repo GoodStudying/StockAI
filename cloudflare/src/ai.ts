@@ -112,7 +112,7 @@ async function systemPrompt(db: D1Database, username: string): Promise<string> {
 【职责】帮助用户查询物料库存、办理出入库、核对 BOM、管理采购清单。
 
 【数据库表结构】（query 工具只能查这些表）
-- materials(id, name 名称, code 编码/立创C编号, model 型号, category 分类, package 封装, brand 品牌, quantity 库存数量, unit 单位, warehouse_id 所属仓库id, description 描述, created_at)
+- materials(id, name 名称, code 编码/立创C编号, model 型号, category 分类, package 封装, brand 品牌, quantity 库存数量, unit 单位, warehouse_id 所属仓库id, location_code 存放位号, description 描述, created_at)
 - warehouses(id, name, parent_id 父库id, level 层级1-4)
 - stock_records(id, material_id, type 类型in入库/out出库, quantity, operator 操作人, remark 备注, created_at) —— 出入库流水
 - purchase_items(id, project 项目, material_id, name, code, model, need_qty 需求数量, unit, remark, created_at) —— 采购条目（已购量=其 purchase_batches 的 qty 合计）
@@ -180,7 +180,7 @@ const AI_TOOLS = [
   { type: "function", function: {
     name: "material",
     description: "物料管理（写操作，生成待确认卡片）。action=create 新建（填立创C编号自动抓图片/手册/参数）；"
-      + "update 修改资料字段（改名称/编码/型号/分类/封装/品牌/单位/仓库/描述；⚠️改库存数量必须用 stock 工具）；"
+      + "update 修改资料字段（改名称/编码/型号/分类/封装/品牌/单位/仓库/位号/描述；⚠️改库存数量必须用 stock 工具）；"
       + "delete 删除（现库存一并清空，标题会标注）。update/delete 用 material_id 或 code 定位。",
     parameters: { type: "object", required: ["action"], properties: {
       action: { type: "string", enum: ["create", "update", "delete"] },
@@ -190,6 +190,7 @@ const AI_TOOLS = [
       model: { type: "string" }, category: { type: "string" },
       package: { type: "string" }, brand: { type: "string" }, unit: { type: "string" },
       warehouse_id: { type: "integer", description: "仓库 id（query 查 warehouses 表）" },
+      location_code: { type: "string", description: "存放位号（如 A1-03，仓库内具体位置标记）" },
       quantity: { type: "integer", description: "仅 create：初始库存，默认0" },
       description: { type: "string" } } } } },
   { type: "function", function: {
@@ -357,7 +358,7 @@ async function buildAction(db: D1Database, name: string, args: Record<string, an
       const target = await resolveStockTarget(db, args);
       if (target.err) return { err: target.err };
       const fields: Record<string, any> = {};
-      for (const k of ["name", "code", "model", "category", "package", "brand", "unit", "description"]) {
+      for (const k of ["name", "code", "model", "category", "package", "brand", "unit", "location_code", "description"]) {
         if (args[k] !== undefined && args[k] !== null) fields[k] = String(args[k]).trim();
       }
       if (args.warehouse_id !== undefined && args.warehouse_id !== null) {
@@ -368,7 +369,7 @@ async function buildAction(db: D1Database, name: string, args: Record<string, an
         fields.warehouse_id = wid;
       }
       if (!Object.keys(fields).length) {
-        return { err: "update 至少给一个要修改的字段（name/code/model/.../warehouse_id）" };
+        return { err: "update 至少给一个要修改的字段（name/code/model/.../warehouse_id/location_code）" };
       }
       base.type = "update_material";
       base.params = { ...fields, material_id: target.mid };
@@ -797,12 +798,13 @@ async function executeAction(db: D1Database, act: any, username: string): Promis
     const wid = parseIntSafe(p.warehouse_id ?? 0, 1) ?? 0;
     const ins = await db.prepare(
       `INSERT INTO materials(name, code, model, category, package, brand,
-                             description, quantity, unit, warehouse_id, lcsc_url)
-       VALUES (?,?,?,?,?,?,?,?,?,?,?)`)
+                             description, quantity, unit, warehouse_id, location_code, lcsc_url)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
       .bind(mname, String(p.code ?? "").trim(), String(p.model ?? "").trim(),
             String(p.category ?? "").trim(), String(p.package ?? "").trim(),
             String(p.brand ?? "").trim(), String(p.description ?? "").trim(),
-            qty, String(p.unit ?? "个").trim() || "个", wid || null, "")
+            qty, String(p.unit ?? "个").trim() || "个", wid || null,
+            String(p.location_code ?? "").trim(), "")
       .run();
     const newId = ins.meta.last_row_id;
     const note = await autoFetchMaterial(db, newId);   // C编号自动抓图/手册外链+参数（失败静默）
@@ -838,7 +840,7 @@ async function executeAction(db: D1Database, act: any, username: string): Promis
     if (!exist.length) return { error: `物料 #${mid} 不存在（可能已被删除）` };
     // 白名单字段动态拼 SET（quantity 在建卡阶段已被拦截，这里再兜底）
     const allowed = ["name", "code", "model", "category", "package", "brand",
-                     "unit", "description", "warehouse_id"];
+                     "unit", "description", "warehouse_id", "location_code"];
     const sets: string[] = [];
     const vals: unknown[] = [];
     for (const k of allowed) {

@@ -523,16 +523,16 @@ def list_materials():
     wid_raw = request.args.get("warehouse_id")
     include_children = request.args.get("include_children", "1") != "0"  # 默认含子库
     sql = """SELECT m.id, m.name, m.code, m.model, m.category, m.package, m.brand,
-                    m.description, m.quantity, m.unit, m.warehouse_id, m.lcsc_url,
+                    m.description, m.quantity, m.unit, m.warehouse_id, m.location_code, m.lcsc_url,
                     m.image_path, (m.image_blob IS NOT NULL) AS has_image,
                     m.created_at, m.updated_at, w.name AS warehouse_name
              FROM materials m
              LEFT JOIN warehouses w ON m.warehouse_id = w.id"""
     conds, params = [], []
     if kw:
-        conds.append("(m.name LIKE ? OR m.code LIKE ? OR m.model LIKE ?)")
+        conds.append("(m.name LIKE ? OR m.code LIKE ? OR m.model LIKE ? OR m.location_code LIKE ?)")
         like = f"%{kw}%"
-        params += [like, like, like]
+        params += [like, like, like, like]
     if wid_raw:
         wid = _parse_int(wid_raw, 1)
         if wid is None:
@@ -649,12 +649,13 @@ def create_material():
         return jsonify({"error": "数量必须是不小于0的整数"}), 400
     last_id, _ = db.execute_write(
         """INSERT INTO materials(name, code, model, category, package, brand,
-                                 description, quantity, unit, warehouse_id, lcsc_url)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                 description, quantity, unit, warehouse_id, location_code, lcsc_url)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         (name, d.get("code", ""), d.get("model", ""), d.get("category", ""),
          d.get("package", ""), d.get("brand", ""), d.get("description", ""),
          qty, d.get("unit", "个"),
-         d.get("warehouse_id") or None, d.get("lcsc_url", "")))
+         d.get("warehouse_id") or None, (d.get("location_code") or "").strip(),
+         d.get("lcsc_url", "")))
 
     # 创建物料时自动下载物料图片（失败不影响建物料）；图片内容直接存数据库
     image_url = (d.get("image_url") or "").strip()
@@ -684,12 +685,13 @@ def update_material(mid):
         return jsonify({"error": "数量必须是不小于0的整数"}), 400
     _, n = db.execute_write(
         """UPDATE materials SET name=?, code=?, model=?, category=?, package=?,
-           brand=?, description=?, quantity=?, unit=?, warehouse_id=?, lcsc_url=?,
+           brand=?, description=?, quantity=?, unit=?, warehouse_id=?, location_code=?, lcsc_url=?,
            updated_at=? WHERE id=?""",
         (name, d.get("code", ""), d.get("model", ""), d.get("category", ""),
          d.get("package", ""), d.get("brand", ""), d.get("description", ""),
          qty, d.get("unit", "个"),
-         d.get("warehouse_id") or None, d.get("lcsc_url", ""),
+         d.get("warehouse_id") or None, (d.get("location_code") or "").strip(),
+         d.get("lcsc_url", ""),
          datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mid))
     if n == 0:
         return jsonify({"error": "物料不存在"}), 404
@@ -790,20 +792,20 @@ def stock_records():
 # ---------------- 开放接口 /api/v1（API Token 认证，供 Cherry Studio / MCP 等程序化调用） ----------------
 
 def _search_core(q, code, limit=20, allow_all=False):
-    """物料搜索核心：code 精确 或 q 模糊（名称/编码/型号），返回精简字段行列表。
+    """物料搜索核心：code 精确 或 q 模糊（名称/编码/型号/位号），返回精简字段行列表。
     被 /api/v1（外部Token）、AI 工具 search_materials 共用，避免三处复制查询逻辑。
     allow_all=True（仅 AI 工具用）：两个参数都为空时列出全部库存（最新的在前），
     解决"我现在有哪些库存"这类无关键词提问；/api/v1 仍要求至少一个参数。"""
     q = (q or "").strip()
     code = (code or "").strip()
-    cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id"
+    cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id, location_code"
     if code:
         return db.query(f"SELECT {cols} FROM materials WHERE code=? LIMIT ?", (code, limit))
     if q:
         like = f"%{q}%"
         return db.query(
             f"SELECT {cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ? "
-            f"ORDER BY id DESC LIMIT ?", (like, like, like, limit))
+            f"OR location_code LIKE ? ORDER BY id DESC LIMIT ?", (like, like, like, like, limit))
     if allow_all:
         # 无关键词 = 全量列表（参考实现的做法：查询类工具空参数合法，AI 不会被逼拒答）
         return db.query(f"SELECT {cols} FROM materials ORDER BY id DESC LIMIT ?", (limit,))
@@ -813,7 +815,7 @@ def _search_core(q, code, limit=20, allow_all=False):
 @app.route("/api/v1/materials", methods=["GET"])
 @token_required
 def v1_search_materials():
-    """物料搜索：q 模糊匹配 名称/编码/型号；code 精确匹配编码"""
+    """物料搜索：q 模糊匹配 名称/编码/型号/位号；code 精确匹配编码"""
     rows = _search_core(request.args.get("q"), request.args.get("code"), limit=50)
     if rows is None:
         return jsonify({"error": "请提供 q 或 code 参数"}), 400
@@ -1971,7 +1973,7 @@ def _system_prompt(username):
 【职责】帮助用户查询物料库存、办理出入库、核对 BOM、管理采购清单。
 
 【数据库表结构】（query 工具只能查这些表）
-- materials(id, name 名称, code 编码/立创C编号, model 型号, category 分类, package 封装, brand 品牌, quantity 库存数量, unit 单位, warehouse_id 所属仓库id, description 描述, created_at)
+- materials(id, name 名称, code 编码/立创C编号, model 型号, category 分类, package 封装, brand 品牌, quantity 库存数量, unit 单位, warehouse_id 所属仓库id, location_code 存放位号, description 描述, created_at)
 - warehouses(id, name, parent_id 父库id, level 层级1-4)
 - stock_records(id, material_id, type 类型in入库/out出库, quantity, operator 操作人, remark 备注, created_at) —— 出入库流水
 - purchase_items(id, project 项目, material_id, name, code, model, need_qty 需求数量, unit, remark, created_at) —— 采购条目（已购量=其 purchase_batches 的 qty 合计）
@@ -2040,7 +2042,7 @@ AI_TOOLS = [
     {"type": "function", "function": {
         "name": "material",
         "description": "物料管理（写操作，生成待确认卡片）。action=create 新建（填立创C编号自动抓图片/手册/参数）；"
-                       "update 修改资料字段（改名称/编码/型号/分类/封装/品牌/单位/仓库/描述；⚠️改库存数量必须用 stock 工具）；"
+                       "update 修改资料字段（改名称/编码/型号/分类/封装/品牌/单位/仓库/位号/描述；⚠️改库存数量必须用 stock 工具）；"
                        "delete 删除（现库存一并清空，标题会标注）。update/delete 用 material_id 或 code 定位。",
         "parameters": {"type": "object", "required": ["action"], "properties": {
             "action": {"type": "string", "enum": ["create", "update", "delete"]},
@@ -2050,6 +2052,7 @@ AI_TOOLS = [
             "model": {"type": "string"}, "category": {"type": "string"},
             "package": {"type": "string"}, "brand": {"type": "string"}, "unit": {"type": "string"},
             "warehouse_id": {"type": "integer", "description": "仓库 id（query 查 warehouses 表）"},
+            "location_code": {"type": "string", "description": "存放位号（如 A1-03，仓库内具体位置标记）"},
             "quantity": {"type": "integer", "description": "仅 create：初始库存，默认0"},
             "description": {"type": "string"}}}}},
     {"type": "function", "function": {
@@ -2184,7 +2187,8 @@ def _build_action(name, args):
             if err:
                 return None, err
             fields = {k: (args.get(k) or "").strip() for k in
-                      ("name", "code", "model", "category", "package", "brand", "unit", "description")
+                      ("name", "code", "model", "category", "package", "brand", "unit",
+                       "location_code", "description")
                       if args.get(k) is not None}
             if args.get("warehouse_id") is not None:
                 wid = _parse_int(args.get("warehouse_id"), 1)
@@ -2194,7 +2198,7 @@ def _build_action(name, args):
                     return None, f"仓库 #{wid} 不存在，先用 query 查 warehouses 表确认"
                 fields["warehouse_id"] = wid
             if not fields:
-                return None, "update 至少给一个要修改的字段（name/code/model/.../warehouse_id）"
+                return None, "update 至少给一个要修改的字段（name/code/model/.../warehouse_id/location_code）"
             base["type"] = "update_material"
             base["params"] = dict(fields, material_id=mid)
             base["title"] = f"修改物料：{mname}（#{mid}）——{('、'.join(fields.keys()))}"
@@ -2635,12 +2639,13 @@ def _execute_action(act, username):
         wid = _parse_int(p.get("warehouse_id") or 0, 1)
         new_id, _ = db.execute_write(
             """INSERT INTO materials(name, code, model, category, package, brand,
-                                     description, quantity, unit, warehouse_id, lcsc_url)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                                     description, quantity, unit, warehouse_id, location_code, lcsc_url)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (mname, (p.get("code") or "").strip(), (p.get("model") or "").strip(),
              (p.get("category") or "").strip(), (p.get("package") or "").strip(),
              (p.get("brand") or "").strip(), (p.get("description") or "").strip(),
-             qty, (p.get("unit") or "个").strip() or "个", wid or None, ""))
+             qty, (p.get("unit") or "个").strip() or "个", wid or None,
+             (p.get("location_code") or "").strip(), ""))
         note = _auto_fetch_material(new_id)       # 立创C编号自动抓图/手册/参数（失败静默）
         res = {"material_id": new_id}
         if note:
@@ -2665,7 +2670,7 @@ def _execute_action(act, username):
             return {"error": f"物料 #{mid} 不存在（可能已被删除）"}
         # 白名单字段动态拼 SET（quantity 在建卡阶段已被拦截，这里再兜底）
         allowed = ("name", "code", "model", "category", "package", "brand",
-                   "unit", "description", "warehouse_id")
+                   "unit", "description", "warehouse_id", "location_code")
         sets, vals = [], []
         for k in allowed:
             if k in p:

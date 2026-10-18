@@ -80,6 +80,22 @@ check("正常修改物料", r.status_code == 200)
 r = c.get("/api/materials", query_string={"warehouse_id": "xyz"})
 check("warehouse_id非法返回400", r.status_code == 400)
 
+# 存放位号（location_code）：新增列，建料/改料/关键字搜索/开放接口全链路
+r = c.post("/api/materials", json={"name": "贴片电阻10k", "code": "C25804", "quantity": 100,
+                                   "warehouse_id": w2, "location_code": "A1-03"})
+m_loc = r.get_json()["id"]
+row = dbm.query("SELECT location_code FROM materials WHERE id=?", (m_loc,))[0]
+check("建料可存位号", row["location_code"] == "A1-03", str(row["location_code"]))
+r = c.get("/api/materials", query_string={"q": "A1-03"})
+check("关键字可按位号搜到", any(m["id"] == m_loc for m in r.get_json()))
+r = c.put(f"/api/materials/{m_loc}", json={"name": "贴片电阻10k", "code": "C25804",
+                                            "quantity": 100, "location_code": "B2-11"})
+row = dbm.query("SELECT location_code FROM materials WHERE id=?", (m_loc,))[0]
+check("改料可改位号", row["location_code"] == "B2-11", str(row["location_code"]))
+r = c.get("/api/v1/materials?q=B2-11", headers=H)
+check("开放接口可按位号搜索", r.status_code == 200
+      and any(m["id"] == m_loc and m["location_code"] == "B2-11" for m in r.get_json()["materials"]))
+
 # ---------- 4. 删除非空仓库 ----------
 print("[4] 删除非空仓库防御")
 r = c.delete(f"/api/warehouses/{w1}")

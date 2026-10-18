@@ -38,15 +38,15 @@ v1.use("/api/v1/*", async (c, next) => {
 v1.get("/api/v1/materials", async (c) => {
   const code = (c.req.query("code") ?? "").trim();
   const kw = (c.req.query("q") ?? "").trim();
-  const cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id";
+  const cols = "id, name, code, model, category, package, brand, quantity, unit, warehouse_id, location_code";
   let rows: any[];
   if (code) {
     rows = await q(c.env.DB, `SELECT ${cols} FROM materials WHERE code=? LIMIT 50`, code);
   } else if (kw) {
     const like = `%${kw}%`;
     rows = await q(c.env.DB,
-      `SELECT ${cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ? ORDER BY id DESC LIMIT 50`,
-      like, like, like);
+      `SELECT ${cols} FROM materials WHERE name LIKE ? OR code LIKE ? OR model LIKE ? OR location_code LIKE ? ORDER BY id DESC LIMIT 50`,
+      like, like, like, like);
   } else {
     return c.json({ error: "请提供 q 或 code 参数" }, 400);
   }

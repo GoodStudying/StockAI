@@ -145,6 +145,7 @@ CREATE TABLE IF NOT EXISTS materials (
     quantity INTEGER DEFAULT 0,
     unit TEXT DEFAULT '个',
     warehouse_id INTEGER REFERENCES warehouses(id),
+    location_code TEXT,       -- 存放位号（仓库内的具体位置标记，如 A1-03，便于查找）
     lcsc_url TEXT,            -- 立创商城链接
     image_path TEXT,          -- 立创图片本地路径（旧字段，保留兼容）
     image_blob BLOB,          -- 图片内容（存数据库，优先于 image_path）
@@ -263,6 +264,9 @@ def run_migrations():
         execute_write("ALTER TABLE materials ADD COLUMN image_path TEXT")
     if "image_blob" not in cols:
         execute_write("ALTER TABLE materials ADD COLUMN image_blob BLOB")
+    # 存放位号：老库升级补列
+    if "location_code" not in cols:
+        execute_write("ALTER TABLE materials ADD COLUMN location_code TEXT")
 
     doc_cols = {r["name"] for r in query("PRAGMA table_info(material_documents)")}
     if "file_blob" not in doc_cols:
@@ -325,6 +329,7 @@ CREATE TABLE IF NOT EXISTS materials (
     quantity INTEGER DEFAULT 0,
     unit TEXT DEFAULT '个',
     warehouse_id INTEGER REFERENCES warehouses(id),
+    location_code TEXT,
     lcsc_url TEXT,
     image_path TEXT,
     image_blob BYTEA,
@@ -441,6 +446,10 @@ def init_schema():
             docs = _pg_columns("material_documents")
             if "file_blob" not in docs:
                 cur.execute("ALTER TABLE material_documents ADD COLUMN file_blob BYTEA")
+                conn.commit()
+            # 存放位号：老库升级补列
+            if "location_code" not in mats:
+                cur.execute("ALTER TABLE materials ADD COLUMN location_code TEXT")
                 conn.commit()
             # v261016.1：chat_messages 加 usage_json（AI 回复的 token 用量）
             if "usage_json" not in _pg_columns("chat_messages"):

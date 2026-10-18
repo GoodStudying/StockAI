@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS materials (
     quantity INTEGER DEFAULT 0,
     unit TEXT DEFAULT '个',
     warehouse_id INTEGER REFERENCES warehouses(id),
+    location_code TEXT,       -- 存放位号（仓库内的具体位置标记，如 A1-03，便于查找）
     lcsc_url TEXT,            -- 立创商城链接
     image_path TEXT,          -- 阶段2 接入 R2 后存对象 key；本地版存磁盘路径
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
