@@ -57,6 +57,9 @@
 
 /* 批量确认条：同一消息 pending 卡片 ≥2 张时出现（一次性入库50种不用点50次） */
 .batch-ops { display: flex; gap: 8px; align-items: center; padding: 2px 0; }
+/* 自动继续开关：批量确认完成后自动发「继续」让 AI 出下一批卡片（大批量分批场景免手动） */
+.batch-ops .auto-cont { display: flex; gap: 4px; align-items: center; font-size: 12px;
+  color: var(--text-2, #888); cursor: pointer; user-select: none; }
 </style>
 </head>
 <body>
@@ -249,8 +252,8 @@ function renderCard(msgId, a) {
   html += `<div class="a-detail">${esc(JSON.stringify(a.params, null, 1))}</div>`;
   if (a.status === 'pending') {
     html += `<div class="a-ops">
-      <button class="btn" style="background:var(--green);color:#fff;border:none" onclick="execAction(${msgId},'${a.id}',false)">确认执行</button>
-      <button class="btn" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)" onclick="execAction(${msgId},'${a.id}',true)">取消</button>
+      <button class="btn" style="background:var(--green);color:var(--green-ink);border:none" onclick="execAction(${msgId},'${a.id}',false)">确认执行</button>
+      <button class="btn" style="background:var(--btn-gray-bg);color:var(--ink-2);border:1px solid var(--line-2)" onclick="execAction(${msgId},'${a.id}',true)">取消</button>
     </div>`;
   } else {
     const res = a.result || {};
@@ -300,14 +303,19 @@ async function execAction(msgId, actionId, cancel) {
 
 /* ---------- 批量确认/取消（同一条消息的全部 pending 卡片） ---------- */
 /* 批量确认条：数量由调用方显式传入（首屏来自消息数据，刷新来自 DOM，批量来自响应） */
+/* 「自动继续」勾选状态存 localStorage 全站共享：勾一次后续批量条都带默认勾选 */
 function batchBar(msgId, n) {
   const bar = document.createElement('div');
   bar.className = 'batch-ops';
+  const autoOn = localStorage.getItem('chat_auto_continue') === '1';
   bar.innerHTML =
-    `<button class="btn" style="background:var(--green);color:#fff;border:none" ` +
+    `<button class="btn" style="background:var(--green);color:var(--green-ink);border:none" ` +
     `onclick="execBatch(${msgId},false)">✓ 全部确认（${n} 张）</button>` +
-    `<button class="btn" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)" ` +
-    `onclick="execBatch(${msgId},true)">全部取消</button>`;
+    `<button class="btn" style="background:var(--btn-gray-bg);color:var(--ink-2);border:1px solid var(--line-2)" ` +
+    `onclick="execBatch(${msgId},true)">全部取消</button>` +
+    `<label class="auto-cont" title="批量确认全部成功后，自动发送「继续」让 AI 生成下一批卡片">` +
+    `<input type="checkbox" ${autoOn ? 'checked' : ''} ` +
+    `onchange="localStorage.setItem('chat_auto_continue', this.checked ? '1' : '0')">自动继续</label>`;
   return bar;
 }
 
@@ -330,6 +338,8 @@ async function execBatch(msgId, cancel) {
     if (!confirm(`确认一次性执行本消息全部 ${n} 张待确认卡片？\n（单张失败不影响其他卡片）`)) return;
   }
   const row = document.querySelector(`.msg-row[data-id="${msgId}"]`);
+  /* 重画前记住「自动继续」勾选状态（整组重画会把批量条连同勾选框一起移除） */
+  const autoCont = !!(row && row.querySelector('.batch-ops .auto-cont input')?.checked);
   if (row) row.querySelectorAll('.batch-ops button, .action-card.pending button')
     .forEach(b => b.disabled = true);
   try {
@@ -354,6 +364,13 @@ async function execBatch(msgId, cancel) {
         (s.failed ? `，失败 ${s.failed} 张（详见卡片）` : ''));
     } else {
       setStatus('done', `批量执行 ${s.executed || 0} 张全部成功`);
+      /* 自动继续：勾选且全部成功时，自动发「继续」让 AI 出下一批卡片。
+         有保留/失败（库存不足等）时不自动发——需人工先处理异常卡片，避免 AI 重复建卡 */
+      if (autoCont && (s.executed || 0) > 0 && !sending) {
+        const input = document.getElementById('chat-input');
+        input.value = '继续'; autoGrow(input);
+        send();
+      }
     }
   } catch (e) {
     /* 失败已 alert；按钮恢复 */

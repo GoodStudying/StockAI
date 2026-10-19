@@ -34,7 +34,7 @@
     <div class="toolbar" style="margin-top:10px">
       <button onclick="parseBom()">解析预览</button>
       <button onclick="runCheck()" id="btn-check" disabled>开始核对</button>
-      <button onclick="clearBom()" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)">清空</button>
+      <button onclick="clearBom()" style="background:var(--btn-gray-bg);color:var(--ink-2);border:1px solid var(--line-2)">清空</button>
       <label style="display:flex;align-items:center;gap:4px;font-size:13px;color:var(--ink-3);cursor:pointer"
              title="规则核对后，对'未找到'的行用 AI 做语义匹配并给替代建议（需在系统管理页配置 AI 接口）">
         <input type="checkbox" id="bom-use-ai" checked> AI 智能匹配
@@ -49,7 +49,7 @@
     <h3 class="pt">采购条目</h3>
     <div class="proj-tabs" id="proj-tabs"></div>
     <div class="toolbar">
-      <button onclick="openItemModal()" style="background:var(--accent);color:#fff;border:none">+ 新增采购项</button>
+      <button onclick="openItemModal()" style="background:var(--accent);color:var(--accent-ink);border:none">+ 新增采购项</button>
       <span style="flex:1"></span>
       <select id="status-filter" onchange="loadItems()">
         <option value="">全部状态</option>
@@ -78,7 +78,7 @@
     <div class="form-row"><label>数量</label><input id="batch-qty" type="number" min="1" value="1"></div>
     <div class="form-row"><label>备注</label><input id="batch-remark" placeholder="如：淘宝下单 / 立创包邮车"></div>
     <div class="modal-ops">
-      <button onclick="closeModal('batch-modal')" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)">取消</button>
+      <button onclick="closeModal('batch-modal')" style="background:var(--btn-gray-bg);color:var(--ink-2);border:1px solid var(--line-2)">取消</button>
       <button onclick="saveBatch()">保存</button>
     </div>
   </div>
@@ -96,7 +96,7 @@
     <div class="form-row"><label>单位</label><input id="item-unit" value="个"></div>
     <div class="form-row"><label>备注</label><input id="item-remark"></div>
     <div class="modal-ops">
-      <button onclick="closeModal('item-modal')" style="background:var(--btn-gray-bg);border:1px solid var(--line-2)">取消</button>
+      <button onclick="closeModal('item-modal')" style="background:var(--btn-gray-bg);color:var(--ink-2);border:1px solid var(--line-2)">取消</button>
       <button onclick="saveItem()">保存</button>
     </div>
   </div>
@@ -197,7 +197,7 @@ function renderResultTable() {
   if (s.shortage + s.not_found > 0) {
     html += `<div class="toolbar" style="gap:8px">
       <input id="import-project" placeholder="导入项目名（如：测试板V2）" style="max-width:220px">
-      <button onclick="importShortage()" style="background:var(--accent);color:#fff;border:none">
+      <button onclick="importShortage()" style="background:var(--accent);color:var(--accent-ink);border:none">
         勾选项导入采购清单</button>
     </div>`;
   }
@@ -314,11 +314,11 @@ async function loadItems() {
       <td style="max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(r.remark || '')}">${esc(r.remark || '-')}</td>
       <td style="font-size:12px;color:var(--ink-3)">${esc(r.created_by || '')}<br>${esc((r.created_at || '').slice(0, 10))}</td>
       <td>
-        <button class="mini-btn" style="background:var(--green);color:#fff;border:none;border-radius:6px;padding:3px 9px;font-size:12px"
+        <button class="mini-btn" style="background:var(--green);color:var(--green-ink);border:none;border-radius:6px;padding:3px 9px;font-size:12px"
           onclick="openBatchModal(${r.id}, '${esc(r.name).replace(/'/g, "\\'")}')">+采购</button>
-        <button class="mini-btn" style="border:1px solid var(--line-2);border-radius:6px;padding:3px 9px;font-size:12px;background:var(--btn-gray-bg)"
+        <button class="mini-btn" style="border:1px solid var(--line-2);border-radius:6px;padding:3px 9px;font-size:12px;background:var(--btn-gray-bg);color:var(--ink-2)"
           onclick="openItemModal(${r.id})">编辑</button>
-        <button class="mini-btn" style="background:var(--red);color:#fff;border:none;border-radius:6px;padding:3px 9px;font-size:12px"
+        <button class="mini-btn" style="background:var(--red);color:var(--red-ink);border:none;border-radius:6px;padding:3px 9px;font-size:12px"
           onclick="delItem(${r.id})">删除</button>
       </td>
     </tr>`;

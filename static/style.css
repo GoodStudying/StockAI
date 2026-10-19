@@ -18,7 +18,10 @@
   --accent: #c9862a;         /* 琥珀金（主操作） */
   --accent-deep: #a96d1c;
   --accent-soft: #faf3e6;    /* 琥珀浅底 */
+  --accent-ink: #fff;        /* 主操作按钮上的文字色（深底琥珀配白字） */
   --green: #3d8b5f;          /* 入库/成功 */
+  --green-ink: #fff;         /* 绿底按钮文字 */
+  --red-ink: #fff;           /* 红底按钮文字 */
   --green-soft: #eef5f0;
   --red: #c0504d;            /* 出库/危险 */
   --red-soft: #faf0ef;
@@ -54,7 +57,10 @@ html[data-theme="light"] {
   --accent: #3b82f6;
   --accent-deep: #2563eb;
   --accent-soft: #eef4fe;
+  --accent-ink: #fff;
   --green: #109269;
+  --green-ink: #fff;
+  --red-ink: #fff;
   --green-soft: #e8f6f1;
   --red: #d5494f;
   --red-soft: #fbeff0;
@@ -86,7 +92,10 @@ html[data-theme="dark"] {
   --accent: #e2a24b;
   --accent-deep: #c98a35;
   --accent-soft: rgba(226,162,75,.14);
+  --accent-ink: #2e1f06;   /* 暗夜的提亮琥珀较浅，按钮文字用深棕保证对比度（白字会看不清） */
   --green: #5cb885;
+  --green-ink: #0c2b18;      /* 暗夜浅绿底配深绿字（白字看不清） */
+  --red-ink: #3a0e0c;        /* 暗夜浅红底配深红字 */
   --green-soft: rgba(92,184,133,.14);
   --red: #e06c6a;
   --red-soft: rgba(224,108,106,.14);
@@ -97,7 +106,7 @@ html[data-theme="dark"] {
   --nav-text: #aeb4bb;
   --nav-link: #8b939c;
   --nav-link-hover: #fff;
-  --nav-active-text: #fff;
+  --nav-active-text: #2e1f06;   /* 激活项是浅琥珀底，文字同 --accent-ink 用深棕 */
   --nav-line: rgba(255,255,255,.07);
   --brand-text: #fff;
   --btn-gray-bg: #262c34;
@@ -221,7 +230,7 @@ h3.pt::before { content: ""; width: 3px; height: 14px; background: var(--accent)
 
 /* 按钮 */
 button {
-  background: var(--accent); color: #fff; border: none;
+  background: var(--accent); color: var(--accent-ink); border: none;
   border-radius: var(--radius-sm); padding: 7px 16px;
   cursor: pointer; font-size: 13px; font-family: var(--font);
   white-space: nowrap; flex-shrink: 0;
@@ -464,14 +473,14 @@ tbody tr:last-child td { border-bottom: none; }
   box-shadow: -6px 0 10px -6px rgba(0,0,0,.14); }
 .table-wrap th.col-sticky { z-index: 3; }
 .col-sticky .mini-btn { padding: 4px 10px; font-size: 12px; border-radius: var(--radius-sm); cursor: pointer; }
-.col-sticky .mini-btn.in { background: var(--green); color: #fff; border: none; }
-.col-sticky .mini-btn.out { background: var(--red); color: #fff; border: none; margin-left: 4px; }
+.col-sticky .mini-btn.in { background: var(--green); color: var(--green-ink); border: none; }
+.col-sticky .mini-btn.out { background: var(--red); color: var(--red-ink); border: none; margin-left: 4px; }
 
 /* ==================== 采购清单（purchase.html） ==================== */
 .proj-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin: 10px 0 14px; }
 .proj-tab { padding: 6px 14px; border-radius: 99px; border: 1px solid var(--line-2); cursor: pointer;
   background: var(--card); color: var(--ink-2); font-size: 13px; user-select: none; }
-.proj-tab.on { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.proj-tab.on { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
 .proj-tab .cnt { opacity: .75; font-size: 11px; margin-left: 4px; }
 .pstatus { display: inline-block; padding: 1px 9px; border-radius: 99px; font-size: 11px; }
 .pstatus.open { background: var(--red-soft); color: var(--red); }
