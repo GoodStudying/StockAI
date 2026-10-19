@@ -72,12 +72,12 @@
 </div>
 
 <!-- 登记采购弹窗 -->
-<div class="modal" id="batch-modal">
-  <div class="modal-box">
+<div class="modal-mask" id="batch-modal">
+  <div class="modal">
     <h3 id="batch-title">登记采购</h3>
     <div class="form-row"><label>数量</label><input id="batch-qty" type="number" min="1" value="1"></div>
     <div class="form-row"><label>备注</label><input id="batch-remark" placeholder="如：淘宝下单 / 立创包邮车"></div>
-    <div class="modal-ops">
+    <div class="modal-footer">
       <button onclick="closeModal('batch-modal')" style="background:var(--btn-gray-bg);color:var(--ink-2);border:1px solid var(--line-2)">取消</button>
       <button onclick="saveBatch()">保存</button>
     </div>
@@ -85,8 +85,8 @@
 </div>
 
 <!-- 新增/编辑采购项弹窗 -->
-<div class="modal" id="item-modal">
-  <div class="modal-box">
+<div class="modal-mask" id="item-modal">
+  <div class="modal">
     <h3 id="item-title">新增采购项</h3>
     <div class="form-row"><label>项目</label><input id="item-project" placeholder="项目名（必填，如：测试板V2）"></div>
     <div class="form-row"><label>名称</label><input id="item-name" placeholder="物料名称（必填）"></div>
@@ -95,7 +95,7 @@
     <div class="form-row"><label>需求量</label><input id="item-need" type="number" min="1" value="1"></div>
     <div class="form-row"><label>单位</label><input id="item-unit" value="个"></div>
     <div class="form-row"><label>备注</label><input id="item-remark"></div>
-    <div class="modal-ops">
+    <div class="modal-footer">
       <button onclick="closeModal('item-modal')" style="background:var(--btn-gray-bg);color:var(--ink-2);border:1px solid var(--line-2)">取消</button>
       <button onclick="saveItem()">保存</button>
     </div>
