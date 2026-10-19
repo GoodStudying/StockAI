@@ -17,6 +17,8 @@ export interface Env {
   ASSETS: Fetcher;           // 静态资源（自动注入）
   WORKER_SECRET: string;     // 会话 JWT 签名密钥（Secret，必配）
   API_TOKEN?: string;        // /api/v1 开放接口令牌，多个用英文逗号分隔（可选）
+  AI_MAX_LLM_ROUNDS?: string;   // AI 单条消息最大 LLM 轮次（可选，默认 20）
+  AI_MAX_TOOL_CALLS?: string;   // AI 单条消息最大工具调用数=卡片上限（可选，默认 50）
 }
 
 /** Hono 环境类型：绑定 + 请求级变量（登录用户 / API 操作人） */

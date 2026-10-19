@@ -21,8 +21,16 @@ import { aiCfg, autoFetchMaterial, purchaseBulkCore, descendantIds, MAX_WAREHOUS
 const chat = new Hono<AppEnv>();
 
 // tool loop 双保险上限：LLM 轮次 与 工具调用总数 都封顶，防模型死循环刷调用
-const MAX_LLM_ROUNDS = 8;
-const MAX_TOOL_CALLS = 12;
+// 默认 20 轮 / 50 次（写操作一次调用 = 一张确认卡片，50 满足批量改位号等场景）；
+// 可用 Worker 环境变量 AI_MAX_LLM_ROUNDS / AI_MAX_TOOL_CALLS 覆盖（Settings → Variables and Secrets）
+const DEFAULT_MAX_LLM_ROUNDS = 20;
+const DEFAULT_MAX_TOOL_CALLS = 50;
+
+/** 读取环境变量里的正整数上限，未配/非法时回落默认值（与 Flask 端 os.environ 逻辑对齐） */
+function envLimit(v: string | undefined, fallback: number): number {
+  const n = parseInt(v ?? "", 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
 
 /** 生成 8 位随机 hex（卡片 id），对齐 Flask 版 secrets.token_hex(4) */
 function randHex8(): string {
@@ -649,7 +657,9 @@ chat.post("/api/chat", requireLogin, async (c) => {
     for (const k of Object.keys(usageTotal)) usageTotal[k] += Number(u?.[k]) || 0;
   };
   let done = false;
-  for (let round = 0; round < MAX_LLM_ROUNDS; round++) {
+  const maxRounds = envLimit(c.env.AI_MAX_LLM_ROUNDS, DEFAULT_MAX_LLM_ROUNDS);
+  const maxToolCalls = envLimit(c.env.AI_MAX_TOOL_CALLS, DEFAULT_MAX_TOOL_CALLS);
+  for (let round = 0; round < maxRounds; round++) {
     let r: { content: string; toolCalls: any[]; usage: any };
     try {
       r = await llmChat(cfg, msgs, AI_TOOLS);
@@ -677,7 +687,7 @@ chat.post("/api/chat", requireLogin, async (c) => {
         msgs.push(toolMsg(tc.id, { error: "arguments 必须是合法的 JSON 对象" }));
         continue;
       }
-      if (toolCount > MAX_TOOL_CALLS) {
+      if (toolCount > maxToolCalls) {
         msgs.push(toolMsg(tc.id, { error: "已达本轮工具调用上限，请直接用现有信息回答用户" }));
         continue;
       }

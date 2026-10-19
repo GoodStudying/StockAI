@@ -434,12 +434,27 @@ r = c2.get("/api/ai/config")
 check("非admin读AI配置返回403", r.status_code == 403)
 
 # 场景e：轮次用尽 → 追加无 tools 请求逼出文本
+# 上限 v261019.3 起改为环境变量可调（默认20轮/50次），此处临时调小便于脚本化验证
+_orig_rounds, _orig_calls = app_module.MAX_LLM_ROUNDS, app_module.MAX_TOOL_CALLS
+app_module.MAX_LLM_ROUNDS = 8
 app_module._llm_chat = scripted_llm(
     [("继续", [("query", {"sql": f"SELECT {i}"})]) for i in range(8)] + ["已到上限的总结文本。"])
 r = c.post("/api/chat", json={"message": "疯狂搜索"})
 d = r.get_json()
 check("8轮用尽后逼出总结文本", r.status_code == 200 and d["content"] == "已到上限的总结文本。"
       and d["actions"] == [], d.get("content", ""))
+
+# 场景e2：工具调用总数封顶 → 第4次起收到上限错误，模型据此收尾
+app_module.MAX_LLM_ROUNDS = 20
+app_module.MAX_TOOL_CALLS = 3
+app_module._llm_chat = scripted_llm([
+    ("", [("query", {"sql": f"SELECT {i}"}) for i in range(5)]),  # 一轮5连调：前3放行后2被拦
+    "收到上限提示后的总结。",
+])
+r = c.post("/api/chat", json={"message": "连环查询"})
+check("工具总数封顶后模型收尾正常", r.status_code == 200
+      and r.get_json()["content"] == "收到上限提示后的总结。", r.get_json().get("content", ""))
+app_module.MAX_LLM_ROUNDS, app_module.MAX_TOOL_CALLS = _orig_rounds, _orig_calls
 
 # 场景f：工具参数错误 → 模型收到 error 自纠不 500（lcsc_search 空关键词仍报错）
 app_module._llm_chat = scripted_llm([

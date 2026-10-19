@@ -1911,8 +1911,10 @@ def bom_analyze():
 # ---------------- AI 对话（OpenAI 兼容协议：Kimi / DeepSeek / GLM 等） ----------------
 
 # tool loop 双保险上限：LLM 轮次 与 工具调用总数 都封顶，防模型死循环刷调用
-MAX_LLM_ROUNDS = 8
-MAX_TOOL_CALLS = 12
+# 默认 20 轮 / 50 次（写操作一次调用 = 一张确认卡片，50 满足批量改位号等场景）；
+# 可用环境变量 AI_MAX_LLM_ROUNDS / AI_MAX_TOOL_CALLS 覆盖（Worker 端在 Settings → Variables 配同名变量）
+MAX_LLM_ROUNDS = int(os.environ.get("AI_MAX_LLM_ROUNDS", "20") or "20")
+MAX_TOOL_CALLS = int(os.environ.get("AI_MAX_TOOL_CALLS", "50") or "50")
 
 
 def _llm_chat(cfg, messages, tools=None):

@@ -18,3 +18,5 @@ database_id = "bfba57af-5c8b-41f6-94b4-f30ad465b2af"
 # 环境变量说明（都在网页 Worker → Settings → Variables and Secrets 里配置，不写在代码仓库）：
 #   WORKER_SECRET  会话 JWT 签名密钥（必配，随机 32 位以上字符串，Type 选 Secret）
 #   API_TOKEN      /api/v1 开放接口令牌（可选，多个用英文逗号分隔，供 Cherry Studio/MCP 调用）
+#   AI_MAX_LLM_ROUNDS  AI 单条消息最大 LLM 轮次（可选，默认 20）
+#   AI_MAX_TOOL_CALLS  AI 单条消息最大工具调用数=一次最多生成的卡片张数（可选，默认 50）
