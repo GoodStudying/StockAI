@@ -320,7 +320,9 @@ function cmpOne(a, b, field, dir) {
   }
   let c;
   if (field === 'quantity') c = (+va) - (+vb);                    // 库存数值比较
-  else c = String(va).localeCompare(String(vb), 'zh');            // 文本按中文排序；created_at 字典序=时间序
+  /* 文本按中文排序，numeric:true 开启自然排序：数字段按数值比（1,2,10 而非 1,10,2），
+     位号 A1-03/编码 C100 这类含数字文本也能正确排序；created_at 字典序=时间序 */
+  else c = String(va).localeCompare(String(vb), 'zh', { numeric: true });
   return dir === 'desc' ? -c : c;
 }
 function cmpRows(a, b) {
@@ -409,7 +411,7 @@ function fillCheckGroup(elId, field) {
     const v = m[field] || '';
     cnt[v] = (cnt[v] || 0) + 1;
   });
-  const keys = Object.keys(cnt).sort((a, b) => a.localeCompare(b, 'zh'));
+  const keys = Object.keys(cnt).sort((a, b) => a.localeCompare(b, 'zh', { numeric: true }));
   box.innerHTML = keys.map(v =>
     `<label class="flt-item"><input type="checkbox" value="${esc(v)}"` +
     `${colFilters[field].includes(v) ? ' checked' : ''}> ${esc(v) || '（未填）'} (${cnt[v]})</label>`
@@ -513,7 +515,7 @@ function renderTable(rows) {
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(m);
   });
-  const keys = [...groups.keys()].sort((a, b) => a.localeCompare(b, 'zh'));
+  const keys = [...groups.keys()].sort((a, b) => a.localeCompare(b, 'zh', { numeric: true }));
   const colspan = 16;   // 表格列数（含 sticky 出入库列）
   body.innerHTML = keys.map(k => {
     const g = groups.get(k);
