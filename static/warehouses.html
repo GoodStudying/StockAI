@@ -8,6 +8,10 @@
 <script>
 /* 尽早应用主题，防止刷新时闪回默认配色 */
 (function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
+/* 首屏鉴权门：渲染前先隐藏整页，checkLogin 鉴权通过后由 common.js 显示（未登录不闪首页）；
+   兜底 6s 超时自动显示，防接口异常导致页面永远空白 */
+document.documentElement.classList.add('auth-pending');
+setTimeout(function(){document.documentElement.classList.remove('auth-pending');}, 6000);
 </script>
 <link rel="icon" type="image/x-icon" href="/favicon.ico">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png">

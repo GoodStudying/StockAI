@@ -11,6 +11,9 @@
 <script>
 /* 尽早应用主题，防止刷新时闪回默认配色 */
 (function(){var t=localStorage.getItem('theme');if(t&&t!=='classic')document.documentElement.setAttribute('data-theme',t);})();
+/* 首屏隐藏：已登录会自动跳首页，避免登录框一闪；下方 /api/me 检查后显示 */
+document.documentElement.classList.add('auth-pending');
+setTimeout(function(){document.documentElement.classList.remove('auth-pending');}, 6000);
 </script>
 </head>
 <body>
@@ -35,6 +38,12 @@
 </div>
 <script src="/common.js"></script>
 <script>
+/* 已登录直接进首页（免再点一次登录）；未登录才揭开首屏显示登录框 */
+fetch('/api/me').then(r => r.json()).then(d => {
+  if (d.user) { location.href = '/'; return; }
+  document.documentElement.classList.remove('auth-pending');
+}).catch(() => { document.documentElement.classList.remove('auth-pending'); });
+
 /* 默认密码提示：仅当 admin 仍是默认密码时显示，改密后自动消失 */
 fetch('/api/default_admin_exists').then(r => r.json()).then(d => {
   if (d.default_exists) document.getElementById('default-hint').style.display = '';

@@ -143,6 +143,13 @@ input, select, textarea, button.gray {
   to { opacity: 1; }
 }
 
+/* ============ 首屏鉴权门：未登录不闪首页 ============
+   各页 head 内联脚本在渲染前给 <html> 加 auth-pending，整页先隐藏只露主题底色；
+   checkLogin() 鉴权通过后移除（未登录跳 login.html 时页面从未可见）。
+   html 上同时铺主题底色，避免隐藏期间闪白。 */
+html.auth-pending { background: var(--paper); }
+html.auth-pending body { visibility: hidden; }
+
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html { -webkit-text-size-adjust: 100%; }
 body {
