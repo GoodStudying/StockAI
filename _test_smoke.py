@@ -831,6 +831,87 @@ m2_after = dbm.query("SELECT quantity FROM materials WHERE id=?", (m2,))[0]["qua
 check("旧卡片执行库存+3", m2_after == m2_before + 3, f"{m2_before}->{m2_after}")
 
 
+# ---------- 19. 入库按仓库名挂库（已存在解析 / 不存在自动创建） ----------
+print("[19] 入库 warehouse_name（名字直挂 + 自动建库）")
+# AI 配置在 15/16 段已被清空又配回，保险起见再配一次
+c.post("/api/ai/config", json={"base_url": "https://api.fake/v1", "model": "fake",
+                               "api_key": "sk-fake"})
+# 造一个确定存在的一级库
+wid_named = c.post("/api/warehouses", json={"name": "名挂测试库"}).get_json()["id"]
+
+# 已有仓库名：卡片期解析成 id（执行不再依赖名字）
+r = c.post("/api/materials", json={"name": "名挂电阻", "code": "WN0001"})
+mid_wn = r.get_json()["id"]
+app_module._llm_chat = scripted_llm([
+    ("", [("stock", {"op": "in", "material_id": mid_wn, "quantity": 4,
+                     "warehouse_name": "名挂测试库"})]),
+    "已生成入库卡片，请确认。",
+])
+r = c.post("/api/chat", json={"message": "入库4个名挂电阻到名挂测试库"})
+d = r.get_json()
+a_wn = d["actions"][0]
+check("卡片标题含仓库名", "挂到仓库「名挂测试库」" in a_wn["title"], a_wn["title"])
+check("卡片期名字解析成 id", a_wn["params"].get("warehouse_id") == wid_named
+      and "warehouse_name" not in a_wn["params"], str(a_wn["params"]))
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "action_id": a_wn["id"]})
+row = dbm.query("SELECT warehouse_id FROM materials WHERE id=?", (mid_wn,))[0]
+check("按名挂库执行成功", r.status_code == 200 and row["warehouse_id"] == wid_named, str(row))
+
+# 新仓库名：卡片标注自动创建，执行后一级库出现、物料挂上新库
+r = c.post("/api/materials", json={"name": "新盒电容", "code": "WN0002"})
+mid_nw = r.get_json()["id"]
+app_module._llm_chat = scripted_llm([
+    ("", [("stock", {"op": "in", "material_id": mid_nw, "quantity": 6,
+                     "warehouse_name": "自动纸盒甲"})]),
+    "已生成入库卡片（含自动建库），请确认。",
+])
+r = c.post("/api/chat", json={"message": "入库6个新盒电容到自动纸盒甲"})
+d = r.get_json()
+a_nw = d["actions"][0]
+check("新库卡片标题标注自动创建", "挂到新仓库「自动纸盒甲」（执行时自动创建）" in a_nw["title"],
+      a_nw["title"])
+check("执行前仓库不存在", not dbm.query("SELECT id FROM warehouses WHERE name='自动纸盒甲'"))
+r = c.post("/api/chat/execute", json={"message_id": d["message_id"], "action_id": a_nw["id"]})
+res = r.get_json()["action"]["result"]
+wh = dbm.query("SELECT id, level FROM warehouses WHERE name='自动纸盒甲'")
+row = dbm.query("SELECT warehouse_id FROM materials WHERE id=?", (mid_nw,))[0]
+check("执行后自动建库(1级)且物料挂上", len(wh) == 1 and wh[0]["level"] == 1
+      and row["warehouse_id"] == wh[0]["id"], str(res))
+check("结果回报自动创建", res.get("warehouse_auto_created") is True, str(res))
+
+# 出库带仓库名 → 预校验拦截，不出卡片
+app_module._llm_chat = scripted_llm([
+    ("", [("stock", {"op": "out", "material_id": mid_nw, "quantity": 1,
+                     "warehouse_name": "自动纸盒甲"})]),
+    "出库不支持指定仓库，已告知用户。",
+])
+r = c.post("/api/chat", json={"message": "出库1个从自动纸盒甲"})
+check("出库带仓库名不生成卡片", r.get_json()["actions"] == [])
+
+# /api/v1：warehouse_name 自动建库 + 同名复用不重复建
+r = c.post("/api/materials", json={"name": "v1名挂料", "code": "WN0003"})
+mid_v1n = r.get_json()["id"]
+n_wh_before = dbm.query("SELECT COUNT(*) AS n FROM warehouses")[0]["n"]
+r = c.post("/api/v1/stock/in", json={"material_id": mid_v1n, "quantity": 2,
+                                     "warehouse_name": "自动纸盒乙"}, headers=H)
+check("/api/v1 名字挂库自动建库", r.status_code == 200
+      and r.get_json().get("warehouse_auto_created") is True, r.get_data(as_text=True)[:150])
+r = c.post("/api/materials", json={"name": "v1名挂料2", "code": "WN0004"})
+mid_v1n2 = r.get_json()["id"]
+r = c.post("/api/v1/stock/in", json={"material_id": mid_v1n2, "quantity": 2,
+                                     "warehouse_name": "自动纸盒乙"}, headers=H)
+n_wh_after = dbm.query("SELECT COUNT(*) AS n FROM warehouses")[0]["n"]
+check("/api/v1 同名仓库复用不重复建", r.status_code == 200
+      and "warehouse_auto_created" not in r.get_json()
+      and n_wh_after == n_wh_before + 1, r.get_data(as_text=True)[:150])
+r = c.post("/api/v1/stock/out", json={"material_id": mid_v1n, "quantity": 1,
+                                      "warehouse_name": "自动纸盒乙"}, headers=H)
+check("/api/v1 出库带仓库名 400", r.status_code == 400)
+dbm.execute_write("DELETE FROM materials WHERE id IN (?,?)", (mid_v1n, mid_v1n2))
+
+app_module._llm_chat = real_llm
+
+
 # ---------- 清理 ----------
 for suffix in ("", "-journal", "-wal", "-shm"):
     p = TEST_DB + suffix

@@ -44,16 +44,20 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 ```json
 {"material_id": 12, "quantity": 100, "remark": "采购单 PO-2026-001", "warehouse_id": 3}
+{"material_id": 12, "quantity": 100, "warehouse_name": "纸盒1"}
 ```
 
 返回：`{"ok": true, "material_id": 12, "quantity": 350}`（quantity 为入库后最新库存）
 
-`warehouse_id` 可选：入库同时把物料挂到该仓库（实现"入到某个盒子/货架"），
-仅入库支持（仓库是物料的归属属性）。仓库不存在返回 400。
+挂库参数 `warehouse_id` / `warehouse_name` 二选一（仅入库支持）：
+
+- `warehouse_id`：必须已存在，否则 400
+- `warehouse_name`：按名字匹配**一级库**（已存在则直接复用，**不存在则自动创建**），
+  响应带 `warehouse_name`，自动创建时另带 `warehouse_auto_created: true`
 
 ### 3. 出库 `POST /api/v1/stock/out`
 
-请求体同入库（不支持 warehouse_id）。库存不足时返回 400 + `{"error": "库存不足，当前库存 5"}`，
+请求体同入库（不支持 warehouse_id / warehouse_name）。库存不足时返回 400 + `{"error": "库存不足，当前库存 5"}`，
 **绝不扣成负数**（单语句原子扣减，并发安全）。
 
 ### 3.5 删除物料 `DELETE /api/v1/materials/<id>`

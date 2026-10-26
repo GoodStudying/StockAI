@@ -79,16 +79,20 @@ def search_materials(keyword: str = "", code: str = "") -> str:
 
 
 @mcp.tool()
-def stock_in(material_id: int, quantity: int, remark: str = "", warehouse_id: int = 0) -> str:
+def stock_in(material_id: int, quantity: int, remark: str = "",
+             warehouse_id: int = 0, warehouse_name: str = "") -> str:
     """入库：给指定物料增加库存。material_id 来自 search_materials 的查询结果；
     quantity 必须为正整数；remark 为操作备注（如采购单号）。
-    warehouse_id 可选（0 或不传=不挂库）：入库同时把物料归属到该仓库
-    （id 用 list_warehouses 查询），实现"入到某个盒子/货架"。
+    挂库（warehouse_id 与 warehouse_name 二选一，仅入库支持）：
+      warehouse_id=已知仓库 id；warehouse_name=仓库名（如"纸盒1"，一级库不存在则自动创建，
+      已存在则直接复用不会重复建）。用户说"入到/挂到 某盒子/货架"时用 warehouse_name 最省事。
     ⚠ 写操作：执行前应先向用户复述物料名称与数量，征得确认后再调用。返回入库后的最新库存。"""
     body = {"material_id": material_id, "quantity": quantity,
             "remark": remark or "Cherry Studio 对话入库"}
     if warehouse_id:
         body["warehouse_id"] = warehouse_id
+    elif warehouse_name:
+        body["warehouse_name"] = warehouse_name
     return _d(_call("POST", "/api/v1/stock/in", body=body))
 
 

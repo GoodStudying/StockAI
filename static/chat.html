@@ -273,7 +273,8 @@ function renderCard(msgId, a) {
         if (res.quantity !== undefined) parts.push(`现库存 ${res.quantity}`);
         else if (res.material_id !== undefined) parts.push(`物料 #${res.material_id}`);
         if (res.warehouse_id !== undefined && res.level === undefined)
-          parts.push(`已挂到仓库 #${res.warehouse_id}`);          /* stock_in 挂库 */
+          parts.push(`已挂到仓库「${res.warehouse_name || '#' + res.warehouse_id}」` +
+                     (res.warehouse_auto_created ? '（新仓库已自动创建）' : ''));   /* stock_in 挂库 */
         if (res.created !== undefined) parts.push(`新建 ${res.created} 项 / 合并 ${res.merged} 项`);
       }
       if (res.note) parts.push(`（${res.note}）`);
