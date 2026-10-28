@@ -129,12 +129,13 @@ async function systemPrompt(db: D1Database, username: string): Promise<string> {
 
 【工具使用规范】
 1. 一切查询（库存/流水/仓库/采购/统计）都用 query：用户问"有哪些库存/库存情况"直接 SELECT * FROM materials，不要反问用户要关键词。LIKE 模糊匹配记得带 %；默认加 LIMIT 50 以内。
-2. stock（出入库）/ material（物料增改删）/ warehouse（仓库增改删）/ purchase（采购管理）是写操作：调用后只会生成"待确认卡片"，并未真正执行。你必须向用户清晰复述操作内容（物料、数量、仓库），并提醒用户点击卡片上的「确认执行」按钮；用户没确认就当作未执行。
+2. stock（出入库）/ material（物料增改删）/ warehouse（仓库增改删）/ purchase（采购管理）是写操作：调用后只会生成"待确认卡片"，并未真正执行。信息齐全（物料/数量/仓库都明确）时必须直接调用工具生成卡片，复述操作并提醒用户点击卡片上的「确认执行」按钮；禁止先发文字向用户索要"是否确认"——确认动作由用户在卡片上完成，你代替不了。只有信息缺失或有歧义（数量不明/仓库不明/编码命中多个物料）时才先提问澄清。
 3. 出入库/修改/删除物料前必须先定位物料：material_id 只能来自 query 结果，禁止编造；用户直接给了编码（如 C621395）时可跳过查询，直接给工具传 code。多候选时把候选列给用户选，不要猜。
 4. 库存中搜不到的物料：用 lcsc_search 搜立创商城（结果含立创C编号），把候选列成简表让用户选；用户确认编号后用 material 的 create 建料（填了 C 编号会自动抓取图片/手册/参数，无需用户手填），再按需用 stock 入库。
 5. BOM 核对用 check_bom；用户想采购缺料时用 purchase 的 add（问清项目名，BOM 缺料可批量导入）；登记一次采购到货用 add_batch。
 6. 用户一次给多行/多种物料要办理时（如批量入库、整份BOM建料）：逐行连续调用对应工具，每行生成一张卡片，全部列完后一次性提醒用户逐张确认；不得以"只能一次一个""系统不支持批量"等理由拒绝或只做一部分。
 7. 用户要"清空所有物料/全部删掉重来"时：先 query 列出全部物料，再对每一行连续调用 material 的 delete 生成删除卡片（标题会标注库存将一并清空），全部列出后提醒用户逐张确认。
+8. 入库挂库用户给出的是仓库名（如"纸盒1"）时：直接给 stock 传 warehouse_name——执行时自动按名字查找，不存在则自动创建一级库；不要先反问仓库 id，也不要为同名新库再发 warehouse create 卡片（会建重）。仅当用户明确要求"建子库/建在某库下面"时才用 warehouse 工具并传 parent_id。
 
 【电子领域常识】
 - 电容容值换算：1µF = 1000nF（0.1µF = 100nF；三位数标注 104 = 100nF、105 = 1µF）。用户给出的不同写法若等值，主动指出并确认是否同一种物料。
@@ -177,13 +178,15 @@ const AI_TOOLS = [
     name: "stock",
     description: "出入库（写操作，生成待确认卡片）。material_id 来自 query 结果；用户直接给了编码时也可只传 code"
       + "（精确匹配编码或型号，多候选会返回列表让你请用户确认，此时无需先查询）。"
-      + "入库可传 warehouse_id 同时把物料挂到该仓库（id 用 query 查 warehouses 表）。",
+      + "入库挂库：用户说'入到/挂到 某仓库'时优先传 warehouse_name（仓库名，如'纸盒1'，"
+      + "执行时自动查找、不存在则自动创建一级库）；已知 id 时也可传 warehouse_id。",
     parameters: { type: "object", required: ["op", "quantity"], properties: {
       op: { type: "string", enum: ["in", "out"], description: "in=入库 out=出库" },
       material_id: { type: "integer", description: "物料 id（与 code 二选一）" },
       code: { type: "string", description: "物料编码/型号（与 material_id 二选一）" },
       quantity: { type: "integer", description: "数量>0" },
-      warehouse_id: { type: "integer", description: "仓库 id（可选，仅入库：同时把物料归属到该仓库）" },
+      warehouse_name: { type: "string", description: "仓库名（可选，与 warehouse_id 二选一，仅入库：同时挂到该仓库）" },
+      warehouse_id: { type: "integer", description: "仓库 id（可选，与 warehouse_name 二选一，仅入库）" },
       remark: { type: "string", description: "备注（可选）" } } } } },
   { type: "function", function: {
     name: "material",
@@ -330,14 +333,31 @@ async function buildAction(db: D1Database, name: string, args: Record<string, an
     delete base.params.code;
     delete base.params.op;
     base.title = `${op === "in" ? "入库" : "出库"}：${target.mname}（#${target.mid}）×${qty}`;
-    // 入库可指定挂到哪个仓库（仓库是物料的归属属性，出库不支持）
-    if (args.warehouse_id) {
-      if (op === "out") return { err: "出库不支持 warehouse_id（仓库归属在入库时指定）" };
-      const wid = parseIntSafe(args.warehouse_id, 1);
-      if (wid === null) return { err: "warehouse_id 必须是正整数" };
-      const wh = await q<{ name: string }>(db, "SELECT name FROM warehouses WHERE id=?", wid);
-      if (!wh.length) return { err: `仓库 #${wid} 不存在，先用 query 查 warehouses 表确认现有仓库 id` };
-      base.title += `，挂到仓库「${wh[0].name}」`;
+    // 入库挂库：id 卡片期校验；名字已存在则解析成 id，不存在则执行时自动建一级库
+    if (op === "out" && (args.warehouse_id || args.warehouse_name)) {
+      return { err: "出库不支持指定仓库（仓库归属在入库时指定）" };
+    }
+    if (op === "in" && (args.warehouse_id || args.warehouse_name)) {
+      const wid = args.warehouse_id ? parseIntSafe(args.warehouse_id, 1) : null;
+      if (args.warehouse_id && wid === null) return { err: "warehouse_id 必须是正整数" };
+      const wname = String(args.warehouse_name ?? "").trim();
+      if (wid === null && !wname) return { err: "warehouse_name 不能为空" };
+      if (wid !== null) {
+        const wh = await q<{ name: string }>(db, "SELECT name FROM warehouses WHERE id=?", wid);
+        if (!wh.length) return { err: `仓库 #${wid} 不存在，先用 query 查 warehouses 表确认现有仓库 id` };
+        base.title += `，挂到仓库「${wh[0].name}」`;
+      } else {
+        // 一级库 parent_id 落库为 NULL，匹配要兼顾 0
+        const wh = await q<{ id: number }>(db,
+          "SELECT id FROM warehouses WHERE name=? AND (parent_id IS NULL OR parent_id=0)", wname);
+        if (wh.length) {
+          base.params.warehouse_id = wh[0].id;
+          delete base.params.warehouse_name;
+          base.title += `，挂到仓库「${wname}」`;
+        } else {
+          base.title += `，挂到新仓库「${wname}」（执行时自动创建）`;
+        }
+      }
     }
     return { action: base };
   }
@@ -777,16 +797,35 @@ async function executeAction(db: D1Database, act: any, username: string): Promis
       return { error: r.err[0], keep_pending: r.err[1] === 400 };
     }
     const result: Record<string, unknown> = { material_id: mid, quantity: r.qty };
-    // 入库卡片带 warehouse_id：入库成功后同步物料归属仓库
-    if (t === "stock_in" && p.warehouse_id) {
-      const wid = parseIntSafe(p.warehouse_id, 1);
-      const wh = wid ? await q(db, "SELECT id FROM warehouses WHERE id=?", wid) : [];
-      if (wid === null || !wh.length) {
-        result.error = `仓库 #${p.warehouse_id} 已不存在，物料已入库但未挂库（可在物料管理页手动指定）`;
-        return result;
+    // 入库挂库：warehouse_id 直挂；warehouse_name 按名解析（一级库不存在则自动创建）
+    if (t === "stock_in" && (p.warehouse_id || p.warehouse_name)) {
+      let wid: number | null = null;
+      let autoCreated = false;
+      if (p.warehouse_id) {
+        wid = parseIntSafe(p.warehouse_id, 1);
+        const wh = wid ? await q(db, "SELECT id FROM warehouses WHERE id=?", wid) : [];
+        if (wid === null || !wh.length) {
+          result.error = `仓库 #${p.warehouse_id} 已不存在，物料已入库但未挂库（可在物料管理页手动指定）`;
+          return result;
+        }
+      } else {
+        const wname = String(p.warehouse_name ?? "").trim();
+        const rows = await q<{ id: number }>(db,
+          "SELECT id FROM warehouses WHERE name=? AND (parent_id IS NULL OR parent_id=0)", wname);
+        if (rows.length) {
+          wid = rows[0].id;
+        } else {
+          const ins = await db.prepare(
+            "INSERT INTO warehouses(name, parent_id, level) VALUES (?,NULL,1)").bind(wname).run();
+          wid = Number(ins.meta.last_row_id);
+          autoCreated = true;
+        }
       }
       await db.prepare("UPDATE materials SET warehouse_id=? WHERE id=?").bind(wid, mid).run();
+      const wh = await q<{ name: string }>(db, "SELECT name FROM warehouses WHERE id=?", wid);
       result.warehouse_id = wid;
+      result.warehouse_name = wh[0]?.name;
+      if (autoCreated) result.warehouse_auto_created = true;
     }
     return result;
   }
