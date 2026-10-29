@@ -264,9 +264,10 @@ async function init() {
   loadMaterials();
 }
 function fillWarehouseSelects() {
-  // 深度优先排序：子库紧跟父库，符合树形层级
+  // 深度优先排序：子库紧跟父库；同层按仓库名（字母/拼音）升序，让下拉框不再乱序
+  const byName = (a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh', { numeric: true });
   const sorted = [];
-  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid);
+  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid).sort(byName);
   (function walk(pid) {
     childrenOf(pid).forEach(w => { sorted.push(w); walk(w.id); });
   })(null);
@@ -334,7 +335,13 @@ function cmpRows(a, b) {
     const c = cmpOne(a, b, r.field, r.dir);
     if (c) return c;
   }
-  return (b.id - a.id);   // 兜底：默认新料在前（与后端 ORDER BY id DESC 一致）
+  /* 默认排序（无用户规则时）：仓库名(字母/拼音) → 位号(自然数字) → id 倒序。
+     与后端 /api/materials 默认排序保持一致，用户清除排序后落到这一档。 */
+  const w = cmpOne(a, b, 'warehouse_name', 'asc');
+  if (w) return w;
+  const l = cmpOne(a, b, 'location_code', 'asc');
+  if (l) return l;
+  return (b.id - a.id);   // 同库同位号兜底：新料在前
 }
 function sortRows(rows) { return rows.slice().sort(cmpRows); }
 

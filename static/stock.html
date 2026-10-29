@@ -83,9 +83,10 @@ async function init() {
   const user = await checkLogin();
   if (!user) return;
   warehouses = await api('/api/warehouses');
-  // 深度优先排序：子库紧跟父库
+  // 深度优先排序：子库紧跟父库；同层按仓库名（字母/拼音）升序，让下拉框不再乱序
+  const byName = (a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh', { numeric: true });
   const sorted = [];
-  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid);
+  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid).sort(byName);
   (function walk(pid) {
     childrenOf(pid).forEach(w => { sorted.push(w); walk(w.id); });
   })(null);

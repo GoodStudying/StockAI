@@ -70,7 +70,9 @@ let collapsed = {};  // 折叠状态：id -> true
 function renderTree() {
   const el = document.getElementById('tree');
   el.innerHTML = '';
-  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid);
+  // 同层按仓库名（字母/拼音）升序，与下拉框/物料列表默认排序一致
+  const byName = (a, b) => String(a.name || '').localeCompare(String(b.name || ''), 'zh', { numeric: true });
+  const childrenOf = pid => warehouses.filter(w => (w.parent_id || null) === pid).sort(byName);
   function render(list) {
     list.forEach(w => {
       const kids = childrenOf(w.id);

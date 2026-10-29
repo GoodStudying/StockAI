@@ -101,6 +101,44 @@ def _parse_int(v, minimum=0):
     return q if q >= minimum else None
 
 
+# 数字段切分正则：把 "A1-03"/"R10" 拆成文本段和整数段，供自然排序 key 使用
+_NAT_SPLIT = re.compile(r"(\d+)")
+
+
+def _natural_key(s):
+    """自然排序 key：把字符串按「数字段/非数字段」切开，数字段转 int 按数值比，
+    文本段按小写字符比（忽略大小写），让 1<2<...<10<11<12 而不是 1<10<11<2。
+    用于位号 R5/R10、A1-03/A1-10 等含数字的文本字段排序。
+    返回可比较的元组；空串返回空元组，调用方需自行决定空值垫底/靠前。
+    注意：文本段统一为 str、数字段统一为 int，同位置类型必须一致才能 < 比较，
+    因此在每段前面加类型标记（0=文本，1=数字），保证元组同位置类型一致。"""
+    if s is None:
+        return ()
+    s = str(s)
+    parts = _NAT_SPLIT.split(s)
+    key = []
+    for p in parts:
+        if not p:
+            continue
+        if p.isdigit():
+            key.append((1, int(p)))
+        else:
+            key.append((0, p.lower()))
+    return tuple(key)
+
+
+def _material_default_sort_key(m):
+    """物料默认排序 key：仓库名(字母/拼音升序) → 位号(自然数字升序) → id 倒序。
+    空仓库/空位号垫底（与 Excel 习惯一致，不影响有值行的相对顺序）。"""
+    wh = (m.get("warehouse_name") or "").strip()
+    loc = (m.get("location_code") or "").strip()
+    # (空标记, 自然key)：空标记 0=有值 1=空，让空值排在所有有值之后
+    wh_key = (1,) if not wh else (0, _natural_key(wh))
+    loc_key = (1,) if not loc else (0, _natural_key(loc))
+    # id 取负实现倒序：id 越大越靠前，保持「新料在前」的兜底习惯
+    return (wh_key, loc_key, -(m.get("id") or 0))
+
+
 # ---------------- 认证 ----------------
 def login_required(f):
     @wraps(f)
@@ -548,8 +586,12 @@ def list_materials():
             params.append(wid)
     if conds:
         sql += " WHERE " + " AND ".join(conds)
+    # SQL 仍按 id DESC LIMIT 500 取数（保持「最新 500 条」的兜底保护不变），
+    # 真正的展示排序在 Python 层做：默认按 仓库名 → 位号(自然) → id DESC，
+    # 避免在 SQLite/PostgreSQL 双端写复杂的自然排序 SQL。
     sql += " ORDER BY m.id DESC LIMIT 500"
     rows = db.query(sql, tuple(params))
+    rows.sort(key=_material_default_sort_key)
     for r in rows:
         r["documents"] = db.query(
             "SELECT id, doc_type, file_name FROM material_documents WHERE material_id=?",
